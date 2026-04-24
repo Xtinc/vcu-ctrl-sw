@@ -3,60 +3,46 @@
 # higher-level STATIC/SHARED libraries without repeated compilation.
 
 set(LIB_COMMON_SRC
-    Utils.c
-    BufCommon.c
-    AllocatorDefault.c
     AlignedAllocator.c
-    MemDesc.c
+    AllocatorDefault.c
+    AvcLevelsLimit.c
+    AvcUtils.c
+    BufCommon.c
     BufferAPI.c
-    BufferPixMapMeta.c
+    BufferCircMeta.c
     BufferHandleMeta.c
+    BufferPictureDecMeta.c
+    BufferPictureMeta.c
+    BufferPixMapMeta.c
+    BufferSeiMeta.c
+    BufferStreamMeta.c
+    ChannelResources.c
+    DisplayInfoMeta.c
+    Error.c
     Fifo.c
     FourCC.c
-    HardwareDriver.c
-    PixMapBuffer.c
-    IntVector.c
-    Planes.c
     HardwareConfig.c
-    Error.c
-    DisplayInfoMeta.c
+    HardwareDriver.c
+    HevcLevelsLimit.c
+    HevcUtils.c
+    HwScalingList.c
+    IntVector.c
+    LevelLimit.c
+    MemDesc.c
     PicFormat.c
-    StaticFifo.c
+    PixMapBuffer.c
+    Planes.c
+    StreamBuffer.c
+    SyntaxConversion.c
+    Utils.c
 )
 
-if(ENABLE_AVC)
-    list(APPEND LIB_COMMON_SRC
-        AvcLevelsLimit.c
-        AvcUtils.c
-    )
-endif()
 
-if(ENABLE_HEVC)
-    list(APPEND LIB_COMMON_SRC
-        HevcLevelsLimit.c
-        HevcUtils.c
-    )
+if(ENABLE_ENC_SW_MULTIPASS)
+    list(APPEND LIB_COMMON_SRC BufferLookAheadMeta.c)
 endif()
-
-if(ENABLE_CODEC)
-    list(APPEND LIB_COMMON_SRC
-        LevelLimit.c
-        StreamBuffer.c
-        ChannelResources.c
-        HwScalingList.c
-        SyntaxConversion.c
-        BufferCircMeta.c
-        BufferStreamMeta.c
-        BufferPictureMeta.c
-        BufferPictureDecMeta.c
-        BufferSeiMeta.c
-    )
-    if(ENABLE_ENC_SW_MULTIPASS)
-        list(APPEND LIB_COMMON_SRC BufferLookAheadMeta.c)
-    endif()
-    if(ENABLE_HIGH_DYNAMIC_RANGE)
-        list(APPEND LIB_COMMON_SRC HDR.c)
-    endif()
+if(ENABLE_HIGH_DYNAMIC_RANGE)
+    list(APPEND LIB_COMMON_SRC HDR.c)
 endif()
 
 add_library(lib_common_obj OBJECT ${LIB_COMMON_SRC})

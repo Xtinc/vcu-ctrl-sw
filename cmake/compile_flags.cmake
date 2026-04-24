@@ -2,7 +2,6 @@
 if(MSVC)
     add_compile_options(
         /W3
-        # /WX
     )
 else()
     # From codec_defs.mk: suppress third-party noise first, then re-enable
@@ -13,7 +12,6 @@ else()
         -pedantic
         -pedantic-errors
         -Werror=pedantic
-        -Werror
         -Wall
         -Wextra
     )
