@@ -4,12 +4,12 @@
 #include "RealtimeEncoder.h"
 
 #include <chrono>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 extern "C"
 {
@@ -26,6 +26,7 @@ extern "C"
 #include "lib_encode/EncSchedulerMcu.h"
 #include "lib_fpga/DmaAlloc.h"
 #include "lib_fpga/DmaAllocLinux.h"
+#include "lib_rtos/message.h"
 }
 
 /* --------------------------------------------------------------------------
@@ -80,6 +81,7 @@ RealtimeEncoder::RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback 
     /* 5. 构建编码器参数并创建编码器 */
     AL_TEncSettings settings{};
     AL_Settings_SetDefaults(&settings);
+    AL_Settings_SetDefaultParam(&settings);
     initSettings(settings);
 
     {
@@ -554,8 +556,8 @@ void RealtimeEncoder::initSettings(AL_TEncSettings &settings) const
     ch.eProfile = m_cfg.eProfile;
     ch.uLevel = m_cfg.uLevel;
     ch.uTier = m_cfg.uTier;
-    ch.ePicFormat = static_cast<AL_EPicFormat>((static_cast<int>(m_cfg.eChromaMode) << 8) | (m_cfg.uBitDepth & 0x0F) |
-                                               ((m_cfg.uBitDepth & 0x0F) << 4));
+    AL_SET_CHROMA_MODE(&ch.ePicFormat, m_cfg.eChromaMode);
+    AL_SET_BITDEPTH(&ch.ePicFormat, m_cfg.uBitDepth);
     ch.uSrcBitDepth = m_cfg.uBitDepth;
     ch.eSrcMode = AL_SRC_RASTER;
     ch.eVideoMode = AL_VM_PROGRESSIVE;
