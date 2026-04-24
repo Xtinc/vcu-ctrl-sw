@@ -222,7 +222,7 @@ static void* NotificationThread(void* p)
       if(err == DRIVER_SUCCESS)
         processStatusMsg(channel, &msg);
       else
-        AUDIO_ERROR("Failed to get decode status (error code: %d)", err);
+        VIDEO_ERROR_PRINT("Failed to get decode status (error code: %d)", err);
     }
 
     /* If the polling finds an end of operation, it means that the channel was destroyed and we can stop waiting for decoding results. */
@@ -294,12 +294,12 @@ static void* ScNotificationThread(void* p)
       if(err == DRIVER_SUCCESS)
         processScStatusMsg(pMsg, &StatusMsg);
       else
-        Rtos_Log(AL_LOG_ERROR, "Failed to get start code status (error code: %d)\n", err);
+        VIDEO_ERROR_PRINT("Failed to get start code status (error code: %d)", err);
     }
 
     if(ctx.revents & AL_POLLHUP)
     {
-      Rtos_Log(AL_LOG_ERROR, "Unexpected End of Operation on start code status: (error_code: %d\n", err);
+      VIDEO_ERROR_PRINT("Unexpected End of Operation on start code status: (error_code: %d", err);
       break;
     }
 
@@ -419,7 +419,7 @@ static AL_ERR API_DestroyChannel(AL_IDecScheduler* pScheduler, AL_HANDLE hChanne
 
   if(error != DRIVER_SUCCESS)
   {
-    Rtos_Log(AL_LOG_ERROR, "Failed to destroy channel (error code: %d)\n", error);
+    VIDEO_ERROR_PRINT("Failed to destroy channel (error code: %d)", error);
     goto exit;
   }
 
@@ -456,7 +456,7 @@ static AL_ERR API_CreateChannel(AL_HANDLE* hChannel, AL_IDecScheduler* pSchedule
 
   if(pChannel->fd < 0)
   {
-    Rtos_Log(AL_LOG_ERROR, "Couldn't open device file %s while creating channel: %s\n", scheduler->deviceFile, strerror(errno));
+    VIDEO_ERROR_PRINT("Couldn't open device file '%s' while creating channel: '%s'", scheduler->deviceFile, strerror(errno));
     goto fail_open;
   }
 
@@ -543,7 +543,7 @@ static void API_SearchSC(AL_IDecScheduler* pScheduler, AL_HANDLE hStartCodeChann
 
   if(pMsg->fd < 0)
   {
-    Rtos_Log(AL_LOG_ERROR, "Cannot open device file %s: %s\n", scheduler->deviceFile, strerror(errno));
+    VIDEO_ERROR_PRINT("Couldn't open device file '%s' while creating channel: '%s'", scheduler->deviceFile, strerror(errno));
     goto fail_open;
   }
 
@@ -554,7 +554,7 @@ static void API_SearchSC(AL_IDecScheduler* pScheduler, AL_HANDLE hStartCodeChann
 
   if(error != DRIVER_SUCCESS)
   {
-    Rtos_Log(AL_LOG_ERROR, "Failed to search start code (error code: %d)\n", error);
+    VIDEO_ERROR_PRINT("Failed to search start code (error code: %d)", error);
     goto fail_open;
   }
 
@@ -591,7 +591,7 @@ static void API_DecodeOneFrame(AL_IDecScheduler* pScheduler, AL_HANDLE hChannel,
   AL_EDriverError error = AL_Driver_PostBlockingMessage(scheduler->driver, chan->fd, AL_MCU_DECODE_ONE_FRM, &msg);
 
   if(error != DRIVER_SUCCESS)
-    Rtos_Log(AL_LOG_ERROR, "Failed to decode one frame (error code: %d)\n", error);
+    VIDEO_ERROR_PRINT("Failed to decode one frame (error code: %d)", error);
 }
 
 static void API_DecodeOneSlice(AL_IDecScheduler* pScheduler, AL_HANDLE hChannel, AL_TDecPicParam* pPictParam, AL_TDecPicBufferAddrs* pPictAddrs, TMemDesc* hSliceParam)
@@ -605,7 +605,7 @@ static void API_DecodeOneSlice(AL_IDecScheduler* pScheduler, AL_HANDLE hChannel,
   AL_EDriverError const error = AL_Driver_PostBlockingMessage(scheduler->driver, chan->fd, AL_MCU_DECODE_ONE_SLICE, &msg);
 
   if(error != DRIVER_SUCCESS)
-    Rtos_Log(AL_LOG_ERROR, "Failed to decode one slice (error code: %d)\n", error);
+    VIDEO_ERROR_PRINT("Failed to decode one slice (error code: %d)", error);
 }
 
 static void GetSchedulerCoreInfo(AL_TDecSchedulerMicroblaze const* pThis, AL_TIDecSchedulerCore* pCore)
@@ -614,7 +614,7 @@ static void GetSchedulerCoreInfo(AL_TDecSchedulerMicroblaze const* pThis, AL_TID
 
   if(fd < 0)
   {
-    Rtos_Log(AL_LOG_ERROR, "Couldn't open device file '%s' while creating channel: '%s'\n", pThis->deviceFile, strerror(errno));
+    VIDEO_ERROR_PRINT("Couldn't open device file '%s' while creating channel: '%s'", pThis->deviceFile, strerror(errno));
     return;
   }
 
@@ -630,7 +630,7 @@ static void GetSchedulerCoreInfo(AL_TDecSchedulerMicroblaze const* pThis, AL_TID
 
   if(error != DRIVER_SUCCESS)
   {
-    Rtos_Log(AL_LOG_ERROR, "Failed to get parameter '%s', (error code: '%d')\n", ToStringIDecSchedulerInfo(AL_IDECSCHEDULER_CORE), error);
+    VIDEO_ERROR_PRINT("Failed to get parameter '%s', (error code: '%d')", ToStringIDecSchedulerInfo(AL_IDECSCHEDULER_CORE), error);
     AL_Driver_Close(pThis->driver, fd);
     return;
   }
@@ -647,7 +647,7 @@ static void GetSchedulerVersion(AL_TDecSchedulerMicroblaze const* pThis, AL_TIDe
 
   if(fd < 0)
   {
-    Rtos_Log(AL_LOG_ERROR, "Couldn't open device file '%s' while creating channel: '%s'\n", pThis->deviceFile, strerror(errno));
+    VIDEO_ERROR_PRINT("Couldn't open device file '%s' while creating channel: '%s'", pThis->deviceFile, strerror(errno));
     return;
   }
 
@@ -663,7 +663,7 @@ static void GetSchedulerVersion(AL_TDecSchedulerMicroblaze const* pThis, AL_TIDe
 
   if(error != DRIVER_SUCCESS)
   {
-    Rtos_Log(AL_LOG_ERROR, "Failed to get parameter '%s', (error code: '%d')\n", ToStringIDecSchedulerInfo(AL_IDECSCHEDULER_VERSION), error);
+    VIDEO_ERROR_PRINT("Failed to get parameter '%s', (error code: '%d')", ToStringIDecSchedulerInfo(AL_IDECSCHEDULER_VERSION), error);
     AL_Driver_Close(pThis->driver, fd);
     return;
   }

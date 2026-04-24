@@ -265,7 +265,7 @@ static void* WaitForStatus(void* p)
       if(err == DRIVER_SUCCESS)
         processStatusMsg(pChannel, &msg);
       else
-        Rtos_Log(AL_LOG_ERROR, "Failed to get encode status (error code: %d)\n", err);
+        VIDEO_ERROR_PRINT("Failed to get encode status (error code: %d)", err);
     }
 
     /* If the polling finds an end of operation, it means that the channel was destroyed and we can stop waiting for encoding results. */
@@ -322,7 +322,7 @@ static void GetSchedulerVersion(AL_TEncSchedulerMicroblaze const* pScheduler, AL
 
   if(fd < 0)
   {
-    Rtos_Log(AL_LOG_ERROR, "Couldn't open device file '%s' while creating channel: '%s'\n", pScheduler->deviceFile, strerror(errno));
+    VIDEO_ERROR_PRINT("Couldn't open device file '%s' while getting driver version: '%s'", pScheduler->deviceFile, strerror(errno));
     return;
   }
 
@@ -338,7 +338,7 @@ static void GetSchedulerVersion(AL_TEncSchedulerMicroblaze const* pScheduler, AL
 
   if(error != DRIVER_SUCCESS)
   {
-    Rtos_Log(AL_LOG_ERROR, "Failed to get parameter '%s', (error code: '%d')\n", ToStringIEncSchedulerInfo(AL_IENCSCHEDULER_VERSION), error);
+    VIDEO_ERROR_PRINT("Failed to get parameter '%s', (error code: '%d')", ToStringIEncSchedulerInfo(AL_IENCSCHEDULER_VERSION), error);
     AL_Driver_Close(pScheduler->driver, fd);
     return;
   }
