@@ -61,7 +61,7 @@ struct EncoderConfig
     uint32_t uNumStreamBufs = 4; /*!< 输出码流缓冲数量 */
 
     /* ---- 硬件设备路径 ---- */
-    std::string sDevicePath = "/dev/allegroIP"; /*!< ZYNQ VCU 设备节点 */
+    std::string sDevicePath = "/dev/allegroIP";  /*!< ZYNQ VCU 设备节点 */
     std::string sDMAProxyPath = "/dev/dmaproxy"; /*!< DMAProxy 设备节点 */
 };
 

@@ -478,50 +478,6 @@ void RealtimeEncoder::onEncodedFrame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
         const auto *pBase = AL_Buffer_GetData(pStream);
         const auto uSize = ReconstructStream(m_dmaProxy, pStream, 0);
 
-        // std::vector<uint8_t> frameData;
-        // size_t totalPayload = 0;
-        // for (uint16_t i = 0; i < pMeta->uNumSection; ++i)
-        // {
-        //     const AL_TStreamSection &sec = pMeta->pSections[i];
-        //     if (sec.uLength == 0 || (sec.eFlags & AL_SECTION_END_FRAME_FLAG))
-        //     {
-        //         continue;
-        //     }
-        //     totalPayload += sec.uLength;
-        // }
-        // frameData.reserve(totalPayload);
-
-        // for (uint16_t i = 0; i < pMeta->uNumSection; ++i)
-        // {
-        //     const AL_TStreamSection &sec = pMeta->pSections[i];
-        //     if (sec.uLength == 0 || (sec.eFlags & AL_SECTION_END_FRAME_FLAG))
-        //     {
-        //         continue;
-        //     }
-
-        //     size_t const sectionOffset = sec.uOffset;
-        //     size_t const sectionLength = sec.uLength;
-
-        //     if (sectionOffset >= streamCapacity)
-        //     {
-        //         m_hasError.store(true);
-        //         continue;
-        //     }
-
-        //     size_t const safeLength = std::min(sectionLength, streamCapacity);
-
-        //     if (sectionOffset + safeLength <= streamCapacity)
-        //     {
-        //         frameData.insert(frameData.end(), pBase + sectionOffset, pBase + sectionOffset + safeLength);
-        //     }
-        //     else
-        //     {
-        //         size_t const firstPart = streamCapacity - sectionOffset;
-        //         frameData.insert(frameData.end(), pBase + sectionOffset, pBase + sectionOffset + firstPart);
-        //         frameData.insert(frameData.end(), pBase, pBase + (safeLength - firstPart));
-        //     }
-        // }
-
         if (m_callback && uSize)
         {
             try

@@ -25,7 +25,6 @@ set(LIB_APP_SRC
     UnCompFrameReader.cpp
     UnCompFrameWriter.cpp
     utils.cpp
-    YUVFileIO.cpp
     YuvIO.cpp
 )
 

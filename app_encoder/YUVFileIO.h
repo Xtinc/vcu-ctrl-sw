@@ -1,5 +1,5 @@
-#ifndef YUVFILEIO_H
-#define YUVFILEIO_H
+#ifndef VIDEO_YUVFILEIO_H
+#define VIDEO_YUVFILEIO_H
 
 extern "C"
 {
