@@ -3,10 +3,10 @@
 
 #include "RealtimeEncoder.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,31 +29,100 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
-/* --------------------------------------------------------------------------
- * 内部常量
- * --------------------------------------------------------------------------*/
-
-/** 流缓冲区基础平滑余量（与原工程保持一致） */
 static constexpr int kStreamSmoothingCount = 2;
-/** 缓冲区高度对齐粒度 */
 static constexpr int kHeightAlign = 8;
 
-/* ============================================================================
- * 构造 / 析构
- * ============================================================================*/
+static uint32_t WriteOneSection(DMAProxy &mem_ctl, AL_TBuffer *source, AL_TBuffer *destination, int offset,
+                                int numSection)
+{
+    auto meta = reinterpret_cast<AL_TStreamMetaData *>(AL_Buffer_GetMetaData(source, AL_META_TYPE_STREAM));
+    auto &section = meta->pSections[numSection];
 
-RealtimeEncoder::RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback callback)
-    : m_cfg(cfg), m_callback(std::move(callback))
+    if (section.uLength == 0 || (section.eFlags & AL_SECTION_END_FRAME_FLAG))
+    {
+        return 0;
+    }
+
+    DBG_ASSERT_GE(source->zSizes[0], section.uOffset);
+
+    auto size = source->zSizes[0] - section.uOffset;
+    if (size < section.uLength)
+    {
+        mem_ctl.move(destination, offset, source, section.uOffset, size);
+        mem_ctl.move(destination, offset, source, 0, section.uLength - size);
+    }
+    else
+    {
+        mem_ctl.move(destination, offset, source, section.uOffset, section.uLength);
+    }
+
+    return section.uLength;
+}
+
+static uint32_t WriteFillerDataSection(DMAProxy &mem_ctl, AL_TBuffer *source, AL_TBuffer *destination, int offset,
+                                       int numSection)
+{
+    auto meta = reinterpret_cast<AL_TStreamMetaData *>(AL_Buffer_GetMetaData(source, AL_META_TYPE_STREAM));
+    auto &section = meta->pSections[numSection];
+
+    auto src = AL_Buffer_GetData(source);
+    auto dst = AL_Buffer_GetData(destination);
+    auto srcOffset = section.uOffset;
+    auto dstOffset = offset;
+    auto length = section.uLength;
+
+    while (--length && (src[srcOffset] != 0xFF))
+    {
+        dst[dstOffset++] = src[srcOffset++];
+    }
+
+    if (length > 0)
+    {
+        mem_ctl.set(destination, dstOffset, 0xFF, length);
+    }
+
+    DBG_ASSERT_COND(src[srcOffset + length] == 0x80);
+    dst[dstOffset + length] = src[srcOffset + length];
+    return section.uLength;
+}
+
+static uint32_t ReconstructStream(DMAProxy &mem_ctl, AL_TBuffer *stream, int firstSection)
+{
+    uint32_t size = 0;
+    auto meta = (AL_TStreamMetaData *)(AL_Buffer_GetMetaData(stream, AL_META_TYPE_STREAM));
+
+    DBG_ASSERT_COND(meta != nullptr);
+    DBG_ASSERT_LE(firstSection, meta->uNumSection);
+
+    for (int i = firstSection; i < meta->uNumSection; i++)
+    {
+        if (meta->pSections[i].eFlags & AL_SECTION_APP_FILLER_FLAG)
+        {
+            size += WriteFillerDataSection(mem_ctl, stream, stream, static_cast<int>(size), i);
+        }
+        else
+        {
+            size += WriteOneSection(mem_ctl, stream, stream, static_cast<int>(size), i);
+        }
+    }
+
+    return size;
+}
+
+RealtimeEncoder::RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb, RealtimeEncoder::WorkMode mode)
+    : m_work_mode(mode), m_cfg(cfg), m_callback(std::move(cb)), m_dmaProxy(cfg.sDMAProxyPath.c_str())
 {
     if (!m_callback)
+    {
         throw std::invalid_argument("RealtimeEncoder: callback must not be null");
+    }
 
-    /* 1. 初始化编码器库 */
     AL_ERR err = AL_Lib_Encoder_Init(AL_LIB_ENCODER_ARCH_HOST);
     if (err != AL_SUCCESS)
+    {
         throw std::runtime_error(std::string("AL_Lib_Encoder_Init failed: ") + AL_Codec_ErrorToString(err));
+    }
 
-    /* 2. 创建 DMA 分配器（访问 ZYNQ VCU 物理内存） */
     m_pAllocator = AL_DmaAlloc_Create(m_cfg.sDevicePath.c_str());
     if (!m_pAllocator)
     {
@@ -61,7 +130,6 @@ RealtimeEncoder::RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback 
         throw std::runtime_error("Failed to create DMA allocator for device: " + m_cfg.sDevicePath);
     }
 
-    /* 3. 创建 MCU 调度器 */
     m_pScheduler = AL_SchedulerMcu_Create(
         AL_GetHardwareDriver(), reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator), m_cfg.sDevicePath.c_str());
     if (!m_pScheduler)
@@ -72,35 +140,29 @@ RealtimeEncoder::RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback 
         throw std::runtime_error("Failed to create MCU scheduler");
     }
 
-    /* 4. 缓存源图像格式信息 */
     m_picFormat = AL_EncGetSrcPicFormat(m_cfg.eChromaMode, m_cfg.uBitDepth, AL_SRC_RASTER);
     m_srcFourCC = AL_EncGetSrcFourCC(m_picFormat);
     m_pitchY = AL_EncGetMinPitch(m_cfg.width, &m_picFormat);
     m_strideH = AL_RoundUp(static_cast<int>(m_cfg.height), kHeightAlign);
 
-    /* 5. 构建编码器参数并创建编码器 */
     AL_TEncSettings settings{};
     AL_Settings_SetDefaults(&settings);
     AL_Settings_SetDefaultParam(&settings);
     initSettings(settings);
 
+    auto result = AL_Settings_CheckValidity(&settings, &settings.tChParam[0], nullptr);
+    if (result > 0)
     {
-        int nInvalid = AL_Settings_CheckValidity(&settings, &settings.tChParam[0], stderr);
-        if (nInvalid > 0)
-            throw std::runtime_error("AL_Settings_CheckValidity found " + std::to_string(nInvalid) +
-                                     " invalid parameter(s)");
-    }
-    {
-        int nIncoherent = AL_Settings_CheckCoherency(&settings, &settings.tChParam[0], m_srcFourCC, stderr);
-        if (nIncoherent < 0)
-            throw std::runtime_error("AL_Settings_CheckCoherency: fatal incoherency");
+        throw std::runtime_error("AL_Settings_CheckValidity found " + std::to_string(result) + " invalid parameter(s)");
     }
 
-    AL_CB_EndEncoding cb{};
-    cb.func = &RealtimeEncoder::sdkCallback;
-    cb.userParam = this;
+    result = AL_Settings_CheckCoherency(&settings, &settings.tChParam[0], m_srcFourCC, nullptr);
+    if (result < 0)
+    {
+        throw std::runtime_error("AL_Settings_CheckCoherency: fatal incoherency");
+    }
 
-    err = AL_Encoder_Create(&m_hEnc, m_pScheduler, m_pAllocator, &settings, cb);
+    err = AL_Encoder_Create(&m_hEnc, m_pScheduler, m_pAllocator, &settings, {&RealtimeEncoder::sdkCallback, this});
     if (err != AL_SUCCESS || m_hEnc == nullptr)
     {
         AL_IEncScheduler_Destroy(m_pScheduler);
@@ -111,19 +173,21 @@ RealtimeEncoder::RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback 
         throw std::runtime_error(std::string("AL_Encoder_Create failed: ") + AL_Codec_ErrorToString(err));
     }
 
-    /* 6. 创建并初始化缓冲区池 */
+    if (!AL_Encoder_SetAutoQP(m_hEnc, true))
+    {
+        VIDEO_ERROR_PRINT("AL_Encoder_SetAutoQP failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
+    }
+
     m_srcBufPool = std::make_unique<PixMapBufPool>();
     m_streamBufPool = std::make_unique<BufPool>();
     initSrcBufPool();
     initStreamBufPool();
 
-    /* 7. 预先向编码器填充全部流缓冲 */
     pushStreamBuffers();
 }
 
 RealtimeEncoder::~RealtimeEncoder()
 {
-    /* 若调用者未主动 flush，确保 EOS 被发送 */
     if (!m_stopped.load())
     {
         try
@@ -135,29 +199,23 @@ RealtimeEncoder::~RealtimeEncoder()
         }
     }
 
-    /* 1. 先销毁编码器（停止使用buffer） */
     if (m_hEnc != nullptr)
     {
         AL_Encoder_Destroy(m_hEnc);
         m_hEnc = nullptr;
     }
 
-    /* 2. 显式释放 buffer pools（必须在 allocator 销毁之前）
-     * BufPool 析构时会调用 AL_Buffer_Destroy 释放所有 DMA buffer，
-     * 这需要使用 allocator。因此我们必须在销毁 allocator 之前
-     * 先销毁 buffer pool。 */
     if (m_srcBufPool)
     {
         m_srcBufPool->Decommit();
-        m_srcBufPool.reset(); // 显式释放，调用 ~PixMapBufPool()
+        m_srcBufPool.reset();
     }
     if (m_streamBufPool)
     {
         m_streamBufPool->Decommit();
-        m_streamBufPool.reset(); // 显式释放，调用 ~BufPool()
+        m_streamBufPool.reset();
     }
 
-    /* 3. 现在可以安全地销毁 scheduler 和 allocator */
     if (m_pScheduler)
     {
         AL_IEncScheduler_Destroy(m_pScheduler);
@@ -172,61 +230,34 @@ RealtimeEncoder::~RealtimeEncoder()
     AL_Lib_Encoder_DeInit();
 }
 
-/* ============================================================================
- * 公开接口
- * ============================================================================*/
-
-bool RealtimeEncoder::pushFrame(const uint8_t *pData, int srcPitch)
-{
-    if (!pData)
-        return false;
-
-    if (m_stopped.load())
-        return false;
-
-    if (m_hasError.load())
-        return false;
-
-    /* 从源缓冲池取一块空闲 DMA 缓冲（阻塞直到有空闲） */
-    AL_TBuffer *pSrcBuf = m_srcBufPool->GetBuffer(AL_BUF_MODE_BLOCK);
-    if (!pSrcBuf)
-        return false;
-
-    /* 将调用者提供的帧数据拷贝到 DMA 缓冲 */
-    copyFrameData(pSrcBuf, pData, srcPitch);
-
-    /* 提交给硬件编码
-     * 引用计数说明：
-     *   - GetBuffer 已使 ref=1（用户引用）
-     *   - AL_Encoder_Process 内部再 Ref → ref=2（SDK 引用）
-     *   - 我们立即 Unref 释放用户引用 → ref=1，缓冲由 SDK 持有
-     *   - SDK 编码完毕后触发 source-release 回调并 Unref → ref=0 → 回池 */
-    bool const ok = AL_Encoder_Process(m_hEnc, pSrcBuf, nullptr);
-    AL_Buffer_Unref(pSrcBuf); /* 释放用户引用；SDK 持有自身引用直到编码完毕 */
-
-    if (!ok)
-    {
-        m_hasError.store(true);
-        return false;
-    }
-    return true;
-}
-
 AL_TBuffer *RealtimeEncoder::acquireSourceBuffer()
 {
-    if (m_stopped.load() || m_hasError.load())
+    if (m_work_mode != WorkMode::FILE)
+    {
         return nullptr;
+    }
+
+    if (m_stopped.load() || m_hasError.load())
+    {
+        return nullptr;
+    }
     return m_srcBufPool->GetBuffer(AL_BUF_MODE_BLOCK);
 }
 
 bool RealtimeEncoder::submitSourceBuffer(AL_TBuffer *pBuf)
 {
-    if (!pBuf)
+    if (m_work_mode != WorkMode::FILE)
+    {
         return false;
+    }
+
+    if (!pBuf)
+    {
+        return false;
+    }
 
     if (m_stopped.load() || m_hasError.load())
     {
-        /* 缓冲已由调用方持有（ref=1），需要释放避免泄漏 */
         AL_Buffer_Unref(pBuf);
         return false;
     }
@@ -237,7 +268,7 @@ bool RealtimeEncoder::submitSourceBuffer(AL_TBuffer *pBuf)
      *   - 此处 Unref 释放用户引用 → ref=1，缓冲由 SDK 持有
      *   - 编码完毕后经 source-release 回调自动回池 */
     bool const ok = AL_Encoder_Process(m_hEnc, pBuf, nullptr);
-    AL_Buffer_Unref(pBuf); /* 释放用户引用 */
+    AL_Buffer_Unref(pBuf);
 
     if (!ok)
     {
@@ -249,16 +280,27 @@ bool RealtimeEncoder::submitSourceBuffer(AL_TBuffer *pBuf)
 
 bool RealtimeEncoder::submitDmabufFd(int fd, size_t size, uint64_t token)
 {
-    if (fd < 0 || size == 0)
+    if (m_work_mode != WorkMode::V4L2)
+    {
         return false;
+    }
+
+    if (fd < 0 || size == 0)
+    {
+        return false;
+    }
 
     if (m_stopped.load() || m_hasError.load())
+    {
         return false;
+    }
 
     auto *pLinuxAllocator = reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator);
     AL_HANDLE dmaHandle = AL_LinuxDmaAllocator_ImportFromFd(pLinuxAllocator, fd);
     if (!dmaHandle)
+    {
         return false;
+    }
 
     AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
     AL_TBuffer *pSrcBuf = AL_PixMapBuffer_Create(m_pAllocator, AL_Buffer_Destroy, tDim, m_srcFourCC);
@@ -301,6 +343,7 @@ bool RealtimeEncoder::submitDmabufFd(int fd, size_t size, uint64_t token)
             m_externalSources.erase(pSrcBuf);
         }
         AL_Buffer_Unref(pSrcBuf);
+        VIDEO_ERROR_PRINT("Failed to submit dmabuf fd %d to encoder", fd);
         m_hasError.store(true);
         return false;
     }
@@ -318,7 +361,9 @@ void RealtimeEncoder::setSourceReleaseCallback(SourceReleaseCallback cb)
 void RealtimeEncoder::flush()
 {
     if (m_stopped.exchange(true))
-        return; /* 已经调用过 flush */
+    {
+        return;
+    }
 
     /* 先让缓冲池拒绝新的阻塞请求，防止内部线程死锁 */
     m_srcBufPool->Decommit();
@@ -332,9 +377,8 @@ void RealtimeEncoder::flush()
     }
 
     /* 等待回调通知 EOS，避免无限阻塞 */
-    static constexpr auto kEosWaitTimeout = std::chrono::seconds(10);
     std::unique_lock<std::mutex> lock(m_eosMutex);
-    bool const gotEos = m_eosCv.wait_for(lock, kEosWaitTimeout, [this] { return m_eosReceived; });
+    bool const gotEos = m_eosCv.wait_for(lock, std::chrono::seconds(10), [this] { return m_eosReceived; });
     if (!gotEos)
     {
         m_hasError.store(true);
@@ -345,7 +389,9 @@ void RealtimeEncoder::flush()
 void RealtimeEncoder::requestKeyFrame()
 {
     if (m_hEnc != nullptr)
+    {
         AL_Encoder_RestartGop(m_hEnc);
+    }
 }
 
 bool RealtimeEncoder::setBitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
@@ -363,11 +409,6 @@ bool RealtimeEncoder::setBitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
     return true;
 }
 
-/* ============================================================================
- * SDK 回调
- * ============================================================================*/
-
-/*static*/
 void RealtimeEncoder::sdkCallback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int /*iLayerID*/)
 {
     auto *self = static_cast<RealtimeEncoder *>(pUserParam);
@@ -396,43 +437,15 @@ void RealtimeEncoder::onEncodedFrame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
      * 对内部池缓冲无需干预；对外部 dmabuf 缓冲需要通知调用方回收。 */
     if (!pStream && pSrc)
     {
-        ExternalSourceContext ctx{};
-        bool found = false;
-        {
-            std::lock_guard<std::mutex> lock(m_externalSourcesMutex);
-            auto it = m_externalSources.find(pSrc);
-            if (it != m_externalSources.end())
-            {
-                ctx = it->second;
-                m_externalSources.erase(it);
-                found = true;
-            }
-        }
-
-        SourceReleaseCallback releaseCb;
-        {
-            std::lock_guard<std::mutex> lock(m_sourceReleaseCallbackMutex);
-            releaseCb = m_sourceReleaseCallback;
-        }
-
-        if (found && releaseCb)
-        {
-            try
-            {
-                releaseCb(ctx.token);
-            }
-            catch (...)
-            {
-                m_hasError.store(true);
-            }
-        }
-
+        releaseExternSources(pSrc);
         return;
     }
 
     /* stream-release：仅通知，无需处理 */
     if (pStream && !pSrc)
+    {
         return;
+    }
 
     /* EOS 信号 */
     if (!pStream && !pSrc)
@@ -447,80 +460,73 @@ void RealtimeEncoder::onEncodedFrame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
     AL_ERR const encErr = AL_Encoder_GetLastError(m_hEnc);
     if (AL_IS_ERROR_CODE(encErr))
     {
-        std::fprintf(stderr, "RealtimeEncoder: encoder error: %s\n", AL_Codec_ErrorToString(encErr));
+        VIDEO_ERROR_PRINT("RealtimeEncoder: encoder error: %s", AL_Codec_ErrorToString(encErr));
         m_hasError.store(true);
     }
-
-    if (AL_IS_WARNING_CODE(encErr))
+    else if (AL_IS_WARNING_CODE(encErr))
     {
-        std::fprintf(stderr, "RealtimeEncoder: encoder warning: %s\n", AL_Codec_ErrorToString(encErr));
+        VIDEO_INFO_PRINT("RealtimeEncoder: encoder warning: %s", AL_Codec_ErrorToString(encErr));
     }
 
     auto *pMeta = reinterpret_cast<AL_TStreamMetaData *>(AL_Buffer_GetMetaData(pStream, AL_META_TYPE_STREAM));
 
-    if (pMeta && pMeta->uNumSection > 0 && m_callback)
+    if (pMeta && pMeta->uNumSection > 0)
     {
-        const uint8_t *pBase = AL_Buffer_GetData(pStream);
-        size_t const streamCapacity = pStream->zSizes[0];
+        const auto isKeyFrame =
+            std::any_of(pMeta->pSections, pMeta->pSections + pMeta->uNumSection,
+                        [](const AL_TStreamSection &sec) { return (sec.eFlags & AL_SECTION_SYNC_FLAG) != 0; });
+        const auto *pBase = AL_Buffer_GetData(pStream);
+        const auto uSize = ReconstructStream(m_dmaProxy, pStream, 0);
 
-        /* 检查是否含有同步帧（IDR/I-frame）标志 */
-        bool isKeyFrame = false;
-        for (uint16_t i = 0; i < pMeta->uNumSection; ++i)
-        {
-            if (pMeta->pSections[i].eFlags & AL_SECTION_SYNC_FLAG)
-            {
-                isKeyFrame = true;
-                break;
-            }
-        }
+        // std::vector<uint8_t> frameData;
+        // size_t totalPayload = 0;
+        // for (uint16_t i = 0; i < pMeta->uNumSection; ++i)
+        // {
+        //     const AL_TStreamSection &sec = pMeta->pSections[i];
+        //     if (sec.uLength == 0 || (sec.eFlags & AL_SECTION_END_FRAME_FLAG))
+        //     {
+        //         continue;
+        //     }
+        //     totalPayload += sec.uLength;
+        // }
+        // frameData.reserve(totalPayload);
 
-        /* 将所有 section 重组为连续码流，保持与 OMX 侧重组语义一致。 */
-        std::vector<uint8_t> frameData;
+        // for (uint16_t i = 0; i < pMeta->uNumSection; ++i)
+        // {
+        //     const AL_TStreamSection &sec = pMeta->pSections[i];
+        //     if (sec.uLength == 0 || (sec.eFlags & AL_SECTION_END_FRAME_FLAG))
+        //     {
+        //         continue;
+        //     }
 
-        size_t totalPayload = 0;
-        for (uint16_t i = 0; i < pMeta->uNumSection; ++i)
-        {
-            const AL_TStreamSection &sec = pMeta->pSections[i];
-            if (sec.uLength == 0 || (sec.eFlags & AL_SECTION_END_FRAME_FLAG))
-                continue;
-            totalPayload += sec.uLength;
-        }
-        frameData.reserve(totalPayload);
+        //     size_t const sectionOffset = sec.uOffset;
+        //     size_t const sectionLength = sec.uLength;
 
-        for (uint16_t i = 0; i < pMeta->uNumSection; ++i)
-        {
-            const AL_TStreamSection &sec = pMeta->pSections[i];
-            if (sec.uLength == 0 || (sec.eFlags & AL_SECTION_END_FRAME_FLAG))
-                continue;
+        //     if (sectionOffset >= streamCapacity)
+        //     {
+        //         m_hasError.store(true);
+        //         continue;
+        //     }
 
-            size_t const sectionOffset = sec.uOffset;
-            size_t const sectionLength = sec.uLength;
+        //     size_t const safeLength = std::min(sectionLength, streamCapacity);
 
-            if (sectionOffset >= streamCapacity)
-            {
-                m_hasError.store(true);
-                continue;
-            }
+        //     if (sectionOffset + safeLength <= streamCapacity)
+        //     {
+        //         frameData.insert(frameData.end(), pBase + sectionOffset, pBase + sectionOffset + safeLength);
+        //     }
+        //     else
+        //     {
+        //         size_t const firstPart = streamCapacity - sectionOffset;
+        //         frameData.insert(frameData.end(), pBase + sectionOffset, pBase + sectionOffset + firstPart);
+        //         frameData.insert(frameData.end(), pBase, pBase + (safeLength - firstPart));
+        //     }
+        // }
 
-            size_t const safeLength = std::min(sectionLength, streamCapacity);
-
-            if (sectionOffset + safeLength <= streamCapacity)
-            {
-                frameData.insert(frameData.end(), pBase + sectionOffset, pBase + sectionOffset + safeLength);
-            }
-            else
-            {
-                size_t const firstPart = streamCapacity - sectionOffset;
-                frameData.insert(frameData.end(), pBase + sectionOffset, pBase + sectionOffset + firstPart);
-                frameData.insert(frameData.end(), pBase, pBase + (safeLength - firstPart));
-            }
-        }
-
-        if (!frameData.empty())
+        if (m_callback && uSize)
         {
             try
             {
-                m_callback(frameData.data(), frameData.size(), isKeyFrame);
+                m_callback(pBase, uSize, isKeyFrame);
             }
             catch (...)
             {
@@ -529,18 +535,17 @@ void RealtimeEncoder::onEncodedFrame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
         }
     }
 
-    /* 重置元数据节计数，将流缓冲重新入队给编码器（不调用 Unref！） */
     if (pMeta)
+    {
         AL_StreamMetaData_ClearAllSections(pMeta);
+    }
 
-    bool const putOk = AL_Encoder_PutStreamBuffer(m_hEnc, pStream);
-    if (!putOk)
+    if (!AL_Encoder_PutStreamBuffer(m_hEnc, pStream))
+    {
+        VIDEO_ERROR_PRINT("Failed to put stream buffer back to encoder");
         m_hasError.store(true);
+    }
 }
-
-/* ============================================================================
- * 初始化辅助
- * ============================================================================*/
 
 void RealtimeEncoder::initSettings(AL_TEncSettings &settings) const
 {
@@ -574,7 +579,7 @@ void RealtimeEncoder::initSettings(AL_TEncSettings &settings) const
     rc.uClkRatio = m_cfg.uClkRatio;
     rc.iInitialQP = m_cfg.iInitialQP;
 
-    /* CPB 大小 = 目标码率 / 帧率（1 秒缓冲） */
+    /* CPB 大小 = 目标码率 / 帧率 */
     float fps = static_cast<float>(m_cfg.uFrameRate) * 1000.0f / static_cast<float>(m_cfg.uClkRatio);
     rc.uCPBSize = static_cast<uint32_t>(m_cfg.uTargetBitRate / fps);
     rc.uInitialRemDelay = rc.uCPBSize;
@@ -585,6 +590,9 @@ void RealtimeEncoder::initSettings(AL_TEncSettings &settings) const
     {
         gop.eMode = AL_GOP_MODE_LOW_DELAY_P;
         gop.uNumB = 0;
+        // ch.uNumSlices = 8;
+        // ch.uSliceSize = 0;
+        // ch.eEncOptions = static_cast<AL_EChEncOption>(ch.eEncOptions | AL_OPT_LOWLAT_INT);
     }
     else
     {
@@ -672,8 +680,7 @@ void RealtimeEncoder::pushStreamBuffers()
          *   - GetBuffer 使 ref=1（用户引用）
          *   - AL_Encoder_PutStreamBuffer 内部 Ref → ref=2（SDK 引用）
          *   - Unref 释放用户引用 → ref=1，缓冲由 SDK 持有 */
-        bool const putOk = AL_Encoder_PutStreamBuffer(m_hEnc, pStream);
-        if (!putOk)
+        if (!AL_Encoder_PutStreamBuffer(m_hEnc, pStream))
         {
             m_hasError.store(true);
             AL_Buffer_Unref(pStream);
@@ -683,75 +690,41 @@ void RealtimeEncoder::pushStreamBuffers()
     }
 }
 
-/* ============================================================================
- * 帧数据拷贝
- * ============================================================================*/
-
-void RealtimeEncoder::copyFrameData(AL_TBuffer *pDstBuf, const uint8_t *pSrcData, int srcPitch) const
+void RealtimeEncoder::releaseExternSources(AL_TBuffer const *pSrc)
 {
-    /* ---- 亮度平面 ---- */
-    uint8_t *pDstY = AL_PixMapBuffer_GetPlaneAddress(pDstBuf, AL_PLANE_Y);
-    int dstPitchY = AL_PixMapBuffer_GetPlanePitch(pDstBuf, AL_PLANE_Y);
-
-    /* 如果调用者未指定 srcPitch，则推断为紧凑布局 */
-    int bytesPerSample = (m_cfg.uBitDepth > 8) ? 2 : 1;
-    int defaultPitch = static_cast<int>(m_cfg.width) * bytesPerSample;
-    int actualSrcPitch = (srcPitch > 0) ? srcPitch : defaultPitch;
-
-    /* 逐行复制亮度 */
-    const uint8_t *pSrcY = pSrcData;
-    for (int row = 0; row < static_cast<int>(m_cfg.height); ++row)
+    if (m_work_mode != WorkMode::V4L2)
     {
-        std::memcpy(pDstY + row * dstPitchY, pSrcY + row * actualSrcPitch, static_cast<size_t>(defaultPitch));
+        return;
     }
 
-    /* ---- 色度平面（仅处理 YUV420/422/444 semi-planar 和 planar 两种情况） ---- */
-    if (m_cfg.eChromaMode == AL_CHROMA_MONO)
-        return;
-
-    /* 源数据：Y 平面之后紧接色度数据 */
-    int lumaLines = static_cast<int>(m_cfg.height);
-    const uint8_t *pSrcChroma = pSrcData + lumaLines * actualSrcPitch;
-
-    /* 色度行数 */
-    int chromaLines = (m_cfg.eChromaMode == AL_CHROMA_4_2_0) ? (lumaLines / 2) : lumaLines;
-    int chromaBytesPerRow = (m_cfg.eChromaMode == AL_CHROMA_4_4_4) ? defaultPitch * 2 /* U + V，各一行 */
-                                                                   : defaultPitch;    /* UV 交织或 U/V 分离 */
-
-    /* 检查是否为 semi-planar（NV12/NV16/P010 等） */
-    uint8_t *pDstUV = AL_PixMapBuffer_GetPlaneAddress(pDstBuf, AL_PLANE_UV);
-    if (pDstUV)
+    ExternalSourceContext ctx{};
+    bool found = false;
     {
-        /* Semi-planar: UV 交织，色度行宽 = 亮度行宽 */
-        int dstPitchUV = AL_PixMapBuffer_GetPlanePitch(pDstBuf, AL_PLANE_UV);
-        int srcChromaRowBytes = defaultPitch; /* U 和 V 已交织，宽度等于亮度宽 */
-        (void)chromaBytesPerRow;
-
-        for (int row = 0; row < chromaLines; ++row)
+        std::lock_guard<std::mutex> lock(m_externalSourcesMutex);
+        auto it = m_externalSources.find(pSrc);
+        if (it != m_externalSources.end())
         {
-            std::memcpy(pDstUV + row * dstPitchUV, pSrcChroma + row * srcChromaRowBytes,
-                        static_cast<size_t>(srcChromaRowBytes));
+            ctx = it->second;
+            m_externalSources.erase(it);
+            found = true;
         }
     }
-    else
+
+    SourceReleaseCallback releaseCB;
     {
-        /* Planar: U 和 V 分开 */
-        uint8_t *pDstU = AL_PixMapBuffer_GetPlaneAddress(pDstBuf, AL_PLANE_U);
-        uint8_t *pDstV = AL_PixMapBuffer_GetPlaneAddress(pDstBuf, AL_PLANE_V);
-        int dstPitchU = AL_PixMapBuffer_GetPlanePitch(pDstBuf, AL_PLANE_U);
-        int dstPitchV = AL_PixMapBuffer_GetPlanePitch(pDstBuf, AL_PLANE_V);
+        std::lock_guard<std::mutex> lock(m_sourceReleaseCallbackMutex);
+        releaseCB = m_sourceReleaseCallback;
+    }
 
-        int uvWidth = (m_cfg.eChromaMode == AL_CHROMA_4_4_4) ? defaultPitch : defaultPitch / 2;
-
-        const uint8_t *pSrcU = pSrcChroma;
-        const uint8_t *pSrcV = pSrcChroma + chromaLines * uvWidth;
-
-        for (int row = 0; row < chromaLines; ++row)
+    if (found && releaseCB)
+    {
+        try
         {
-            if (pDstU)
-                std::memcpy(pDstU + row * dstPitchU, pSrcU + row * uvWidth, static_cast<size_t>(uvWidth));
-            if (pDstV)
-                std::memcpy(pDstV + row * dstPitchV, pSrcV + row * uvWidth, static_cast<size_t>(uvWidth));
+            m_sourceReleaseCallback(ctx.token);
+        }
+        catch (...)
+        {
+            m_hasError.store(true);
         }
     }
 }

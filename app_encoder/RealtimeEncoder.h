@@ -23,13 +23,10 @@ extern "C"
 
 #include "lib_app/BufPool.h"
 #include "lib_app/PixMapBufPool.h"
+#include "lib_app/video_utils.h"
 
-/*****************************************************************************
- * EncoderConfig
- * ---------------------------------------------------------------------------
- * 用于构造 RealtimeEncoder 的参数集合。
- * 调用者只需填写关心的字段；其余字段已设置合理默认值。
- *****************************************************************************/
+#include "DMAProxy.h"
+
 struct EncoderConfig
 {
     /* ---- 编解码器 ---- */
@@ -65,6 +62,7 @@ struct EncoderConfig
 
     /* ---- 硬件设备路径 ---- */
     std::string sDevicePath = "/dev/allegroIP"; /*!< ZYNQ VCU 设备节点 */
+    std::string sDMAProxyPath = "/dev/dmaproxy"; /*!< DMAProxy 设备节点 */
 };
 
 /*****************************************************************************
@@ -72,7 +70,6 @@ struct EncoderConfig
  * ---------------------------------------------------------------------------
  * 对 Allegro VCU SDK 编码器 API 的轻量封装，提供：
  *   - 基于 DMA 分配器 + MCU Scheduler 的硬件初始化
- *   - pushFrame() 接口推送裸 YUV 帧（内存拷贝）
  *   - acquireSourceBuffer() / submitSourceBuffer() 接口供外部直接写入 DMA 缓冲
  *   - 编码完成后通过回调返回码流数据
  *   - flush() 触发 EOS 并等待编码器排空
@@ -83,13 +80,19 @@ struct EncoderConfig
  *   source-release / stream-release 回调释放其引用，引用归零时缓冲自动回池。
  *
  * 线程安全说明：
- *   pushFrame() / acquireSourceBuffer() / submitSourceBuffer() / flush() 应在
+ *   =acquireSourceBuffer() / submitSourceBuffer() / flush() 应在
  *   同一线程（生产者线程）中调用。
  *   EncodedFrameCallback 从 SDK 内部回调线程调用，请勿在回调中调用 pushFrame()。
  *****************************************************************************/
 class RealtimeEncoder
 {
   public:
+    enum WorkMode
+    {
+        FILE, /*!< 从文件读取 YUV 原始帧进行编码 */
+        V4L2  /*!< 通过 v4l2 接口获取原始帧进行编码（零拷贝） */
+    };
+
     /**
      * @brief 编码帧回调类型
      * @param pData      指向本次编码输出的码流字节，生命周期仅限回调函数内部有效
@@ -112,7 +115,7 @@ class RealtimeEncoder
      * @param callback 码流输出回调，不可为空
      * @throws std::runtime_error 若硬件初始化或编码器创建失败
      */
-    explicit RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback callback);
+    explicit RealtimeEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb, WorkMode mode);
 
     /**
      * @brief 析构：若尚未调用 flush()，则先触发 EOS 再释放硬件资源
@@ -124,22 +127,6 @@ class RealtimeEncoder
     RealtimeEncoder &operator=(const RealtimeEncoder &) = delete;
     RealtimeEncoder(RealtimeEncoder &&) = delete;
     RealtimeEncoder &operator=(RealtimeEncoder &&) = delete;
-
-    /**
-     * @brief 推送一帧裸 YUV 数据到编码器（内存拷贝路径）
-     *
-     * 从 DMA 缓冲池申请缓冲，将 pData 按平面逐行拷贝进去，再提交给硬件。
-     * 数据布局须与 DMA 缓冲的 FourCC 一致（可由 getSrcFourCC() 查询）：
-     *   - NV12（8-bit 4:2:0 semi-planar）：Y 平面在前，UV 交织平面紧随其后
-     *   - I420：Y → U → V 顺序
-     *   如输入格式不同，应先转换，或使用 acquireSourceBuffer()+submitSourceBuffer()
-     *   路径配合 lib_conv_yuv 进行格式转换（参见 YuvFileSource）。
-     *
-     * @param pData    YUV 平面数据首字节
-     * @param srcPitch 输入亮度行步长（字节），0 = 紧凑布局（width * bytesPerSample）
-     * @return true 提交成功；false 编码器已停止或发生错误
-     */
-    bool pushFrame(const uint8_t *pData, int srcPitch = 0);
 
     /**
      * @brief 从源缓冲池申请一块空闲 DMA 缓冲（阻塞）
@@ -225,25 +212,23 @@ class RealtimeEncoder
     }
 
   private:
-    /* ---- SDK 回调（静态转发到实例方法） ---- */
     static void sdkCallback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID);
-
     void onEncodedFrame(AL_TBuffer *pStream, AL_TBuffer const *pSrc);
 
-    /* ---- 初始化辅助 ---- */
     void initSettings(AL_TEncSettings &settings) const;
     void initSrcBufPool();
     void initStreamBufPool();
     void pushStreamBuffers();
+    void releaseExternSources(AL_TBuffer const *pSrc);
 
-    /* ---- 帧数据拷贝辅助 ---- */
-    void copyFrameData(AL_TBuffer *pDstBuf, const uint8_t *pSrcData, int srcPitch) const;
-
+  private:
+    const WorkMode m_work_mode;
     /* ---- 配置与回调 ---- */
     EncoderConfig m_cfg;
     EncodedFrameCallback m_callback;
 
     /* ---- SDK 硬件资源 ---- */
+    DMAProxy m_dmaProxy;
     AL_TAllocator *m_pAllocator = nullptr;
     AL_IEncScheduler *m_pScheduler = nullptr;
     AL_HEncoder m_hEnc = nullptr;

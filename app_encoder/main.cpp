@@ -30,16 +30,12 @@
 #if REALTIME_ENCODER_HAS_V4L2
 #include "V4l2DmabufSource.h"
 #endif
-
-#include <cstdlib>
 #include <fstream>
-#include <iostream>
-#include <stdexcept>
-#include <string>
 
 extern "C"
 {
 #include "lib_common/FourCC.h"
+#include "lib_rtos/message.h"
 }
 
 static uint32_t ParseFourCC(const std::string &fccStr)
@@ -54,14 +50,12 @@ int main(int argc, char *argv[])
 {
     if (argc < 7)
     {
-        std::cerr << "Usage: " << argv[0]
-                  << " file <input.yuv> <output.265> <width> <height> <num_frames> [fourcc=NV12]\n"
+        VIDEO_ERROR_PRINT("Usage: %s file <input.yuv> <output.265> <width> <height> <num_frames> [fourcc=NV12]",
+                          argv[0]);
 #if REALTIME_ENCODER_HAS_V4L2
-                  << "   or: " << argv[0]
-                  << " v4l2 <device> <output.265> <width> <height> <num_frames> [fourcc=NV12]\n";
+        VIDEO_ERROR_PRINT("   or: %s v4l2 <device> <output.265> <width> <height> <num_frames> [fourcc=NV12]", argv[0]);
 #else
-                  << "\n"
-                  << "Note: v4l2 mode is not available in this build (Linux-only).\n";
+        VIDEO_ERROR_PRINT("Note: v4l2 mode is not available in this build (Linux-only).");
 #endif
         return EXIT_FAILURE;
     }
@@ -70,14 +64,14 @@ int main(int argc, char *argv[])
 
     if (mode != "file" && mode != "v4l2")
     {
-        std::cerr << "Invalid mode: " << mode << " (expected: file or v4l2)\n";
+        VIDEO_ERROR_PRINT("Invalid mode: %s (expected: file or v4l2)", mode.c_str());
         return EXIT_FAILURE;
     }
 
 #if !REALTIME_ENCODER_HAS_V4L2
     if (mode == "v4l2")
     {
-        std::cerr << "v4l2 mode is not supported in this build (Linux-only).\n";
+        VIDEO_ERROR_PRINT("v4l2 mode is not supported in this build (Linux-only).");
         return EXIT_FAILURE;
     }
 #endif
@@ -100,7 +94,7 @@ int main(int argc, char *argv[])
     std::ofstream outFile(outputPath, std::ios::binary);
     if (!outFile)
     {
-        std::cerr << "Cannot open output file: " << outputPath << "\n";
+        VIDEO_ERROR_PRINT("Cannot open output file: %s", outputPath.c_str());
         return EXIT_FAILURE;
     }
 
@@ -110,38 +104,41 @@ int main(int argc, char *argv[])
     cfg.uLevel = 51;
     cfg.width = static_cast<uint16_t>(width);
     cfg.height = static_cast<uint16_t>(height);
-    cfg.eChromaMode = AL_CHROMA_4_2_0;
+    cfg.eChromaMode = AL_CHROMA_4_2_2;
     cfg.uBitDepth = 8;
     cfg.eRCMode = AL_RC_CBR;
-    cfg.uTargetBitRate = 4000000; /* 4 Mbps */
+    cfg.uTargetBitRate = 8000000; /* 8 Mbps */
     cfg.uFrameRate = 30;
     cfg.uClkRatio = 1000;
     cfg.uGopLength = 30;
-    cfg.bLowDelayMode = false;
+    cfg.bLowDelayMode = true;
     cfg.uNumB = 0;
     cfg.uNumSrcBufs = 4;
     cfg.uNumStreamBufs = 4;
     cfg.sDevicePath = "/dev/allegroIP";
+    cfg.sDMAProxyPath = "/dev/dmaproxy";
 
     /* ---- 创建编码器 ---- */
     int encodedUnits = 0;
-    std::cout << "Initializing encoder..." << std::endl;
+    VIDEO_INFO_PRINT("Initializing encoder...");
 
     try
     {
-        RealtimeEncoder encoder(cfg, [&](const uint8_t *pData, size_t size, bool isKeyFrame) {
-            if (isKeyFrame)
-                std::cout << "  [KeyFrame] output_unit=" << encodedUnits << " size=" << size << "\n";
-            outFile.write(reinterpret_cast<const char *>(pData), static_cast<std::streamsize>(size));
-            ++encodedUnits;
-        });
+        RealtimeEncoder encoder(
+            cfg,
+            [&](const uint8_t *pData, size_t size, bool isKeyFrame) {
+                VIDEO_INFO_PRINT("[%s] output_unit=%d size=%zu", isKeyFrame ? "IDR" : "Normal", encodedUnits, size);
+                outFile.write(reinterpret_cast<const char *>(pData), static_cast<std::streamsize>(size));
+                ++encodedUnits;
+            },
+            mode == "v4l2" ? RealtimeEncoder::WorkMode::V4L2 : RealtimeEncoder::WorkMode::FILE);
 
-        std::cout << "Encoder ready.\n";
-        std::cout << "  Src FourCC : " << encoder.getSrcFourCC() << "\n";
-        std::cout << "  File FourCC: " << fileFourCC << "\n";
-        std::cout << "  PitchY     : " << encoder.getPitchY() << "\n";
+        VIDEO_INFO_PRINT("Encoder ready.");
+        VIDEO_INFO_PRINT("  Src FourCC : %s", FourCC2STR(encoder.getSrcFourCC()).c_str());
+        VIDEO_INFO_PRINT("  File FourCC: %s", FourCC2STR(fileFourCC).c_str());
+        VIDEO_INFO_PRINT("  PitchY     : %u", encoder.getPitchY());
 
-        std::cout << "Processing up to " << numFrames << " frame(s)...\n";
+        VIDEO_INFO_PRINT("Processing up to %d frame(s)...", numFrames);
 
         int pushed = 0;
 
@@ -154,7 +151,6 @@ int main(int argc, char *argv[])
             fileInfo.FrameRate = cfg.uFrameRate;
 
             YuvFileSource yuv(encoder, inputPathOrDevice, fileInfo, /*bLoop=*/false);
-
             for (int i = 0; i < numFrames; ++i)
             {
                 if (i > 0 && (i % 90 == 0))
@@ -162,7 +158,7 @@ int main(int argc, char *argv[])
 
                 if (!yuv.pushNextFrame())
                 {
-                    std::cout << "  File EOF at frame " << i << "\n";
+                    VIDEO_INFO_PRINT("  File EOF at frame %d", i);
                     break;
                 }
                 ++pushed;
@@ -181,27 +177,27 @@ int main(int argc, char *argv[])
 
                 if (!v4l2.pushNextFrame())
                 {
-                    std::cout << "  V4L2 capture stopped at frame " << i << "\n";
+                    VIDEO_INFO_PRINT("  V4L2 capture stopped at frame %d", i);
                     break;
                 }
                 ++pushed;
             }
             v4l2.stop();
 #else
-            std::cerr << "v4l2 mode is not supported in this build (Linux-only).\n";
+            VIDEO_ERROR_PRINT("v4l2 mode is not supported in this build (Linux-only).");
             return EXIT_FAILURE;
 #endif
         }
 
-        std::cout << "All frames pushed (" << pushed << " total), flushing encoder...\n";
+        VIDEO_INFO_PRINT("All frames pushed (%d total), flushing encoder...", pushed);
         encoder.flush();
 
-        std::cout << "Done. Pushed frames: " << pushed << ", output units: " << encodedUnits << "\n";
-        std::cout << "Output written to: " << outputPath << "\n";
+        VIDEO_INFO_PRINT("Done. Pushed frames: %d, output units: %d", pushed, encodedUnits);
+        VIDEO_INFO_PRINT("Output written to: %s", outputPath.c_str());
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Error: " << e.what() << "\n";
+        VIDEO_ERROR_PRINT("Error: %s", e.what());
         return EXIT_FAILURE;
     }
 

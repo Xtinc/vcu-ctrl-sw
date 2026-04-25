@@ -5,27 +5,28 @@
 #   liballegro_app_static — static archive  (linked directly into executables)
 
 set(LIB_APP_SRC
-    utils.cpp
-    convert.cpp
-    BufPool.cpp
-    PixMapBufPool.cpp
     AllocatorTracker.cpp
-    YuvIO.cpp
-    JsonFile.cpp
+    BaseFrameWriter.cpp
+    BufPool.cpp
+    CompFrameCommon.cpp
+    convert.cpp
     FileUtils.cpp
+    FrameReader.cpp
+    JsonFile.cpp
     MD5.cpp
     Parser.cpp
+    PixMapBufPool.cpp
+    PlaneUtils.cpp
+    SinkCrcDump.cpp
+    SinkCrop.cpp
+    SinkFrame.cpp
+    SinkStreamMd5.cpp
     Tokenizer.cpp
-    FrameReader.cpp
     UnCompFrameReader.cpp
     UnCompFrameWriter.cpp
-    CompFrameCommon.cpp
-    BaseFrameWriter.cpp
-    SinkFrame.cpp
-    SinkCrop.cpp
-    SinkCrcDump.cpp
-    SinkStreamMd5.cpp
-    PlaneUtils.cpp
+    utils.cpp
+    YUVFileIO.cpp
+    YuvIO.cpp
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")

@@ -549,21 +549,16 @@ void AL_Settings_SetDefaults(AL_TEncSettings* pSettings)
   pChan->MaxNumMergeCand = 5;
 
   pChan->eStartCodeBytesAligned = AL_START_CODE_AUTO;
-
-#if (defined(ANDROID) || defined(__ANDROID_API__))
-  pChan->eStartCodeBytesAligned = AL_START_CODE_4_BYTES;
-#endif
-
 }
 
 /***************************************************************************/
-#define MSG(msg) { if(pOut) fprintf(pOut, msg "\r\n"); }
-#define MSG_WARNING(msg) MSG("[WARNING]: " msg)
-#define MSG_ERROR(msg) MSG("[ERROR]: " msg)
+#define MSG VIDEO_INFO_PRINT
+#define MSG_WARNING VIDEO_INFO_PRINT
+#define MSG_ERROR VIDEO_ERROR_PRINT
 
-#define MSGF(msg, ...) { if(pOut) fprintf(pOut, msg "\r\n", __VA_ARGS__); }
-#define MSGF_WARNING(msg, ...) MSGF("[WARNING]: " msg, __VA_ARGS__)
-#define MSGF_ERROR(msg, ...) MSGF("[ERROR]: " msg, __VA_ARGS__)
+#define MSGF VIDEO_INFO_PRINT
+#define MSGF_WARNING VIDEO_INFO_PRINT
+#define MSGF_ERROR VIDEO_ERROR_PRINT
 
 void AL_Settings_SetDefaultParam(AL_TEncSettings* pSettings)
 {

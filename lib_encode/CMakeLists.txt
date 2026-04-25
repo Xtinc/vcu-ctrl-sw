@@ -51,12 +51,9 @@ set(ALL_ENCODE_OBJECTS
     $<TARGET_OBJECTS:lib_rtos_obj>
 )
 
-add_library(liballegro_encode SHARED ${ALL_ENCODE_OBJECTS})
 add_library(liballegro_encode_static STATIC ${ALL_ENCODE_OBJECTS})
 
-foreach(_tgt liballegro_encode liballegro_encode_static)
-    target_link_libraries(${_tgt} PUBLIC Threads::Threads)
-    set_target_properties(${_tgt} PROPERTIES OUTPUT_NAME allegro_encode)
-endforeach()
+target_link_libraries(liballegro_encode_static PUBLIC Threads::Threads)
+set_target_properties(liballegro_encode_static PROPERTIES OUTPUT_NAME allegro_encode)
 
 set_target_properties(liballegro_encode_static PROPERTIES SUFFIX ".a")
