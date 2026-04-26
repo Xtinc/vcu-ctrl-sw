@@ -33,28 +33,27 @@ inline TFourCC STR2FOURCC(const std::string &str)
 
 struct EncoderConfig
 {
-    AL_EProfile eProfile;       // AVC/HEVC Profile
-    uint8_t uLevel;             // Level (e.g., H.265 Level 5.1)
-    uint8_t uTier;              // 0 = Main Tier, 1 = High Tier (HEVC only)
+    AL_EProfile profile;        // AVC/HEVC Profile
+    uint8_t level;              // Level (e.g., H.265 Level 5.1)
+    uint8_t tier;               // 0 = Main Tier, 1 = High Tier (HEVC only)
     uint16_t width;             // Frame width
     uint16_t height;            // Frame height
-    AL_EChromaMode eChromaMode; // Chroma sampling format
-    uint8_t uBitDepth;          // Bit depth (8 or 10)
-    AL_ERateCtrlMode eRCMode;   // Rate control mode
-    uint32_t uTargetBitRate;    // Target bitrate in bps
-    uint32_t uMaxBitRate;       // VBR peak bitrate in bps, 0 = same as target
-    int16_t iInitialQP;         // Initial QP (fixed QP in CQP mode)
-    uint16_t uFrameRate;        // Frame rate numerator
-    uint16_t uClkRatio;         // Frame rate denominator, final frame rate = uFrameRate*1000/uClkRatio
-    uint16_t uGopLength;        // GOP length (number of frames between two IDR/I frames)
-    uint32_t uFreqIDR;          // IDR forced insertion frequency (0 = only GOP first frame)
-    bool bLowDelayMode;         // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
-    uint8_t uNumB;              // Number of B-frames in GOP (ignored if bLowDelayMode is true)
-    uint32_t uNumSrcBufs;       // Number of input source frame buffers
-    uint32_t uNumStreamBufs;    // Number of output stream buffers
-
-    std::string enc_dev_path; // Encoder device node (e.g., "/dev/allegroIP")
-    std::string dma_dev_path; // DMAProxy device node (e.g., "/dev/dmaproxy")
+    AL_EChromaMode chroma_mode; // Chroma sampling format
+    uint8_t bit_depth;          // Bit depth (8 or 10)
+    AL_ERateCtrlMode rc_mode;   // Rate control mode
+    uint32_t target_bitrate;    // Target bitrate in bps
+    uint32_t max_bitrate;       // VBR peak bitrate in bps, 0 = same as target
+    int16_t initial_qp;         // Initial QP (fixed QP in CQP mode)
+    uint16_t framerate;         // Frame rate numerator
+    uint16_t clk_ratio;         // Frame rate denominator, final frame rate = framerate*1000/clk_ratio
+    uint16_t gop_length;        // GOP length (number of frames between two IDR/I frames)
+    uint32_t freq_idr;          // IDR forced insertion frequency (0 = only GOP first frame)
+    bool low_delay_mode;        // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
+    uint8_t num_b;              // Number of B-frames in GOP (ignored if low_delay_mode is true)
+    uint32_t num_src_bufs;      // Number of input source frame buffers
+    uint32_t num_stream_bufs;   // Number of output stream buffers
+    std::string enc_dev_path;   // Encoder device node (e.g., "/dev/allegroIP")
+    std::string dma_dev_path;   // DMAProxy device node (e.g., "/dev/dmaproxy")
 };
 
 enum class SourceMode
@@ -66,7 +65,7 @@ enum class SourceMode
 class RTEncoderBase
 {
   public:
-    using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size, bool isKeyFrame)>;
+    using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size)>;
 
     // CTOR throw std::runtime_error on initialization failure (e.g., hardware init, encoder creation)
     explicit RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb);

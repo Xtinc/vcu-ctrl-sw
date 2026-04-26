@@ -129,7 +129,7 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         throw std::runtime_error("Failed to create MCU scheduler");
     }
 
-    m_pic_format = AL_EncGetSrcPicFormat(m_cfg.eChromaMode, m_cfg.uBitDepth, AL_SRC_RASTER);
+    m_pic_format = AL_EncGetSrcPicFormat(m_cfg.chroma_mode, m_cfg.bit_depth, AL_SRC_RASTER);
     m_src_fourcc = AL_EncGetSrcFourCC(m_pic_format);
     m_pitchY = AL_EncGetMinPitch(m_cfg.width, &m_pic_format);
     m_strideH = AL_RoundUp(static_cast<int>(m_cfg.height), kHeightAlign);
@@ -285,6 +285,9 @@ bool RTEncoderBase::set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
         m_error.store(true);
         return false;
     }
+
+    request_IDR();
+    return true;
 }
 
 bool RTEncoderBase::set_framerate(uint32_t uFrameRate, uint32_t uClkRatio)
@@ -300,6 +303,8 @@ bool RTEncoderBase::set_framerate(uint32_t uFrameRate, uint32_t uClkRatio)
         m_error.store(true);
         return false;
     }
+
+    request_IDR();
     return true;
 }
 
@@ -310,12 +315,12 @@ TFourCC RTEncoderBase::SRC_FourCC() const
 
 uint8_t RTEncoderBase::SRC_bitdepth() const
 {
-    return m_cfg.uBitDepth;
+    return m_cfg.bit_depth;
 }
 
 AL_EChromaMode RTEncoderBase::SRC_chroma() const
 {
-    return m_cfg.eChromaMode;
+    return m_cfg.chroma_mode;
 }
 
 void RTEncoderBase::sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID)
@@ -326,7 +331,6 @@ void RTEncoderBase::sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuff
 
 void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc)
 {
-
     // source-release
     if (!pStream && pSrc)
     {
@@ -366,10 +370,6 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
     {
         if (pMeta->uNumSection > 0)
         {
-
-            const auto isKeyFrame =
-                std::any_of(pMeta->pSections, pMeta->pSections + pMeta->uNumSection,
-                            [](const AL_TStreamSection &sec) { return (sec.eFlags & AL_SECTION_SYNC_FLAG) != 0; });
             const auto *pBase = AL_Buffer_GetData(pStream);
             const auto uSize = reconstruct_stream(m_dma_proxy, pStream, 0);
 
@@ -377,7 +377,7 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
             {
                 try
                 {
-                    m_callback(pBase, uSize, isKeyFrame);
+                    m_callback(pBase, uSize);
                 }
                 catch (...)
                 {
@@ -404,31 +404,31 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
     ch.uSrcWidth = m_cfg.width;
     ch.uSrcHeight = m_cfg.height;
 
-    ch.eProfile = m_cfg.eProfile;
-    ch.uLevel = m_cfg.uLevel;
-    ch.uTier = m_cfg.uTier;
-    AL_SET_CHROMA_MODE(&ch.ePicFormat, m_cfg.eChromaMode);
-    AL_SET_BITDEPTH(&ch.ePicFormat, m_cfg.uBitDepth);
-    ch.uSrcBitDepth = m_cfg.uBitDepth;
+    ch.eProfile = m_cfg.profile;
+    ch.uLevel = m_cfg.level;
+    ch.uTier = m_cfg.tier;
+    AL_SET_CHROMA_MODE(&ch.ePicFormat, m_cfg.chroma_mode);
+    AL_SET_BITDEPTH(&ch.ePicFormat, m_cfg.bit_depth);
+    ch.uSrcBitDepth = m_cfg.bit_depth;
     ch.eSrcMode = AL_SRC_RASTER;
     ch.eVideoMode = AL_VM_PROGRESSIVE;
 
     ch.eEncTools = static_cast<AL_EChEncTool>(AL_OPT_LF | AL_OPT_LF_X_SLICE);
 
     AL_TRCParam &rc = ch.tRCParam;
-    rc.eRCMode = m_cfg.eRCMode;
-    rc.uTargetBitRate = m_cfg.uTargetBitRate;
-    rc.uMaxBitRate = (m_cfg.uMaxBitRate > 0) ? m_cfg.uMaxBitRate : m_cfg.uTargetBitRate;
-    rc.uFrameRate = m_cfg.uFrameRate;
-    rc.uClkRatio = m_cfg.uClkRatio;
-    rc.iInitialQP = m_cfg.iInitialQP;
+    rc.eRCMode = m_cfg.rc_mode;
+    rc.uTargetBitRate = m_cfg.target_bitrate;
+    rc.uMaxBitRate = (m_cfg.max_bitrate > 0) ? m_cfg.max_bitrate : m_cfg.target_bitrate;
+    rc.uFrameRate = m_cfg.framerate;
+    rc.uClkRatio = m_cfg.clk_ratio;
+    rc.iInitialQP = m_cfg.initial_qp;
 
-    float fps = static_cast<float>(m_cfg.uFrameRate) * 1000.0f / static_cast<float>(m_cfg.uClkRatio);
-    rc.uCPBSize = static_cast<uint32_t>(m_cfg.uTargetBitRate / fps);
+    float fps = static_cast<float>(m_cfg.framerate) * 1000.0f / static_cast<float>(m_cfg.clk_ratio);
+    rc.uCPBSize = static_cast<uint32_t>(m_cfg.target_bitrate / fps);
     rc.uInitialRemDelay = rc.uCPBSize;
 
     AL_TGopParam &gop = ch.tGopParam;
-    if (m_cfg.bLowDelayMode)
+    if (m_cfg.low_delay_mode)
     {
         gop.eMode = AL_GOP_MODE_LOW_DELAY_P;
         gop.uNumB = 0;
@@ -439,10 +439,10 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
     else
     {
         gop.eMode = AL_GOP_MODE_DEFAULT;
-        gop.uNumB = m_cfg.uNumB;
+        gop.uNumB = m_cfg.num_b;
     }
-    gop.uGopLength = m_cfg.uGopLength;
-    gop.uFreqIDR = (m_cfg.uFreqIDR > 0) ? m_cfg.uFreqIDR : m_cfg.uGopLength;
+    gop.uGopLength = m_cfg.gop_length;
+    gop.uFreqIDR = (m_cfg.freq_idr > 0) ? m_cfg.freq_idr : m_cfg.gop_length;
 
     settings.bEnableAUD = false;
     settings.eEnableFillerData = AL_FILLER_DISABLE;
@@ -471,7 +471,7 @@ void RTEncoderBase::init_src_buf_pool()
     m_source_buf_pool->set_format(tDim, m_src_fourcc);
     m_source_buf_pool->add_chunk(chunk_size, plane_descs);
 
-    if (!m_source_buf_pool->init(m_pAllocator, m_cfg.uNumSrcBufs, "source_pool"))
+    if (!m_source_buf_pool->init(m_pAllocator, m_cfg.num_src_bufs, "source_pool"))
     {
         throw std::runtime_error("Failed to initialize source buffer pool");
     }
@@ -481,11 +481,11 @@ void RTEncoderBase::init_stream_buf_pool()
 {
     AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
 
-    uint64_t streamSize = static_cast<uint64_t>(AL_GetMitigatedMaxNalSize(tDim, m_cfg.eChromaMode, m_cfg.uBitDepth));
+    uint64_t streamSize = static_cast<uint64_t>(AL_GetMitigatedMaxNalSize(tDim, m_cfg.chroma_mode, m_cfg.bit_depth));
     streamSize += AL_ENC_MAX_HEADER_SIZE;
 
     uint32_t numBufs =
-        m_cfg.uNumStreamBufs + static_cast<uint32_t>(kStreamSmoothingCount) + static_cast<uint32_t>(m_cfg.uNumB);
+        m_cfg.num_stream_bufs + static_cast<uint32_t>(kStreamSmoothingCount) + static_cast<uint32_t>(m_cfg.num_b);
 
     auto *pMeta = reinterpret_cast<AL_TMetaData *>(AL_StreamMetaData_Create(AL_MAX_SECTION));
     if (!pMeta)
@@ -505,9 +505,9 @@ void RTEncoderBase::init_stream_buf_pool()
 void RTEncoderBase::push_stream_buffers()
 {
     uint32_t total =
-        m_cfg.uNumStreamBufs + static_cast<uint32_t>(kStreamSmoothingCount) + static_cast<uint32_t>(m_cfg.uNumB);
+        m_cfg.num_stream_bufs + static_cast<uint32_t>(kStreamSmoothingCount) + static_cast<uint32_t>(m_cfg.num_b);
 
-    for (auto i = 0; i < total; i++)
+    for (uint32_t i = 0; i < total; i++)
     {
         auto *pBuf = m_stream_buf_pool->get_buffer(false);
         if (!pBuf)

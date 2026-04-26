@@ -43,21 +43,21 @@ int main(int argc, char *argv[])
     }
 
     EncoderConfig cfg{};
-    cfg.eProfile = AL_PROFILE_HEVC_MAIN;
-    cfg.uLevel = 51;
+    cfg.profile = AL_PROFILE_HEVC_MAIN;
+    cfg.level = 51;
     cfg.width = static_cast<uint16_t>(width);
     cfg.height = static_cast<uint16_t>(height);
-    cfg.eChromaMode = AL_CHROMA_4_2_2;
-    cfg.uBitDepth = 8;
-    cfg.eRCMode = AL_RC_CBR;
-    cfg.uTargetBitRate = 8000000; /* 8 Mbps */
-    cfg.uFrameRate = 30;
-    cfg.uClkRatio = 1000;
-    cfg.uGopLength = 30;
-    cfg.bLowDelayMode = true;
-    cfg.uNumB = 0;
-    cfg.uNumSrcBufs = 4;
-    cfg.uNumStreamBufs = 4;
+    cfg.chroma_mode = AL_CHROMA_4_2_2;
+    cfg.bit_depth = 8;
+    cfg.rc_mode = AL_RC_CBR;
+    cfg.target_bitrate = 8000000; /* 8 Mbps */
+    cfg.framerate = 30;
+    cfg.clk_ratio = 1000;
+    cfg.gop_length = 30;
+    cfg.low_delay_mode = true;
+    cfg.num_b = 0;
+    cfg.num_src_bufs = 4;
+    cfg.num_stream_bufs = 4;
     cfg.enc_dev_path = "/dev/allegroIP";
     cfg.dma_dev_path = "/dev/dmaproxy";
 
@@ -67,8 +67,8 @@ int main(int argc, char *argv[])
     RTEncoder<SourceMode::FILE> *encoder = nullptr;
     try
     {
-        encoder = new RTEncoder<SourceMode::FILE>(cfg, [&](const uint8_t *pData, size_t size, bool isKeyFrame) {
-            VIDEO_INFO_PRINT("[%s] output_unit=%d size=%zu", isKeyFrame ? "Key" : "Normal", encodedUnits, size);
+        encoder = new RTEncoder<SourceMode::FILE>(cfg, [&](const uint8_t *pData, size_t size) {
+            VIDEO_INFO_PRINT("[%d] size=%6zu KB", encodedUnits, size / 1000);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++encodedUnits;
         });
@@ -94,11 +94,6 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < numFrames; i++)
     {
-        if (i > 0 && (i % 90 == 0))
-        {
-            encoder->request_IDR();
-        }
-
         AL_TBuffer *srcBuf = encoder->acquire_source_buffer();
         if (!srcBuf)
         {
