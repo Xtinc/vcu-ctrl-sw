@@ -81,22 +81,25 @@ class RTEncoderBase
     void request_IDR();
     bool set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate = 0);
     bool set_framerate(uint32_t uFrameRate, uint32_t uClkRatio = 1000);
+    bool set_resolution(uint32_t uWidth, uint32_t uHeight);
 
     TFourCC SRC_FourCC() const;
     uint8_t SRC_bitdepth() const;
     AL_EChromaMode SRC_chroma() const;
+    AL_TDimension SRC_resolution() const;
 
   private:
     static void sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID);
     void on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc);
 
     void init_settings(AL_TEncSettings &settings) const;
-    void init_src_buf_pool();
+    void init_source_buf_pool();
     void init_stream_buf_pool();
     void push_stream_buffers();
     virtual void release_sources(AL_TBuffer const *pSrc) = 0;
 
   protected:
+    mutable std::mutex m_cfg_mutex;
     EncoderConfig m_cfg;
     EncodedFrameCallback m_callback;
 
@@ -110,8 +113,6 @@ class RTEncoderBase
 
     AL_TPicFormat m_pic_format;
     TFourCC m_src_fourcc;
-    int m_pitchY;
-    int m_strideH;
 
     std::atomic<bool> m_stopped;
     std::mutex m_eos_mutex;

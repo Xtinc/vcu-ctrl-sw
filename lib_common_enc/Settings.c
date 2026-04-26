@@ -589,6 +589,7 @@ void AL_Settings_SetDefaultParam(AL_TEncSettings* pSettings)
 /***************************************************************************/
 int AL_Settings_CheckValidity(AL_TEncSettings* pSettings, AL_TEncChanParam* pChParam, FILE* pOut)
 {
+  (void)pOut;
   (void)pSettings;
   int err = 0;
 
@@ -1113,6 +1114,7 @@ static AL_EProfile getMinimumProfile(AL_ECodec eCodec, int iBitDepth, AL_EChroma
 /****************************************************************************/
 static void AL_sCheckRange16b(int16_t* pRange, int* pNumIncoherency, const int16_t iMinVal, const int16_t iMaxVal, char const* pRangeName, FILE* pOut)
 {
+  (void)pOut;
   if((*pRange >= 0) && (iMinVal > *pRange || *pRange > iMaxVal))
   {
     *pRange = Min(iMaxVal, Max(iMinVal, *pRange));
@@ -1124,6 +1126,7 @@ static void AL_sCheckRange16b(int16_t* pRange, int* pNumIncoherency, const int16
 /***************************************************************************/
 static void CorrectBitRateParams(AL_TEncChanParam* pChParam, TFourCC tFourCC, int iBitDepth, int* numIncoherency, FILE* pOut)
 {
+  (void)pOut;
   if(AL_IS_CBR(pChParam->tRCParam.eRCMode))
   {
     if(pChParam->tRCParam.uMaxBitRate > pChParam->tRCParam.uTargetBitRate)

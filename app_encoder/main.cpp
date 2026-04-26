@@ -7,12 +7,15 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
+#include <fstream>
+#include <sstream>
+#include <vector>
+
 int main(int argc, char *argv[])
 {
-    if (argc < 7)
+    if (argc < 4)
     {
-        VIDEO_ERROR_PRINT("Usage: %s file <input.yuv> <output.265> <width> <height> <num_frames> [fourcc=NV12]",
-                          argv[0]);
+        VIDEO_ERROR_PRINT("Usage: %s file <cmd.txt> <output.265>", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -23,34 +26,51 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const std::string inputPath = argv[2];
-    const std::string outputPath = argv[3];
-    const int width = std::stoi(argv[4]);
-    const int height = std::stoi(argv[5]);
-    const int numFrames = std::stoi(argv[6]);
-
-    TFourCC fileFourCC = FOURCC(NV12);
-    if (argc >= 8)
+    std::ifstream cmdFile(argv[2]);
+    if (!cmdFile)
     {
-        fileFourCC = STR2FOURCC(argv[7]);
+        VIDEO_ERROR_PRINT("Cannot open command file: %s", argv[2]);
+        return EXIT_FAILURE;
     }
 
-    std::ofstream outFile(outputPath, std::ios::binary);
-    if (!outFile)
+    std::vector<std::vector<std::string>> cmdLines;
+    std::string line;
+    while (std::getline(cmdFile, line))
     {
-        VIDEO_ERROR_PRINT("Cannot open output file: %s", outputPath.c_str());
+        std::istringstream iss(line);
+        std::vector<std::string> tokens;
+        for (std::string token; iss >> token;)
+            tokens.push_back(token);
+        if (!tokens.empty())
+            cmdLines.push_back(tokens);
+    }
+    if (cmdLines.empty())
+    {
+        VIDEO_ERROR_PRINT("No valid command lines in %s", argv[2]);
         return EXIT_FAILURE;
+    }
+
+    TFourCC fourcc = FOURCC(NV12);
+    if (cmdLines[0].size() >= 5)
+    {
+        fourcc = STR2FOURCC(cmdLines[0][4]);
+    }
+    for (size_t i = 1; i < cmdLines.size(); ++i)
+    {
+        if (cmdLines[i].size() >= 5 && STR2FOURCC(cmdLines[i][4]) != fourcc)
+        {
+            VIDEO_ERROR_PRINT("FourCC mismatch at line %zu", i + 1);
+            return EXIT_FAILURE;
+        }
     }
 
     EncoderConfig cfg{};
     cfg.profile = AL_PROFILE_HEVC_MAIN;
     cfg.level = 51;
-    cfg.width = static_cast<uint16_t>(width);
-    cfg.height = static_cast<uint16_t>(height);
     cfg.chroma_mode = AL_CHROMA_4_2_2;
     cfg.bit_depth = 8;
     cfg.rc_mode = AL_RC_CBR;
-    cfg.target_bitrate = 8000000; /* 8 Mbps */
+    cfg.target_bitrate = 8000000;
     cfg.framerate = 60;
     cfg.clk_ratio = 1000;
     cfg.gop_length = 30;
@@ -61,80 +81,94 @@ int main(int argc, char *argv[])
     cfg.enc_dev_path = "/dev/allegroIP";
     cfg.dma_dev_path = "/dev/dmaproxy";
 
-    int encodedUnits = 0;
-    VIDEO_INFO_PRINT("Initializing encoder...");
+    std::ofstream outFile(argv[3], std::ios::binary);
+    if (!outFile)
+    {
+        VIDEO_ERROR_PRINT("Cannot open output file: %s", argv[3]);
+        return EXIT_FAILURE;
+    }
 
+    int totalEncodedUnits = 0;
     RTEncoder<SourceMode::FILE> *encoder = nullptr;
     try
     {
+        int width_1st = std::stoi(cmdLines[0][1]);
+        int height_1st = std::stoi(cmdLines[0][2]);
+        cfg.width = static_cast<uint16_t>(width_1st);
+        cfg.height = static_cast<uint16_t>(height_1st);
         encoder = new RTEncoder<SourceMode::FILE>(cfg, [&](const uint8_t *pData, size_t size) {
-            VIDEO_INFO_PRINT("[%6d] size=%6zu Bytes", encodedUnits, size);
+            VIDEO_INFO_PRINT("[%6d] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
-            ++encodedUnits;
+            ++totalEncodedUnits;
         });
 
-        VIDEO_INFO_PRINT("Encoder ready.");
-        VIDEO_INFO_PRINT("  Src FourCC : %s", FOURCC2STR(encoder->SRC_FourCC()).c_str());
-        VIDEO_INFO_PRINT("  File FourCC: %s", FOURCC2STR(fileFourCC).c_str());
+        for (size_t cmdIdx = 0; cmdIdx < cmdLines.size(); ++cmdIdx)
+        {
+            const auto &tokens = cmdLines[cmdIdx];
+            if (tokens.size() < 4)
+            {
+                VIDEO_ERROR_PRINT("Invalid command line at %zu", cmdIdx + 1);
+                continue;
+            }
+            const std::string &inputPath = tokens[0];
+            int width = std::stoi(tokens[1]);
+            int height = std::stoi(tokens[2]);
+            int numFrames = std::stoi(tokens[3]);
 
-        VIDEO_INFO_PRINT("Processing up to %d frame(s)...", numFrames);
+            YuvFileIO yuvFile(inputPath, YuvFileIO::Mode::Read, width, height, fourcc);
+            if (!yuvFile.open())
+            {
+                VIDEO_ERROR_PRINT("Failed to open YUV file: %s", inputPath.c_str());
+                continue;
+            }
+
+            if (width_1st != width || height_1st != height)
+            {
+                encoder->set_resolution(width, height);
+                encoder->request_IDR();
+                VIDEO_INFO_PRINT("Resolution change at line %zu: %dx%d", cmdIdx + 1, width, height);
+            }
+            VIDEO_INFO_PRINT("Start encoding %d frames from %s", numFrames, inputPath.c_str());
+            for (int i = 0; i < numFrames; i++)
+            {
+                AL_TBuffer *srcBuf = encoder->acquire_source_buffer();
+                if (!srcBuf)
+                {
+                    VIDEO_ERROR_PRINT("Failed to acquire source buffer at frame %d", i);
+                    break;
+                }
+                if (!yuvFile.read_frame(srcBuf))
+                {
+                    AL_Buffer_Unref(srcBuf);
+                    break;
+                }
+                if (!encoder->submit_source_buffer(srcBuf))
+                {
+                    VIDEO_ERROR_PRINT("Failed to submit source buffer at frame %d", i);
+                    break;
+                }
+            }
+        }
+
+        try
+        {
+            encoder->flush();
+        }
+        catch (...)
+        {
+        }
+
+        delete encoder;
+        VIDEO_INFO_PRINT("All tasks done. Total encoded units: %d", totalEncodedUnits);
+        return EXIT_SUCCESS;
     }
     catch (const std::exception &e)
     {
-        VIDEO_ERROR_PRINT("Encoder initialization failed: %s", e.what());
+        VIDEO_ERROR_PRINT("Encoder error: %s", e.what());
+        if (encoder)
+        {
+            delete encoder;
+        }
         return EXIT_FAILURE;
     }
-
-    YuvFileIO yuvFile(inputPath, YuvFileIO::Mode::Read, width, height, fileFourCC);
-    if (!yuvFile.open())
-    {
-        VIDEO_ERROR_PRINT("Failed to open YUV file: %s", inputPath.c_str());
-        return EXIT_FAILURE;
-    }
-
-    for (int i = 0; i < numFrames; i++)
-    {
-        if (i == 300)
-        {
-            encoder->set_framerate(30);    /* 30 fps */
-            encoder->set_bitrate(4000000); /* 4 Mbps */
-            encoder->request_IDR();
-        }
-
-        AL_TBuffer *srcBuf = encoder->acquire_source_buffer();
-        if (!srcBuf)
-        {
-            VIDEO_ERROR_PRINT("Failed to acquire source buffer at frame %d", i);
-            break;
-        }
-
-        if (!yuvFile.read_frame(srcBuf))
-        {
-            VIDEO_INFO_PRINT("File EOF at frame %d", i);
-            AL_Buffer_Unref(srcBuf);
-            break;
-        }
-
-        if (!encoder->submit_source_buffer(srcBuf))
-        {
-            VIDEO_ERROR_PRINT("Failed to submit source buffer at frame %d", i);
-            break;
-        }
-    }
-
-    VIDEO_INFO_PRINT("Flushing encoder...");
-
-    try
-    {
-        encoder->flush();
-    }
-    catch (const std::exception &e)
-    {
-        VIDEO_ERROR_PRINT("Error during flush: %s", e.what());
-    }
-
-    VIDEO_INFO_PRINT("Output written to: %s, units %d", outputPath.c_str(), encodedUnits);
-
-    delete encoder;
-    return EXIT_SUCCESS;
 }

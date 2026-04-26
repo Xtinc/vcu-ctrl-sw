@@ -18,6 +18,8 @@ extern "C"
 
 static constexpr int kStreamSmoothingCount = 2;
 static constexpr int kHeightAlign = 8;
+static constexpr uint32_t kMaxWidth = 3840;
+static constexpr uint32_t kMaxHeight = 2160;
 
 static uint32_t write_one_section(DMAProxy &mem_ctl, AL_TBuffer *source, AL_TBuffer *destination, int offset,
                                   int numSection)
@@ -98,8 +100,7 @@ static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int fi
 
 RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : m_cfg(cfg), m_callback(std::move(cb)), m_dma_proxy(cfg.dma_dev_path.c_str()), m_pAllocator(nullptr),
-      m_pScheduler(nullptr), m_pic_format{}, m_src_fourcc{}, m_pitchY(0), m_strideH(0), m_stopped(false),
-      m_eos_signaled(false), m_error(false)
+      m_pScheduler(nullptr), m_pic_format{}, m_src_fourcc{}, m_stopped(false), m_eos_signaled(false), m_error(false)
 {
     if (!m_callback)
     {
@@ -131,8 +132,6 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
 
     m_pic_format = AL_EncGetSrcPicFormat(m_cfg.chroma_mode, m_cfg.bit_depth, AL_SRC_RASTER);
     m_src_fourcc = AL_EncGetSrcFourCC(m_pic_format);
-    m_pitchY = AL_EncGetMinPitch(m_cfg.width, &m_pic_format);
-    m_strideH = AL_RoundUp(static_cast<int>(m_cfg.height), kHeightAlign);
 
     AL_TEncSettings settings{};
     AL_Settings_SetDefaults(&settings);
@@ -170,7 +169,7 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
     m_source_buf_pool = std::make_unique<PixMapBufPool>();
     m_stream_buf_pool = std::make_unique<GenericBufPool>();
 
-    init_src_buf_pool();
+    init_source_buf_pool();
     init_stream_buf_pool();
     push_stream_buffers();
 }
@@ -286,6 +285,10 @@ bool RTEncoderBase::set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(m_cfg_mutex);
+    m_cfg.target_bitrate = uTargetBitRate;
+    m_cfg.max_bitrate = effectiveMax;
+
     return true;
 }
 
@@ -302,6 +305,39 @@ bool RTEncoderBase::set_framerate(uint32_t uFrameRate, uint32_t uClkRatio)
         m_error.store(true);
         return false;
     }
+
+    std::lock_guard<std::mutex> lock(m_cfg_mutex);
+    m_cfg.framerate = uFrameRate;
+    m_cfg.clk_ratio = uClkRatio;
+
+    return true;
+}
+
+bool RTEncoderBase::set_resolution(uint32_t uWidth, uint32_t uHeight)
+{
+    if (!m_hEnc || uWidth == 0 || uHeight == 0)
+    {
+        return false;
+    }
+
+    if (uWidth > kMaxWidth || uHeight > kMaxHeight)
+    {
+        VIDEO_ERROR_PRINT("set_resolution rejected: %ux%u exceeds init/max %ux%u", uWidth, uHeight, kMaxWidth,
+                          kMaxHeight);
+        return false;
+    }
+
+    const AL_TDimension dim{static_cast<int32_t>(uWidth), static_cast<int32_t>(uHeight)};
+    if (!AL_Encoder_SetInputResolution(m_hEnc, dim))
+    {
+        VIDEO_ERROR_PRINT("set_resolution failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
+        m_error.store(true);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_cfg_mutex);
+    m_cfg.width = uWidth;
+    m_cfg.height = uHeight;
 
     return true;
 }
@@ -321,7 +357,13 @@ AL_EChromaMode RTEncoderBase::SRC_chroma() const
     return m_cfg.chroma_mode;
 }
 
-void RTEncoderBase::sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID)
+AL_TDimension RTEncoderBase::SRC_resolution() const
+{
+    std::lock_guard<std::mutex> lock(m_cfg_mutex);
+    return AL_TDimension{m_cfg.width, m_cfg.height};
+}
+
+void RTEncoderBase::sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int /*iLayerID*/)
 {
     auto *pThis = static_cast<RTEncoderBase *>(pUserParam);
     pThis->on_encoded_frame(pStream, pSrc);
@@ -450,20 +492,23 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
     settings.eQpTableMode = AL_QP_TABLE_NONE;
 }
 
-void RTEncoderBase::init_src_buf_pool()
+void RTEncoderBase::init_source_buf_pool()
 {
-    AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
+    AL_TDimension tDim{static_cast<int32_t>(kMaxWidth), static_cast<int32_t>(kMaxHeight)};
     AL_EPlaneId usedPlanes[AL_MAX_BUFFER_PLANES]{};
     int nPlanes = AL_Plane_GetBufferPixelPlanes(m_pic_format, usedPlanes);
 
     std::vector<AL_TPlaneDescription> plane_descs;
     int chunk_size = 0;
 
+    int pitchY_4k = AL_EncGetMinPitch(kMaxWidth, &m_pic_format);
+    int strideH_4k = AL_RoundUp(kMaxHeight, kHeightAlign);
     for (int i = 0; i < nPlanes; i++)
     {
-        auto pitch = (usedPlanes[i] == AL_PLANE_Y) ? m_pitchY : AL_GetChromaPitch(m_src_fourcc, m_pitchY);
+        auto pitch = (usedPlanes[i] == AL_PLANE_Y) ? pitchY_4k : AL_GetChromaPitch(m_src_fourcc, pitchY_4k);
         plane_descs.push_back({usedPlanes[i], chunk_size, pitch});
-        chunk_size += static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&m_pic_format, m_pitchY, m_strideH, usedPlanes[i]));
+        chunk_size +=
+            static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&m_pic_format, pitchY_4k, strideH_4k, usedPlanes[i]));
     }
 
     m_source_buf_pool->set_format(tDim, m_src_fourcc);
@@ -473,11 +518,15 @@ void RTEncoderBase::init_src_buf_pool()
     {
         throw std::runtime_error("Failed to initialize source buffer pool");
     }
+
+    VIDEO_INFO_PRINT("Source buffer pool initialized: format=%s, size=%ux%u, planes=%d, chunk_size=%d, num_bufs=%u",
+                     FOURCC2STR(m_src_fourcc).c_str(), tDim.iWidth, tDim.iHeight, nPlanes, chunk_size,
+                     m_cfg.num_src_bufs);
 }
 
 void RTEncoderBase::init_stream_buf_pool()
 {
-    AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
+    AL_TDimension tDim{static_cast<int32_t>(kMaxWidth), static_cast<int32_t>(kMaxHeight)};
 
     uint64_t streamSize = static_cast<uint64_t>(AL_GetMitigatedMaxNalSize(tDim, m_cfg.chroma_mode, m_cfg.bit_depth));
     streamSize += AL_ENC_MAX_HEADER_SIZE;
@@ -498,6 +547,9 @@ void RTEncoderBase::init_stream_buf_pool()
     {
         throw std::runtime_error("Failed to initialize stream buffer pool");
     }
+
+    VIDEO_INFO_PRINT("Stream buffer pool initialized: buffer_size=%zu Bytes, num_bufs=%u",
+                     m_stream_buf_pool->get_buf_size(), m_stream_buf_pool->get_num_buf());
 }
 
 void RTEncoderBase::push_stream_buffers()
@@ -540,7 +592,14 @@ AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
     {
         return nullptr;
     }
-    return m_source_buf_pool->get_buffer();
+
+    auto pBuf = m_source_buf_pool->get_buffer();
+    if (pBuf)
+    {
+        AL_PixMapBuffer_SetDimension(pBuf, SRC_resolution());
+    }
+
+    return pBuf;
 }
 
 bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
@@ -565,7 +624,7 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
     return true;
 }
 
-void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const *pSrc)
+void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const * /*pSrc*/)
 {
     // for file mode, source buffer is owned by the encoder and need do nothing on release callback
 }
