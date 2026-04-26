@@ -2,7 +2,6 @@
 
 option(ENABLE_ROI               "Enable Region-of-Interest support"    ON)
 option(ENABLE_MICROBLAZE        "Enable Microblaze MCU firmware path"  ON)
-option(ENABLE_SYNC_IP           "Enable sync-IP application"           ON)
 option(ENABLE_HIGH_DYNAMIC_RANGE "Enable HDR support"                  ON)
 option(ENABLE_ENC_SW_MULTIPASS  "Enable encoder software multi-pass"   ON)
 option(ENABLE_LINUX_DRIVER      "Enable Linux DMA allocator driver"    ON)

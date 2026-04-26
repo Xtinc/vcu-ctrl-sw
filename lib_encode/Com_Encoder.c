@@ -1280,7 +1280,8 @@ static bool AL_Common_Encoder_SetChannelResolution(AL_TLayerCtx* pLayerCtx, AL_T
   pChanParam->uEncWidth = tDim.iWidth;
   pChanParam->uEncHeight = tDim.iHeight;
   pChanParam->uSrcWidth = tDim.iWidth;
-  pChanParam->uSrcHeight = tDim.iWidth;
+  // pChanParam->uSrcHeight = tDim.iWidth;
+  pChanParam->uSrcHeight = tDim.iHeight;
   return true;
 }
 

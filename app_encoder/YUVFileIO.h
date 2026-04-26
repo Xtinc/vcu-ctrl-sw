@@ -5,7 +5,6 @@ extern "C"
 {
 #include "lib_common/BufferAPI.h"
 #include "lib_common/FourCC.h"
-#include "lib_rtos/message.h"
 }
 
 #include <cstddef>

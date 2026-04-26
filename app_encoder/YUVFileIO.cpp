@@ -1,9 +1,10 @@
-#include "lib_app/YUVFileIO.h"
+#include "YUVFileIO.h"
 
 extern "C"
 {
 #include "lib_common/BufCommon.h"
 #include "lib_common/PixMapBuffer.h"
+#include "lib_rtos/message.h"
 }
 
 YuvFileIO::YuvFileIO(std::string filePath, Mode mode, int width, int height, TFourCC fourCC, bool loopRead)
