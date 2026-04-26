@@ -51,7 +51,7 @@ int main(int argc, char *argv[])
     cfg.bit_depth = 8;
     cfg.rc_mode = AL_RC_CBR;
     cfg.target_bitrate = 8000000; /* 8 Mbps */
-    cfg.framerate = 30;
+    cfg.framerate = 60;
     cfg.clk_ratio = 1000;
     cfg.gop_length = 30;
     cfg.low_delay_mode = true;
@@ -68,7 +68,7 @@ int main(int argc, char *argv[])
     try
     {
         encoder = new RTEncoder<SourceMode::FILE>(cfg, [&](const uint8_t *pData, size_t size) {
-            VIDEO_INFO_PRINT("[%d] size=%6zu KB", encodedUnits, size / 1000);
+            VIDEO_INFO_PRINT("[%6d] size=%6zu Bytes", encodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++encodedUnits;
         });
@@ -94,6 +94,13 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < numFrames; i++)
     {
+        if (i == 300)
+        {
+            encoder->set_framerate(30);    /* 30 fps */
+            encoder->set_bitrate(4000000); /* 4 Mbps */
+            encoder->request_IDR();
+        }
+
         AL_TBuffer *srcBuf = encoder->acquire_source_buffer();
         if (!srcBuf)
         {

@@ -286,7 +286,6 @@ bool RTEncoderBase::set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
         return false;
     }
 
-    request_IDR();
     return true;
 }
 
@@ -304,7 +303,6 @@ bool RTEncoderBase::set_framerate(uint32_t uFrameRate, uint32_t uClkRatio)
         return false;
     }
 
-    request_IDR();
     return true;
 }
 
