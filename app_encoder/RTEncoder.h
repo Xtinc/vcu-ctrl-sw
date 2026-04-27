@@ -3,6 +3,8 @@
 
 #include "MemMgr.h"
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 
 extern "C"
 {
@@ -66,9 +68,6 @@ class RTEncoderBase
 {
   public:
     using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size)>;
-
-    // CTOR throw std::runtime_error on initialization failure (e.g., hardware init, encoder creation)
-    explicit RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb);
     virtual ~RTEncoderBase();
 
     RTEncoderBase(const RTEncoderBase &) = delete;
@@ -88,12 +87,15 @@ class RTEncoderBase
     AL_EChromaMode SRC_chroma() const;
     AL_TDimension SRC_resolution() const;
 
+  protected:
+    // CTOR throw std::runtime_error on initialization failure (e.g., hardware init, encoder creation)
+    explicit RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb);
+
   private:
     static void sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID);
     void on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc);
 
     void init_settings(AL_TEncSettings &settings) const;
-    void init_source_buf_pool();
     void init_stream_buf_pool();
     void push_stream_buffers();
     virtual void release_sources(AL_TBuffer const *pSrc) = 0;
@@ -134,7 +136,29 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
     bool submit_source_buffer(AL_TBuffer *pBuf);
 
   private:
+    void init_source_buf_pool();
     void release_sources(AL_TBuffer const *pSrc) override;
+};
+
+template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
+{
+  public:
+    using SourceReleaseCallback = std::function<void(int fd, void *userData)>;
+
+    RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
+    ~RTEncoder() override = default;
+
+    void set_release_callback(SourceReleaseCallback releaseCb, void *userData = nullptr);
+    bool submit_dma_fd(int fd, size_t size);
+
+  private:
+    void release_sources(AL_TBuffer const *pSrc) override;
+
+  private:
+    std::mutex m_fd_mutex;
+    std::unordered_map<const AL_TBuffer *, int> m_fd_map;
+    void *m_usr_data;
+    SourceReleaseCallback m_release_cb;
 };
 
 #endif // REALTIME_ENCODER_H

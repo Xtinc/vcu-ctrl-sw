@@ -136,6 +136,10 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
     AL_TEncSettings settings{};
     AL_Settings_SetDefaults(&settings);
     AL_Settings_SetDefaultParam(&settings);
+    auto configed_width = m_cfg.width;
+    auto configed_height = m_cfg.height;
+    m_cfg.width = kMaxWidth;
+    m_cfg.height = kMaxHeight;
     init_settings(settings);
 
     auto result = AL_Settings_CheckValidity(&settings, &settings.tChParam[0], nullptr);
@@ -166,12 +170,9 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         VIDEO_ERROR_PRINT("AL_Encoder_SetAutoQP failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
     }
 
-    m_source_buf_pool = std::make_unique<PixMapBufPool>();
-    m_stream_buf_pool = std::make_unique<GenericBufPool>();
-
-    init_source_buf_pool();
     init_stream_buf_pool();
     push_stream_buffers();
+    set_resolution(configed_width, configed_height);
 }
 
 RTEncoderBase::~RTEncoderBase()
@@ -227,7 +228,11 @@ void RTEncoderBase::flush()
         return; // Already stopped
     }
 
-    m_source_buf_pool->decommit();
+    if (m_source_buf_pool)
+    {
+        m_source_buf_pool->decommit();
+    }
+
     const auto eos_queued = AL_Encoder_Process(m_hEnc, nullptr, nullptr);
     if (!eos_queued)
     {
@@ -492,42 +497,9 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
     settings.eQpTableMode = AL_QP_TABLE_NONE;
 }
 
-void RTEncoderBase::init_source_buf_pool()
-{
-    AL_TDimension tDim{static_cast<int32_t>(kMaxWidth), static_cast<int32_t>(kMaxHeight)};
-    AL_EPlaneId usedPlanes[AL_MAX_BUFFER_PLANES]{};
-    int nPlanes = AL_Plane_GetBufferPixelPlanes(m_pic_format, usedPlanes);
-
-    std::vector<AL_TPlaneDescription> plane_descs;
-    int chunk_size = 0;
-
-    int pitchY_4k = AL_EncGetMinPitch(kMaxWidth, &m_pic_format);
-    int strideH_4k = AL_RoundUp(kMaxHeight, kHeightAlign);
-    for (int i = 0; i < nPlanes; i++)
-    {
-        auto pitch = (usedPlanes[i] == AL_PLANE_Y) ? pitchY_4k : AL_GetChromaPitch(m_src_fourcc, pitchY_4k);
-        plane_descs.push_back({usedPlanes[i], chunk_size, pitch});
-        chunk_size +=
-            static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&m_pic_format, pitchY_4k, strideH_4k, usedPlanes[i]));
-    }
-
-    m_source_buf_pool->set_format(tDim, m_src_fourcc);
-    m_source_buf_pool->add_chunk(chunk_size, plane_descs);
-
-    if (!m_source_buf_pool->init(m_pAllocator, m_cfg.num_src_bufs, "source_pool"))
-    {
-        throw std::runtime_error("Failed to initialize source buffer pool");
-    }
-
-    VIDEO_INFO_PRINT("Source buffer pool initialized: format=%s, size=%ux%u, planes=%d, chunk_size=%d, num_bufs=%u",
-                     FOURCC2STR(m_src_fourcc).c_str(), tDim.iWidth, tDim.iHeight, nPlanes, chunk_size,
-                     m_cfg.num_src_bufs);
-}
-
 void RTEncoderBase::init_stream_buf_pool()
 {
-    AL_TDimension tDim{static_cast<int32_t>(kMaxWidth), static_cast<int32_t>(kMaxHeight)};
-
+    AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
     uint64_t streamSize = static_cast<uint64_t>(AL_GetMitigatedMaxNalSize(tDim, m_cfg.chroma_mode, m_cfg.bit_depth));
     streamSize += AL_ENC_MAX_HEADER_SIZE;
 
@@ -540,6 +512,7 @@ void RTEncoderBase::init_stream_buf_pool()
         throw std::runtime_error("Failed to create stream metadata template");
     }
 
+    m_stream_buf_pool = std::make_unique<GenericBufPool>();
     bool ok = m_stream_buf_pool->init(m_pAllocator, numBufs, static_cast<size_t>(streamSize), pMeta, "stream_pool");
     AL_MetaData_Destroy(pMeta);
 
@@ -584,6 +557,7 @@ void RTEncoderBase::push_stream_buffers()
 RTEncoder<SourceMode::FILE>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : RTEncoderBase(cfg, std::move(cb))
 {
+    init_source_buf_pool();
 }
 
 AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
@@ -624,7 +598,161 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
     return true;
 }
 
+void RTEncoder<SourceMode::FILE>::init_source_buf_pool()
+{
+    AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
+    AL_EPlaneId usedPlanes[AL_MAX_BUFFER_PLANES]{};
+    int nPlanes = AL_Plane_GetBufferPixelPlanes(m_pic_format, usedPlanes);
+
+    std::vector<AL_TPlaneDescription> plane_descs;
+    int chunk_size = 0;
+
+    int pitchY = AL_EncGetMinPitch(m_cfg.width, &m_pic_format);
+    int strideH = AL_RoundUp(m_cfg.height, kHeightAlign);
+    for (int i = 0; i < nPlanes; i++)
+    {
+        auto pitch = (usedPlanes[i] == AL_PLANE_Y) ? pitchY : AL_GetChromaPitch(m_src_fourcc, pitchY);
+        plane_descs.push_back({usedPlanes[i], chunk_size, pitch});
+        chunk_size += static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&m_pic_format, pitchY, strideH, usedPlanes[i]));
+    }
+
+    m_source_buf_pool = std::make_unique<PixMapBufPool>();
+    m_source_buf_pool->set_format(tDim, m_src_fourcc);
+    m_source_buf_pool->add_chunk(chunk_size, plane_descs);
+
+    if (!m_source_buf_pool->init(m_pAllocator, m_cfg.num_src_bufs, "source_pool"))
+    {
+        throw std::runtime_error("Failed to initialize source buffer pool");
+    }
+
+    VIDEO_INFO_PRINT("Source buffer pool initialized: format=%s, size=%ux%u, planes=%d, chunk_size=%d, num_bufs=%u",
+                     FOURCC2STR(m_src_fourcc).c_str(), tDim.iWidth, tDim.iHeight, nPlanes, chunk_size,
+                     m_cfg.num_src_bufs);
+}
+
 void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const * /*pSrc*/)
 {
     // for file mode, source buffer is owned by the encoder and need do nothing on release callback
+}
+
+RTEncoder<SourceMode::V4L2>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
+    : RTEncoderBase(cfg, std::move(cb))
+{
+}
+
+void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
+{
+    std::lock_guard<std::mutex> lock(m_fd_mutex);
+    m_release_cb = std::move(releaseCb);
+    m_usr_data = userData;
+}
+
+bool RTEncoder<SourceMode::V4L2>::submit_dma_fd(int fd, size_t data_size)
+{
+    if (m_stopped.load() || m_error.load())
+    {
+        return false;
+    }
+
+    if (fd < 0 || data_size == 0)
+    {
+        return false;
+    }
+
+    if (m_stopped.load() || m_error.load())
+    {
+        return false;
+    }
+
+    auto *pLinuxAllocator = reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator);
+    AL_HANDLE dmaHandle = AL_LinuxDmaAllocator_ImportFromFd(pLinuxAllocator, fd);
+    if (!dmaHandle)
+    {
+        return false;
+    }
+
+    auto src_dim = SRC_resolution();
+    AL_TBuffer *pSrcBuf = AL_PixMapBuffer_Create(m_pAllocator, AL_Buffer_Destroy, src_dim, m_src_fourcc);
+    if (!pSrcBuf)
+    {
+        AL_Allocator_Free(m_pAllocator, dmaHandle);
+        return false;
+    }
+
+    AL_EPlaneId usedPlanes[AL_MAX_BUFFER_PLANES]{};
+    int nPlanes = AL_Plane_GetBufferPixelPlanes(m_pic_format, usedPlanes);
+
+    std::vector<AL_TPlaneDescription> planeDescs;
+    planeDescs.reserve(static_cast<size_t>(nPlanes));
+
+    int pitchY = AL_EncGetMinPitch(src_dim.iWidth, &m_pic_format);
+    int strideH = AL_RoundUp(src_dim.iHeight, kHeightAlign);
+    int offset = 0;
+    for (int i = 0; i < nPlanes; ++i)
+    {
+        int pitch = (usedPlanes[i] == AL_PLANE_Y) ? pitchY : AL_GetChromaPitch(m_src_fourcc, pitchY);
+        planeDescs.push_back(AL_TPlaneDescription{usedPlanes[i], offset, pitch});
+        offset += static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&m_pic_format, pitchY, strideH, usedPlanes[i]));
+    }
+
+    if (!AL_PixMapBuffer_AddPlanes(pSrcBuf, dmaHandle, data_size, planeDescs.data(), nPlanes))
+    {
+        AL_Buffer_Unref(pSrcBuf);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_fd_mutex);
+        m_fd_map[pSrcBuf] = fd;
+    }
+
+    if (!AL_Encoder_Process(m_hEnc, pSrcBuf, nullptr))
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_fd_mutex);
+            m_fd_map.erase(pSrcBuf);
+        }
+        AL_Buffer_Unref(pSrcBuf);
+        VIDEO_ERROR_PRINT("Failed to submit dmabuf fd %d to encoder", fd);
+        m_error.store(true);
+        return false;
+    }
+
+    AL_Buffer_Unref(pSrcBuf);
+    return true;
+}
+
+void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
+{
+    int fd = -1;
+    SourceReleaseCallback release_cb;
+    {
+        std::lock_guard<std::mutex> lock(m_fd_mutex);
+        auto it = m_fd_map.find(pSrc);
+        if (it != m_fd_map.end())
+        {
+            fd = it->second;
+            m_fd_map.erase(it);
+        }
+        release_cb = m_release_cb;
+    }
+
+    if (fd < 0)
+    {
+        VIDEO_ERROR_PRINT("Failed to find fd for released source buffer");
+        m_error.store(true);
+    }
+
+    try
+    {
+        if (release_cb)
+        {
+            release_cb(fd, m_usr_data);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        m_error.store(true);
+        VIDEO_ERROR_PRINT("Exception in source release callback: %s", e.what());
+    }
 }
