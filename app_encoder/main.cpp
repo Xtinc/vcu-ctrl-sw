@@ -1,4 +1,5 @@
 #include "RTEncoder.h"
+#include "V4L2Source.h"
 #include "YUVFileIO.h"
 
 extern "C"
@@ -8,28 +9,16 @@ extern "C"
 }
 
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <vector>
 
-int main(int argc, char *argv[])
+int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, EncoderConfig &cfg)
 {
-    if (argc < 4)
-    {
-        VIDEO_ERROR_PRINT("Usage: %s file <cmd.txt> <output.265>", argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    const std::string mode = argv[1];
-    if (mode != "file" && mode != "v4l2")
-    {
-        VIDEO_ERROR_PRINT("Invalid mode: %s (expected: file or v4l2)", mode.c_str());
-        return EXIT_FAILURE;
-    }
-
-    std::ifstream cmdFile(argv[2]);
+    std::ifstream cmdFile(cmdFilePath);
     if (!cmdFile)
     {
-        VIDEO_ERROR_PRINT("Cannot open command file: %s", argv[2]);
+        VIDEO_ERROR_PRINT("Cannot open command file: %s", cmdFilePath.c_str());
         return EXIT_FAILURE;
     }
 
@@ -46,7 +35,7 @@ int main(int argc, char *argv[])
     }
     if (cmdLines.empty())
     {
-        VIDEO_ERROR_PRINT("No valid command lines in %s", argv[2]);
+        VIDEO_ERROR_PRINT("No valid command lines in %s", cmdFilePath.c_str());
         return EXIT_FAILURE;
     }
 
@@ -64,43 +53,19 @@ int main(int argc, char *argv[])
         }
     }
 
-    EncoderConfig cfg{};
-    cfg.profile = AL_PROFILE_HEVC_MAIN;
-    cfg.level = 51;
-    cfg.chroma_mode = AL_CHROMA_4_2_2;
-    cfg.bit_depth = 8;
-    cfg.rc_mode = AL_RC_CBR;
-    cfg.target_bitrate = 8000000;
-    cfg.framerate = 60;
-    cfg.clk_ratio = 1000;
-    cfg.gop_length = 30;
-    cfg.low_delay_mode = true;
-    cfg.num_b = 0;
-    cfg.num_src_bufs = 4;
-    cfg.num_stream_bufs = 4;
-    cfg.enc_dev_path = "/dev/allegroIP";
-    cfg.dma_dev_path = "/dev/dmaproxy";
-
-    std::ofstream outFile(argv[3], std::ios::binary);
-    if (!outFile)
-    {
-        VIDEO_ERROR_PRINT("Cannot open output file: %s", argv[3]);
-        return EXIT_FAILURE;
-    }
-
     int totalEncodedUnits = 0;
-    RTEncoder<SourceMode::FILE> *encoder = nullptr;
+    std::unique_ptr<RTEncoder<SourceMode::FILE>> encoder;
     try
     {
         int width_1st = std::stoi(cmdLines[0][1]);
         int height_1st = std::stoi(cmdLines[0][2]);
         cfg.width = static_cast<uint16_t>(width_1st);
         cfg.height = static_cast<uint16_t>(height_1st);
-        encoder = new RTEncoder<SourceMode::FILE>(cfg, [&](const uint8_t *pData, size_t size) {
+        encoder.reset(new RTEncoder<SourceMode::FILE>(cfg, [&](const uint8_t *pData, size_t size) {
             VIDEO_INFO_PRINT("[%6d] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
-        });
+        }));
 
         for (size_t cmdIdx = 0; cmdIdx < cmdLines.size(); ++cmdIdx)
         {
@@ -157,18 +122,125 @@ int main(int argc, char *argv[])
         catch (...)
         {
         }
-
-        delete encoder;
         VIDEO_INFO_PRINT("All tasks done. Total encoded units: %d", totalEncodedUnits);
         return EXIT_SUCCESS;
     }
     catch (const std::exception &e)
     {
         VIDEO_ERROR_PRINT("Encoder error: %s", e.what());
-        if (encoder)
-        {
-            delete encoder;
-        }
         return EXIT_FAILURE;
     }
+}
+
+int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, EncoderConfig &cfg)
+{
+    int totalEncodedUnits = 0;
+    std::unique_ptr<RTEncoder<SourceMode::V4L2>> encoder;
+    try
+    {
+        encoder.reset(new RTEncoder<SourceMode::V4L2>(cfg, [&](const uint8_t *pData, size_t size) {
+            VIDEO_INFO_PRINT("[%6d] size: %6zu bytes", totalEncodedUnits, size);
+            outFile.write(reinterpret_cast<const char *>(pData), size);
+            ++totalEncodedUnits;
+        }));
+
+        V4L2Source v4l2src(v4l2_dev, cfg.width, cfg.height, STR2FOURCC("NV12"), cfg.num_src_bufs);
+        encoder->set_release_callback([&v4l2src](int fd, void *usr_data) {
+            v4l2src.queue_buffer(fd);
+        });
+        if (!v4l2src.start())
+        {
+            VIDEO_ERROR_PRINT("Failed to start V4L2 device: %s", v4l2_dev.c_str());
+            return EXIT_FAILURE;
+        }
+
+        int frameCount = 100;
+        for (int i = 0; i < frameCount; ++i)
+        {
+            int fd = -1;
+            size_t length = 0;
+            if (!v4l2src.read_frame(fd, length))
+            {
+                VIDEO_ERROR_PRINT("Failed to read frame from V4L2 device at frame %d", i);
+                break;
+            }
+            if (!encoder->submit_dma_fd(fd, length))
+            {
+                VIDEO_ERROR_PRINT("Failed to submit dma fd at frame %d", i);
+                break;
+            }
+        }
+
+        try
+        {
+            encoder->flush();
+        }
+        catch (...)
+        {
+        }
+        v4l2src.stop();
+        VIDEO_INFO_PRINT("V4L2 encoding done. Total encoded units: %d", totalEncodedUnits);
+        return EXIT_SUCCESS;
+    }
+    catch (const std::exception &e)
+    {
+        VIDEO_ERROR_PRINT("V4L2 Encoder error: %s", e.what());
+        return EXIT_FAILURE;
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 4)
+    {
+        VIDEO_ERROR_PRINT("Usage: %s <mode> <cmd.txt|v4l2_dev> <output.265>", argv[0]);
+        VIDEO_ERROR_PRINT("  mode: file | v4l2");
+        VIDEO_ERROR_PRINT("  file模式: %s file <cmd.txt> <output.265>", argv[0]);
+        VIDEO_ERROR_PRINT("  v4l2模式: %s v4l2 <video_device> <output.265>", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const std::string mode = argv[1];
+    if (mode != "file" && mode != "v4l2")
+    {
+        VIDEO_ERROR_PRINT("Invalid mode: %s (expected: file or v4l2)", mode.c_str());
+        return EXIT_FAILURE;
+    }
+
+    EncoderConfig cfg{};
+    cfg.profile = AL_PROFILE_HEVC_MAIN;
+    cfg.level = 51;
+    cfg.chroma_mode = AL_CHROMA_4_2_2;
+    cfg.bit_depth = 8;
+    cfg.rc_mode = AL_RC_CBR;
+    cfg.target_bitrate = 8000000;
+    cfg.framerate = 60;
+    cfg.clk_ratio = 1000;
+    cfg.gop_length = 30;
+    cfg.low_delay_mode = true;
+    cfg.num_b = 0;
+    cfg.num_src_bufs = 4;
+    cfg.num_stream_bufs = 4;
+    cfg.enc_dev_path = "/dev/allegroIP";
+    cfg.dma_dev_path = "/dev/dmaproxy";
+
+    std::ofstream outFile(argv[3], std::ios::binary);
+    if (!outFile)
+    {
+        VIDEO_ERROR_PRINT("Cannot open output file: %s", argv[3]);
+        return EXIT_FAILURE;
+    }
+
+    if (mode == "file")
+    {
+        return encode_file_mode(argv[2], outFile, cfg);
+    }
+    else if (mode == "v4l2")
+    {
+        cfg.width = 1920;
+        cfg.height = 1080;
+        return encode_v4l2_mode(argv[2], outFile, cfg);
+    }
+
+    return EXIT_FAILURE;
 }

@@ -44,7 +44,7 @@ V4L2Source::~V4L2Source()
 bool V4L2Source::start()
 {
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    bool ok = ioctl(m_state->fd, VIDIOC_STREAMON, &type, "VIDIOC_STREAMON");
+    bool ok = (ioctl(m_state->fd, VIDIOC_STREAMON, &type) == 0);
     m_state->running.store(ok);
     return ok;
 }
@@ -59,16 +59,18 @@ void V4L2Source::stop()
         (void)ioctl(m_state->fd, VIDIOC_STREAMOFF, &type);
     }
 
-    for (auto &b : m_state->buffers)
     {
-        if (b.fd >= 0)
+        std::lock_guard<std::mutex> lock(m_state->qbufMutex);
+        for (auto &b : m_state->buffers)
         {
-            ::close(b.fd);
-            b.fd = -1;
+            if (b.fd >= 0)
+            {
+                ::close(b.fd);
+                b.fd = -1;
+            }
         }
+        m_state->buffers.clear();
     }
-
-    m_state->buffers.clear();
 
     if (m_state->fd >= 0)
     {
@@ -89,12 +91,9 @@ bool V4L2Source::read_frame(int &fd, size_t &length)
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
 
+    std::lock_guard<std::mutex> lock(m_state->qbufMutex);
     if (ioctl(m_state->fd, VIDIOC_DQBUF, &buf) < 0)
     {
-        if (errno == EAGAIN)
-        {
-            return true;
-        }
         return false;
     }
 

@@ -21,6 +21,27 @@ static constexpr int kHeightAlign = 8;
 static constexpr uint32_t kMaxWidth = 3840;
 static constexpr uint32_t kMaxHeight = 2160;
 
+using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
+
+static size_t build_pixmap_plane_descs(const AL_TPicFormat &pic_fmt, TFourCC fourcc, AL_TDimension src_dim,
+                                       std::vector<AL_TPlaneDescription> &plane_descs)
+{
+    plane_descs.clear();
+    AL_EPlaneId usedPlanes[AL_MAX_BUFFER_PLANES]{};
+    auto nPlanes = AL_Plane_GetBufferPixelPlanes(pic_fmt, usedPlanes);
+    auto pitchY = AL_EncGetMinPitch(src_dim.iWidth, &pic_fmt);
+    auto strideH = AL_RoundUp(src_dim.iHeight, kHeightAlign);
+
+    size_t chunk_size = 0;
+    for (int i = 0; i < nPlanes; i++)
+    {
+        auto pitch = (usedPlanes[i] == AL_PLANE_Y) ? pitchY : AL_GetChromaPitch(fourcc, pitchY);
+        plane_descs.push_back({usedPlanes[i], static_cast<int>(chunk_size), pitch});
+        chunk_size += static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&pic_fmt, pitchY, strideH, usedPlanes[i]));
+    }
+    return chunk_size;
+}
+
 static uint32_t write_one_section(DMAProxy &mem_ctl, AL_TBuffer *source, AL_TBuffer *destination, int offset,
                                   int numSection)
 {
@@ -583,7 +604,7 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
         return false;
     }
 
-    std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)> buf_guard(pBuf, &AL_Buffer_Unref);
+    AL_BufferGuard buf_guard(pBuf, &AL_Buffer_Unref);
 
     if (m_stopped.load() || m_error.load())
     {
@@ -601,20 +622,8 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
 void RTEncoder<SourceMode::FILE>::init_source_buf_pool()
 {
     AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
-    AL_EPlaneId usedPlanes[AL_MAX_BUFFER_PLANES]{};
-    int nPlanes = AL_Plane_GetBufferPixelPlanes(m_pic_format, usedPlanes);
-
     std::vector<AL_TPlaneDescription> plane_descs;
-    int chunk_size = 0;
-
-    int pitchY = AL_EncGetMinPitch(m_cfg.width, &m_pic_format);
-    int strideH = AL_RoundUp(m_cfg.height, kHeightAlign);
-    for (int i = 0; i < nPlanes; i++)
-    {
-        auto pitch = (usedPlanes[i] == AL_PLANE_Y) ? pitchY : AL_GetChromaPitch(m_src_fourcc, pitchY);
-        plane_descs.push_back({usedPlanes[i], chunk_size, pitch});
-        chunk_size += static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&m_pic_format, pitchY, strideH, usedPlanes[i]));
-    }
+    size_t chunk_size = build_pixmap_plane_descs(m_pic_format, m_src_fourcc, tDim, plane_descs);
 
     m_source_buf_pool = std::make_unique<PixMapBufPool>();
     m_source_buf_pool->set_format(tDim, m_src_fourcc);
@@ -625,8 +634,8 @@ void RTEncoder<SourceMode::FILE>::init_source_buf_pool()
         throw std::runtime_error("Failed to initialize source buffer pool");
     }
 
-    VIDEO_INFO_PRINT("Source buffer pool initialized: format=%s, size=%ux%u, planes=%d, chunk_size=%d, num_bufs=%u",
-                     FOURCC2STR(m_src_fourcc).c_str(), tDim.iWidth, tDim.iHeight, nPlanes, chunk_size,
+    VIDEO_INFO_PRINT("Source buffer pool initialized: format=%s, size=%ux%u, planes=%zu, chunk_size=%zu, num_bufs=%u",
+                     FOURCC2STR(m_src_fourcc).c_str(), tDim.iWidth, tDim.iHeight, plane_descs.size(), chunk_size,
                      m_cfg.num_src_bufs);
 }
 
@@ -679,25 +688,14 @@ bool RTEncoder<SourceMode::V4L2>::submit_dma_fd(int fd, size_t data_size)
         return false;
     }
 
-    AL_EPlaneId usedPlanes[AL_MAX_BUFFER_PLANES]{};
-    int nPlanes = AL_Plane_GetBufferPixelPlanes(m_pic_format, usedPlanes);
+    AL_Buffer_Ref(pSrcBuf);
+    AL_BufferGuard buf_guard(pSrcBuf, &AL_Buffer_Unref);
 
     std::vector<AL_TPlaneDescription> planeDescs;
-    planeDescs.reserve(static_cast<size_t>(nPlanes));
-
-    int pitchY = AL_EncGetMinPitch(src_dim.iWidth, &m_pic_format);
-    int strideH = AL_RoundUp(src_dim.iHeight, kHeightAlign);
-    int offset = 0;
-    for (int i = 0; i < nPlanes; ++i)
+    build_pixmap_plane_descs(m_pic_format, m_src_fourcc, src_dim, planeDescs);
+    if (!AL_PixMapBuffer_AddPlanes(pSrcBuf, dmaHandle, data_size, planeDescs.data(),
+                                   static_cast<int>(planeDescs.size())))
     {
-        int pitch = (usedPlanes[i] == AL_PLANE_Y) ? pitchY : AL_GetChromaPitch(m_src_fourcc, pitchY);
-        planeDescs.push_back(AL_TPlaneDescription{usedPlanes[i], offset, pitch});
-        offset += static_cast<int>(AL_GetAllocSizeSrc_PixPlane(&m_pic_format, pitchY, strideH, usedPlanes[i]));
-    }
-
-    if (!AL_PixMapBuffer_AddPlanes(pSrcBuf, dmaHandle, data_size, planeDescs.data(), nPlanes))
-    {
-        AL_Buffer_Unref(pSrcBuf);
         return false;
     }
 
@@ -712,13 +710,11 @@ bool RTEncoder<SourceMode::V4L2>::submit_dma_fd(int fd, size_t data_size)
             std::lock_guard<std::mutex> lock(m_fd_mutex);
             m_fd_map.erase(pSrcBuf);
         }
-        AL_Buffer_Unref(pSrcBuf);
         VIDEO_ERROR_PRINT("Failed to submit dmabuf fd %d to encoder", fd);
         m_error.store(true);
         return false;
     }
 
-    AL_Buffer_Unref(pSrcBuf);
     return true;
 }
 

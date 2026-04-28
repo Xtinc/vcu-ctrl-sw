@@ -28,6 +28,18 @@ class V4L2Source
     bool start();
     void stop();
     bool read_frame(int &fd, size_t &length);
+    void queue_buffer(int fd)
+    {
+        std::lock_guard<std::mutex> lock(m_state->qbufMutex);
+        for (size_t i = 0; i < m_state->buffers.size(); ++i)
+        {
+            if (m_state->buffers[i].fd == fd)
+            {
+                queue_buffer_by_index(m_state, i);
+                break;
+            }
+        }
+    }
 
   private:
     struct CaptureBuffer
