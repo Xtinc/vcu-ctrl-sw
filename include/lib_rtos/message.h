@@ -43,11 +43,16 @@
 #define DBG_ASSERT_GT(val1, val2) ((void)0)
 #endif
 
-#define VIDEO_INFO_PRINT(fmt, ...) printf("[INF] %s(%d): " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
+#define VIDEO_INFO_PRINT(fmt, ...)                                                                                     \
+    printf("[%15.7f] INF: %s(%d): " fmt "\n", get_log_time_sec(), __func__, __LINE__, ##__VA_ARGS__)
 #define VIDEO_ERROR_PRINT(fmt, ...)                                                                                    \
     do                                                                                                                 \
     {                                                                                                                  \
-        printf("[ERR] %s(%d): " fmt "\n", __func__, __LINE__, ##__VA_ARGS__);                                          \
+        printf("[%15.7f] ERR: %s(%d): " fmt "\n", get_log_time_sec(), __func__, __LINE__, ##__VA_ARGS__);              \
         fflush(stdout);                                                                                                \
     } while (0)
-#define VIDEO_DEBUG_PRINT(fmt, ...) printf("[DEB] %s(%d): " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
+#define VIDEO_DEBUG_PRINT(fmt, ...)                                                                                    \
+    printf("[%15.7f] : %s(%d): " fmt "\n", get_log_time_sec(), __func__, __LINE__, ##__VA_ARGS__)
+
+void message_init();
+double get_log_time_sec();

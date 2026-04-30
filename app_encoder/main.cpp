@@ -198,6 +198,7 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
 
 int main(int argc, char *argv[])
 {
+    message_init();
     if (argc < 4)
     {
         VIDEO_ERROR_PRINT("Usage: %s <mode> <cmd.txt|v4l2_dev> <output.265>", argv[0]);
