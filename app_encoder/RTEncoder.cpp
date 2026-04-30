@@ -654,124 +654,13 @@ void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const * /*pSrc*/)
 {
     // for file mode, source buffer is owned by the encoder and need do nothing on release callback
 }
-
-// Implementation for V4L2_MMAP source mode
-RTEncoder<SourceMode::V4L2_MMAP>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
-    : RTEncoderBase(cfg, std::move(cb))
-{
-}
-
-void RTEncoder<SourceMode::V4L2_MMAP>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
-{
-    std::lock_guard<std::mutex> lock(m_fd_mutex);
-    m_release_cb = std::move(releaseCb);
-    m_usr_data = userData;
-}
-
-bool RTEncoder<SourceMode::V4L2_MMAP>::submit_dma_fd(int fd, size_t data_size)
-{
-    if (m_stopped.load() || m_error.load())
-    {
-        return false;
-    }
-
-    if (fd < 0 || data_size == 0)
-    {
-        return false;
-    }
-
-    if (m_stopped.load() || m_error.load())
-    {
-        return false;
-    }
-
-    auto *pLinuxAllocator = reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator);
-    AL_HANDLE dmaHandle = AL_LinuxDmaAllocator_ImportFromFd(pLinuxAllocator, fd);
-    if (!dmaHandle)
-    {
-        return false;
-    }
-
-    auto src_dim = SRC_resolution();
-    AL_TBuffer *pSrcBuf = AL_PixMapBuffer_Create(m_pAllocator, AL_Buffer_Destroy, src_dim, m_src_fourcc);
-    if (!pSrcBuf)
-    {
-        AL_Allocator_Free(m_pAllocator, dmaHandle);
-        return false;
-    }
-
-    AL_Buffer_Ref(pSrcBuf);
-    AL_BufferGuard buf_guard(pSrcBuf, &AL_Buffer_Unref);
-
-    std::vector<AL_TPlaneDescription> planeDescs;
-    build_pixmap_plane_descs(m_pic_format, m_src_fourcc, src_dim, planeDescs);
-    if (!AL_PixMapBuffer_AddPlanes(pSrcBuf, dmaHandle, data_size, planeDescs.data(),
-                                   static_cast<int>(planeDescs.size())))
-    {
-        return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(m_fd_mutex);
-        m_fd_map[pSrcBuf] = fd;
-    }
-
-    if (!AL_Encoder_Process(m_hEnc, pSrcBuf, nullptr))
-    {
-        {
-            std::lock_guard<std::mutex> lock(m_fd_mutex);
-            m_fd_map.erase(pSrcBuf);
-        }
-        VIDEO_ERROR_PRINT("Failed to submit dmabuf fd %d to encoder", fd);
-        m_error.store(true);
-        return false;
-    }
-
-    return true;
-}
-
-void RTEncoder<SourceMode::V4L2_MMAP>::release_sources(AL_TBuffer const *pSrc)
-{
-    int fd = -1;
-    SourceReleaseCallback release_cb;
-    {
-        std::lock_guard<std::mutex> lock(m_fd_mutex);
-        auto it = m_fd_map.find(pSrc);
-        if (it != m_fd_map.end())
-        {
-            fd = it->second;
-            m_fd_map.erase(it);
-        }
-        release_cb = m_release_cb;
-    }
-
-    if (fd < 0)
-    {
-        VIDEO_ERROR_PRINT("Failed to find fd for released source buffer");
-        m_error.store(true);
-    }
-
-    try
-    {
-        if (release_cb)
-        {
-            release_cb(fd, m_usr_data);
-        }
-    }
-    catch (const std::exception &e)
-    {
-        m_error.store(true);
-        VIDEO_ERROR_PRINT("Exception in source release callback: %s", e.what());
-    }
-}
-
 // Implementation for V4L2_DMABUF source mode
-RTEncoder<SourceMode::V4L2_MDMA>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
+RTEncoder<SourceMode::V4L2>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : RTEncoderBase(cfg, std::move(cb))
 {
 }
 
-RTEncoder<SourceMode::V4L2_MDMA>::~RTEncoder()
+RTEncoder<SourceMode::V4L2>::~RTEncoder()
 {
     // Ensure all buffers are released back to the pool
     std::lock_guard<std::mutex> lock(m_idx_mutex);
@@ -782,14 +671,14 @@ RTEncoder<SourceMode::V4L2_MDMA>::~RTEncoder()
     m_idx_map.clear();
 }
 
-void RTEncoder<SourceMode::V4L2_MDMA>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
+void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
 {
     std::lock_guard<std::mutex> lock(m_idx_mutex);
     m_release_cb = std::move(releaseCb);
     m_usr_data = userData;
 }
 
-std::vector<int> RTEncoder<SourceMode::V4L2_MDMA>::acquire_dma_fds(int count)
+std::vector<int> RTEncoder<SourceMode::V4L2>::acquire_dma_fds(int count)
 {
     if (static_cast<size_t>(count) > m_cfg.num_src_bufs)
     {
@@ -825,7 +714,7 @@ std::vector<int> RTEncoder<SourceMode::V4L2_MDMA>::acquire_dma_fds(int count)
     return fds;
 }
 
-bool RTEncoder<SourceMode::V4L2_MDMA>::submit_dma_index(int idx)
+bool RTEncoder<SourceMode::V4L2>::submit_dma_index(int idx)
 {
     if (m_stopped.load() || m_error.load())
     {
@@ -853,7 +742,7 @@ bool RTEncoder<SourceMode::V4L2_MDMA>::submit_dma_index(int idx)
     return true;
 }
 
-void RTEncoder<SourceMode::V4L2_MDMA>::release_sources(AL_TBuffer const *pSrc)
+void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
 {
     int idx = -1;
     SourceReleaseCallback release_cb;

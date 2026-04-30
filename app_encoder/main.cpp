@@ -54,14 +54,14 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
     }
 
     int totalEncodedUnits = 0;
-    std::unique_ptr<RTEncoder<SourceMode::FILE>> encoder;
+    std::unique_ptr<RTEncoderFile> encoder;
     try
     {
         int width_1st = std::stoi(cmdLines[0][1]);
         int height_1st = std::stoi(cmdLines[0][2]);
         cfg.width = static_cast<uint16_t>(width_1st);
         cfg.height = static_cast<uint16_t>(height_1st);
-        encoder = std::make_unique<RTEncoder<SourceMode::FILE>>(cfg, [&](const uint8_t *pData, size_t size) {
+        encoder = std::make_unique<RTEncoderFile>(cfg, [&](const uint8_t *pData, size_t size) {
             VIDEO_INFO_PRINT("[%6d] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
@@ -135,20 +135,17 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
 int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, EncoderConfig &cfg)
 {
     int totalEncodedUnits = 0;
-    std::unique_ptr<RTEncoder<SourceMode::V4L2_MDMA>> encoder;
+    std::unique_ptr<RTEncoderV4L2> encoder;
     try
     {
-        encoder = std::make_unique<RTEncoder<SourceMode::V4L2_MDMA>>(cfg, [&](const uint8_t *pData, size_t size) {
+        encoder = std::make_unique<RTEncoderV4L2>(cfg, [&](const uint8_t *pData, size_t size) {
             VIDEO_INFO_PRINT("[%6d] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
         });
 
         V4L2Source v4l2src(v4l2_dev, cfg.width, cfg.height, STR2FOURCC("NV12"), cfg.num_src_bufs);
-        encoder->set_release_callback([&v4l2src](int idx, void *) {
-            VIDEO_INFO_PRINT("Releasing source buffer index %d back to V4L2 device", idx);
-            v4l2src.queue_idx(idx);
-        });
+        encoder->set_release_callback([&v4l2src](int idx, void *) { v4l2src.queue_idx(idx); });
         auto fds = encoder->acquire_dma_fds(cfg.num_src_bufs);
         if (!v4l2src.import_fds(fds))
         {

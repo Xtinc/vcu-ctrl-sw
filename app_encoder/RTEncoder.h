@@ -61,8 +61,7 @@ struct EncoderConfig
 enum class SourceMode
 {
     FILE,
-    V4L2_MMAP,
-    V4L2_MDMA
+    V4L2
 };
 
 class RTEncoderBase
@@ -127,6 +126,8 @@ class RTEncoderBase
 };
 
 template <SourceMode mode> class RTEncoder;
+using RTEncoderFile = RTEncoder<SourceMode::FILE>;
+using RTEncoderV4L2 = RTEncoder<SourceMode::V4L2>;
 
 template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
 {
@@ -144,28 +145,7 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
     AL_TDimension m_src_dim;
 };
 
-template <> class RTEncoder<SourceMode::V4L2_MMAP> : public RTEncoderBase
-{
-  public:
-    using SourceReleaseCallback = std::function<void(int fd, void *userData)>;
-
-    RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
-    ~RTEncoder() override = default;
-
-    void set_release_callback(SourceReleaseCallback releaseCb, void *userData = nullptr);
-    bool submit_dma_fd(int fd, size_t size);
-
-  private:
-    void release_sources(AL_TBuffer const *pSrc) override;
-
-  private:
-    std::mutex m_fd_mutex;
-    std::unordered_map<const AL_TBuffer *, int> m_fd_map;
-    void *m_usr_data;
-    SourceReleaseCallback m_release_cb;
-};
-
-template <> class RTEncoder<SourceMode::V4L2_MDMA> : public RTEncoderBase
+template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
 {
   public:
     using SourceReleaseCallback = std::function<void(int idx, void *userData)>;
