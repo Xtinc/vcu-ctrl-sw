@@ -61,11 +61,11 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
         int height_1st = std::stoi(cmdLines[0][2]);
         cfg.width = static_cast<uint16_t>(width_1st);
         cfg.height = static_cast<uint16_t>(height_1st);
-        encoder.reset(new RTEncoder<SourceMode::FILE>(cfg, [&](const uint8_t *pData, size_t size) {
+        encoder = std::make_unique<RTEncoder<SourceMode::FILE>>(cfg, [&](const uint8_t *pData, size_t size) {
             VIDEO_INFO_PRINT("[%6d] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
-        }));
+        });
 
         for (size_t cmdIdx = 0; cmdIdx < cmdLines.size(); ++cmdIdx)
         {
@@ -135,36 +135,43 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
 int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, EncoderConfig &cfg)
 {
     int totalEncodedUnits = 0;
-    std::unique_ptr<RTEncoder<SourceMode::V4L2>> encoder;
+    std::unique_ptr<RTEncoder<SourceMode::V4L2_MDMA>> encoder;
     try
     {
-        encoder.reset(new RTEncoder<SourceMode::V4L2>(cfg, [&](const uint8_t *pData, size_t size) {
+        encoder = std::make_unique<RTEncoder<SourceMode::V4L2_MDMA>>(cfg, [&](const uint8_t *pData, size_t size) {
             VIDEO_INFO_PRINT("[%6d] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
-        }));
+        });
 
         V4L2Source v4l2src(v4l2_dev, cfg.width, cfg.height, STR2FOURCC("NV12"), cfg.num_src_bufs);
-        encoder->set_release_callback([&v4l2src](int fd, void *usr_data) {
-            v4l2src.queue_buffer(fd);
+        encoder->set_release_callback([&v4l2src](int idx, void *) {
+            VIDEO_INFO_PRINT("Releasing source buffer index %d back to V4L2 device", idx);
+            v4l2src.queue_idx(idx);
         });
+        auto fds = encoder->acquire_dma_fds(cfg.num_src_bufs);
+        if (!v4l2src.import_fds(fds))
+        {
+            VIDEO_ERROR_PRINT("Failed to import dma fds to V4L2 device");
+            return EXIT_FAILURE;
+        }
+
         if (!v4l2src.start())
         {
             VIDEO_ERROR_PRINT("Failed to start V4L2 device: %s", v4l2_dev.c_str());
             return EXIT_FAILURE;
         }
 
-        int frameCount = 100;
+        int frameCount = 1000;
         for (int i = 0; i < frameCount; ++i)
         {
-            int fd = -1;
-            size_t length = 0;
-            if (!v4l2src.read_frame(fd, length))
+            int idx = v4l2src.dequeue_idx();
+            if (idx < 0)
             {
                 VIDEO_ERROR_PRINT("Failed to read frame from V4L2 device at frame %d", i);
                 break;
             }
-            if (!encoder->submit_dma_fd(fd, length))
+            if (!encoder->submit_dma_index(idx))
             {
                 VIDEO_ERROR_PRINT("Failed to submit dma fd at frame %d", i);
                 break;
@@ -195,8 +202,8 @@ int main(int argc, char *argv[])
     {
         VIDEO_ERROR_PRINT("Usage: %s <mode> <cmd.txt|v4l2_dev> <output.265>", argv[0]);
         VIDEO_ERROR_PRINT("  mode: file | v4l2");
-        VIDEO_ERROR_PRINT("  file模式: %s file <cmd.txt> <output.265>", argv[0]);
-        VIDEO_ERROR_PRINT("  v4l2模式: %s v4l2 <video_device> <output.265>", argv[0]);
+        VIDEO_ERROR_PRINT("  file: %s file <cmd.txt> <output.265>", argv[0]);
+        VIDEO_ERROR_PRINT("  v4l2: %s v4l2 <video_device> <output.265>", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -210,14 +217,14 @@ int main(int argc, char *argv[])
     EncoderConfig cfg{};
     cfg.profile = AL_PROFILE_HEVC_MAIN;
     cfg.level = 51;
-    cfg.chroma_mode = AL_CHROMA_4_2_2;
+    cfg.chroma_mode = AL_CHROMA_4_2_0;
     cfg.bit_depth = 8;
     cfg.rc_mode = AL_RC_CBR;
     cfg.target_bitrate = 8000000;
     cfg.framerate = 60;
     cfg.clk_ratio = 1000;
     cfg.gop_length = 30;
-    cfg.low_delay_mode = true;
+    cfg.low_delay_mode = false;
     cfg.num_b = 0;
     cfg.num_src_bufs = 4;
     cfg.num_stream_bufs = 4;
@@ -237,8 +244,8 @@ int main(int argc, char *argv[])
     }
     else if (mode == "v4l2")
     {
-        cfg.width = 1920;
-        cfg.height = 1080;
+        cfg.width = 3840;
+        cfg.height = 2160;
         return encode_v4l2_mode(argv[2], outFile, cfg);
     }
 

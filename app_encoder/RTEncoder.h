@@ -61,7 +61,8 @@ struct EncoderConfig
 enum class SourceMode
 {
     FILE,
-    V4L2
+    V4L2_MMAP,
+    V4L2_MDMA
 };
 
 class RTEncoderBase
@@ -96,6 +97,7 @@ class RTEncoderBase
     void on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc);
 
     void init_settings(AL_TEncSettings &settings) const;
+    void init_source_buf_pool();
     void init_stream_buf_pool();
     void push_stream_buffers();
     virtual void release_sources(AL_TBuffer const *pSrc) = 0;
@@ -136,11 +138,13 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
     bool submit_source_buffer(AL_TBuffer *pBuf);
 
   private:
-    void init_source_buf_pool();
     void release_sources(AL_TBuffer const *pSrc) override;
+
+  private:
+    AL_TDimension m_src_dim;
 };
 
-template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
+template <> class RTEncoder<SourceMode::V4L2_MMAP> : public RTEncoderBase
 {
   public:
     using SourceReleaseCallback = std::function<void(int fd, void *userData)>;
@@ -157,6 +161,28 @@ template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
   private:
     std::mutex m_fd_mutex;
     std::unordered_map<const AL_TBuffer *, int> m_fd_map;
+    void *m_usr_data;
+    SourceReleaseCallback m_release_cb;
+};
+
+template <> class RTEncoder<SourceMode::V4L2_MDMA> : public RTEncoderBase
+{
+  public:
+    using SourceReleaseCallback = std::function<void(int idx, void *userData)>;
+
+    RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
+    ~RTEncoder() override;
+
+    void set_release_callback(SourceReleaseCallback releaseCb, void *userData = nullptr);
+    std::vector<int> acquire_dma_fds(int count);
+    bool submit_dma_index(int idx);
+
+  private:
+    void release_sources(AL_TBuffer const *pSrc) override;
+
+  private:
+    std::mutex m_idx_mutex;
+    std::vector<AL_TBuffer *> m_idx_map;
     void *m_usr_data;
     SourceReleaseCallback m_release_cb;
 };

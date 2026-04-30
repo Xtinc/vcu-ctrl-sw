@@ -1,13 +1,19 @@
 #include "V4L2Source.h"
 
-#if LINUX_OS_ENVIRONMENT
+extern "C"
+{
+#include "lib_rtos/message.h"
+}
 
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <linux/videodev2.h>
+#include <stdexcept>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+static constexpr auto SUPPORTED_FOURCC_NV12 = FOURCC(NV12);
+static constexpr auto SUPPORTED_FOURCC_NV16 = FOURCC(NV16);
 
 static void xioctl(int fd, unsigned long request, void *arg, const char *what)
 {
@@ -17,199 +23,200 @@ static void xioctl(int fd, unsigned long request, void *arg, const char *what)
     }
 }
 
-V4L2Source::V4L2Source(const std::string &devicePath, uint32_t width, uint32_t height, uint32_t pixelFormat,
-                       uint32_t bufferCount)
-    : m_dev_path(devicePath), m_width(width), m_height(height), m_pix_fmt(pixelFormat), m_buffer_count(bufferCount),
-      m_state(std::make_shared<SharedState>())
+static void dump_v4l2_format(const v4l2_format &fmt)
 {
-    open_device();
-    config_format();
-    request_buffers();
-    export_buffers();
-    queue_all_buffers();
+    if (V4L2_TYPE_IS_MULTIPLANAR(fmt.type))
+    {
+        const v4l2_pix_format_mplane *pix = &fmt.fmt.pix_mp;
+        VIDEO_INFO_PRINT("MultiPlane:%ux%u format=%.4s bpl=%u", pix->width, pix->height, (char *)&pix->pixelformat,
+                         pix->plane_fmt[0].bytesperline);
+    }
+    else
+    {
+        const v4l2_pix_format *pix = &fmt.fmt.pix;
+        VIDEO_INFO_PRINT("SinglePlane:%ux%u format=%.4s bpl=%u\n", pix->width, pix->height, (char *)&pix->pixelformat,
+                         pix->bytesperline);
+    }
+}
+
+V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, int buf_cnt,
+                       bool multiple_planes)
+    : m_fd(-1), m_dev(dev), m_width(req_width), m_height(req_height), m_buffer_count(buf_cnt),
+      m_buf_type(multiple_planes ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE),
+      m_pix_fmt(V4L2_PIX_FMT_NV12), m_streaming(false)
+{
+    if (req_fourcc != SUPPORTED_FOURCC_NV12 && req_fourcc != SUPPORTED_FOURCC_NV16)
+    {
+        throw std::invalid_argument("Unsupported pixel format (FOURCC): " + std::to_string(req_fourcc));
+    }
+
+    m_pix_fmt = (req_fourcc == SUPPORTED_FOURCC_NV12) ? V4L2_PIX_FMT_NV12 : V4L2_PIX_FMT_NV16;
+
+    m_fd = ::open(m_dev.c_str(), O_RDWR);
+    if (m_fd < 0)
+    {
+        throw std::runtime_error("Failed to open V4L2 device: " + m_dev + " - " + std::strerror(errno));
+    }
+
+    try
+    {
+        v4l2_format fmt{};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        fmt.fmt.pix_mp.width = m_width;
+        fmt.fmt.pix_mp.height = m_height;
+        fmt.fmt.pix_mp.pixelformat = m_pix_fmt;
+        fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+        xioctl(m_fd, VIDIOC_S_FMT, &fmt, "set format");
+
+        std::memset(&fmt, 0, sizeof(fmt));
+        fmt.type = m_buf_type;
+        xioctl(m_fd, VIDIOC_G_FMT, &fmt, "get format");
+        if (fmt.fmt.pix_mp.width != static_cast<uint32_t>(m_width) ||
+            fmt.fmt.pix_mp.height != static_cast<uint32_t>(m_height) ||
+            fmt.fmt.pix_mp.pixelformat != (unsigned int)(m_pix_fmt))
+        {
+            throw std::runtime_error("V4L2 device did not accept requested format");
+        }
+
+        dump_v4l2_format(fmt);
+
+        v4l2_requestbuffers reqbuf{};
+        reqbuf.count = m_buffer_count;
+        reqbuf.type = m_buf_type;
+        reqbuf.memory = V4L2_MEMORY_DMABUF;
+        xioctl(m_fd, VIDIOC_REQBUFS, &reqbuf, "request buffers");
+        if (reqbuf.count < static_cast<uint32_t>(m_buffer_count))
+        {
+            throw std::runtime_error("V4L2 device could not allocate enough buffers");
+        }
+    }
+    catch (...)
+    {
+        if (m_fd >= 0)
+        {
+            ::close(m_fd);
+            m_fd = -1;
+        }
+        throw;
+    }
 }
 
 V4L2Source::~V4L2Source()
 {
-    try
+    if (m_fd >= 0)
     {
-        stop();
+        ::close(m_fd);
+        m_fd = -1;
     }
-    catch (const std::exception &e)
+}
+
+bool V4L2Source::import_fds(const std::vector<int> &fds)
+{
+    if (fds.size() != static_cast<size_t>(m_buffer_count))
     {
-        VIDEO_ERROR_PRINT("Exception in V4L2Source destructor: %s", e.what());
+        VIDEO_ERROR_PRINT("Number of provided FDs (%zu) does not match buffer count (%d)", fds.size(), m_buffer_count);
+        return false;
     }
+
+    m_buffers.resize(m_buffer_count);
+
+    for (size_t i = 0; i < static_cast<size_t>(m_buffer_count); ++i)
+    {
+        auto &b = m_buffers[i];
+        std::memset(&b.buf, 0, sizeof(b.buf));
+        std::memset(&b.plane, 0, sizeof(b.plane));
+        b.buf.index = i;
+        b.buf.type = m_buf_type;
+        b.buf.memory = V4L2_MEMORY_DMABUF;
+        b.buf.length = 1;
+        b.buf.m.planes = b.plane;
+        b.plane[0].m.fd = fds[i];
+
+        if (ioctl(m_fd, VIDIOC_QBUF, &b.buf) < 0)
+        {
+            VIDEO_ERROR_PRINT("Failed to queue buffer: %s", std::strerror(errno));
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool V4L2Source::start()
 {
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    bool ok = (ioctl(m_state->fd, VIDIOC_STREAMON, &type) == 0);
-    m_state->running.store(ok);
-    return ok;
-}
-
-void V4L2Source::stop()
-{
-    bool was_running = m_state->running.exchange(false);
-
-    if (m_state->fd >= 0 && was_running)
+    if (m_streaming)
     {
-        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        (void)ioctl(m_state->fd, VIDIOC_STREAMOFF, &type);
+        return true;
     }
 
+    int type = m_buf_type;
+    auto ret = ioctl(m_fd, VIDIOC_STREAMON, &type);
+    if (ret != 0)
     {
-        std::lock_guard<std::mutex> lock(m_state->qbufMutex);
-        for (auto &b : m_state->buffers)
-        {
-            if (b.fd >= 0)
-            {
-                ::close(b.fd);
-                b.fd = -1;
-            }
-        }
-        m_state->buffers.clear();
-    }
-
-    if (m_state->fd >= 0)
-    {
-        ::close(m_state->fd);
-        m_state->fd = -1;
-    }
-}
-
-bool V4L2Source::read_frame(int &fd, size_t &length)
-{
-    if (!m_state->running.load())
-    {
+        VIDEO_ERROR_PRINT("Failed to start streaming: %s", std::strerror(errno));
         return false;
     }
-
-    struct v4l2_buffer buf;
-    std::memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-
-    std::lock_guard<std::mutex> lock(m_state->qbufMutex);
-    if (ioctl(m_state->fd, VIDIOC_DQBUF, &buf) < 0)
-    {
-        return false;
-    }
-
-    if (buf.index >= m_state->buffers.size())
-    {
-        return false;
-    }
-
-    auto &cap = m_state->buffers[buf.index];
-    if (cap.fd < 0 || cap.length == 0)
-    {
-        return false;
-    }
-
-    fd = cap.fd;
-    length = cap.length;
+    m_streaming = true;
     return true;
 }
 
-void V4L2Source::open_device()
+bool V4L2Source::stop()
 {
-    m_state->fd = ::open(m_dev_path.c_str(), O_RDWR);
-    if (m_state->fd < 0)
+    if (!m_streaming)
     {
-        throw std::runtime_error("Failed to open V4L2 device: " + m_dev_path + " - " + std::strerror(errno));
+        return true;
     }
+
+    int type = m_buf_type;
+    auto ret = ioctl(m_fd, VIDIOC_STREAMOFF, &type);
+    if (ret != 0)
+    {
+        VIDEO_ERROR_PRINT("Failed to stop streaming: %s", std::strerror(errno));
+        return false;
+    }
+    m_streaming = false;
+    return true;
 }
 
-void V4L2Source::config_format()
+bool V4L2Source::queue_idx(int idx)
 {
-    struct v4l2_format fmt;
-    std::memset(&fmt, 0, sizeof(fmt));
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.width = m_width;
-    fmt.fmt.pix.height = m_height;
-    fmt.fmt.pix.pixelformat = m_pix_fmt;
-    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (!m_streaming || idx < 0 || static_cast<size_t>(idx) >= m_buffers.size())
+    {
+        return false;
+    }
 
-    xioctl(m_state->fd, VIDIOC_S_FMT, &fmt, "VIDIOC_S_FMT");
+    auto &b = m_buffers[idx];
+    if (ioctl(m_fd, VIDIOC_QBUF, &b.buf) < 0)
+    {
+        VIDEO_ERROR_PRINT("Failed to queue buffer: %s", std::strerror(errno));
+        return false;
+    }
+
+    return true;
 }
 
-void V4L2Source::request_buffers()
+int V4L2Source::dequeue_idx()
 {
-    struct v4l2_requestbuffers req;
-    std::memset(&req, 0, sizeof(req));
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-    req.count = m_buffer_count;
-    xioctl(m_state->fd, VIDIOC_REQBUFS, &req, "VIDIOC_REQBUFS");
-
-    if (req.count == 0)
+    if (!m_streaming)
     {
-        throw std::runtime_error("VIDIOC_REQBUFS returned zero buffers");
+        return -1;
     }
 
-    m_state->buffers.resize(req.count);
-}
+    v4l2_buffer buf{};
+    v4l2_plane plane[1]{};
+    buf.type = m_buf_type;
+    buf.memory = V4L2_MEMORY_DMABUF;
+    buf.length = 1;
+    buf.m.planes = plane;
 
-void V4L2Source::export_buffers()
-{
-    for (uint32_t i = 0; i < m_state->buffers.size(); ++i)
+    if (ioctl(m_fd, VIDIOC_DQBUF, &buf) < 0)
     {
-        struct v4l2_buffer buf;
-        std::memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-        xioctl(m_state->fd, VIDIOC_QUERYBUF, &buf, "VIDIOC_QUERYBUF");
-
-        struct v4l2_exportbuffer exp;
-        std::memset(&exp, 0, sizeof(exp));
-        exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        exp.index = i;
-        exp.flags = O_CLOEXEC;
-        xioctl(m_state->fd, VIDIOC_EXPBUF, &exp, "VIDIOC_EXPBUF");
-
-        m_state->buffers[i].fd = exp.fd;
-        m_state->buffers[i].length = buf.length;
-    }
-}
-
-void V4L2Source::queue_all_buffers()
-{
-    for (size_t i = 0; i < m_state->buffers.size(); i++)
-    {
-        queue_buffer_by_index(m_state, i);
-    }
-}
-
-void V4L2Source::queue_buffer_by_index(const std::shared_ptr<SharedState> &state, uint32_t index)
-{
-    if (!state)
-    {
-        return;
-    }
-
-    if (index >= state->buffers.size() || state->fd < 0)
-    {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(state->qbufMutex);
-
-    struct v4l2_buffer buf;
-    std::memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = index;
-
-    if (ioctl(state->fd, VIDIOC_QBUF, &buf) < 0)
-    {
-        if (errno != EBUSY)
+        if (errno != EAGAIN)
         {
-            return;
+            VIDEO_ERROR_PRINT("Failed to dequeue buffer: %s", std::strerror(errno));
         }
+        return -1;
     }
-}
 
-#endif
+    return buf.index;
+}

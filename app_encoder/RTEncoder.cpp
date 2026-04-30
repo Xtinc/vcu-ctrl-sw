@@ -18,6 +18,7 @@ extern "C"
 
 static constexpr int kStreamSmoothingCount = 2;
 static constexpr int kHeightAlign = 8;
+static constexpr int kMaxSliceNum = 8;
 static constexpr uint32_t kMaxWidth = 3840;
 static constexpr uint32_t kMaxHeight = 2160;
 
@@ -157,10 +158,6 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
     AL_TEncSettings settings{};
     AL_Settings_SetDefaults(&settings);
     AL_Settings_SetDefaultParam(&settings);
-    auto configed_width = m_cfg.width;
-    auto configed_height = m_cfg.height;
-    m_cfg.width = kMaxWidth;
-    m_cfg.height = kMaxHeight;
     init_settings(settings);
 
     auto result = AL_Settings_CheckValidity(&settings, &settings.tChParam[0], nullptr);
@@ -191,9 +188,10 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         VIDEO_ERROR_PRINT("AL_Encoder_SetAutoQP failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
     }
 
+    init_source_buf_pool();
     init_stream_buf_pool();
     push_stream_buffers();
-    set_resolution(configed_width, configed_height);
+    set_resolution(m_cfg.width, m_cfg.height);
 }
 
 RTEncoderBase::~RTEncoderBase()
@@ -459,16 +457,18 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
         VIDEO_ERROR_PRINT("Failed to put stream buffer back to encoder");
         m_error.store(true);
     }
+
+    release_sources(pSrc);
 }
 
 void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
 {
     AL_TEncChanParam &ch = settings.tChParam[0];
 
-    ch.uEncWidth = m_cfg.width;
-    ch.uEncHeight = m_cfg.height;
-    ch.uSrcWidth = m_cfg.width;
-    ch.uSrcHeight = m_cfg.height;
+    ch.uEncWidth = kMaxWidth;
+    ch.uEncHeight = kMaxHeight;
+    ch.uSrcWidth = kMaxWidth;
+    ch.uSrcHeight = kMaxHeight;
 
     ch.eProfile = m_cfg.profile;
     ch.uLevel = m_cfg.level;
@@ -498,9 +498,9 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
     {
         gop.eMode = AL_GOP_MODE_LOW_DELAY_P;
         gop.uNumB = 0;
-        // ch.uNumSlices = 8;
-        // ch.uSliceSize = 0;
-        // ch.eEncOptions = static_cast<AL_EChEncOption>(ch.eEncOptions | AL_OPT_LOWLAT_INT);
+        ch.uNumSlices = kMaxSliceNum;
+        ch.uSliceSize = 0;
+        ch.bSubframeLatency = true;
     }
     else
     {
@@ -518,8 +518,38 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
     settings.eQpTableMode = AL_QP_TABLE_NONE;
 }
 
+void RTEncoderBase::init_source_buf_pool()
+{
+    if (m_cfg.low_delay_mode)
+    {
+        m_cfg.num_src_bufs = std::max(m_cfg.num_src_bufs, static_cast<uint32_t>(kMaxSliceNum + 2));
+    }
+
+    AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
+    std::vector<AL_TPlaneDescription> plane_descs;
+    size_t chunk_size = build_pixmap_plane_descs(m_pic_format, m_src_fourcc, tDim, plane_descs);
+
+    m_source_buf_pool = std::make_unique<PixMapBufPool>();
+    m_source_buf_pool->set_format(tDim, m_src_fourcc);
+    m_source_buf_pool->add_chunk(chunk_size, plane_descs);
+
+    if (!m_source_buf_pool->init(m_pAllocator, m_cfg.num_src_bufs, "source_pool"))
+    {
+        throw std::runtime_error("Failed to initialize source buffer pool");
+    }
+
+    VIDEO_INFO_PRINT("Source buffer pool initialized: format=%s, size=%ux%u, planes=%zu, chunk_size=%zu, num_bufs=%u",
+                     FOURCC2STR(m_src_fourcc).c_str(), tDim.iWidth, tDim.iHeight, plane_descs.size(), chunk_size,
+                     m_cfg.num_src_bufs);
+}
+
 void RTEncoderBase::init_stream_buf_pool()
 {
+    if (m_cfg.low_delay_mode)
+    {
+        m_cfg.num_stream_bufs = std::max(m_cfg.num_stream_bufs, static_cast<uint32_t>(kMaxSliceNum + 2));
+    }
+
     AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
     uint64_t streamSize = static_cast<uint64_t>(AL_GetMitigatedMaxNalSize(tDim, m_cfg.chroma_mode, m_cfg.bit_depth));
     streamSize += AL_ENC_MAX_HEADER_SIZE;
@@ -575,10 +605,10 @@ void RTEncoderBase::push_stream_buffers()
     }
 }
 
+// Implementation for FILE source mode
 RTEncoder<SourceMode::FILE>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : RTEncoderBase(cfg, std::move(cb))
 {
-    init_source_buf_pool();
 }
 
 AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
@@ -587,12 +617,13 @@ AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
     {
         return nullptr;
     }
-
+    auto current_dim = SRC_resolution();
     auto pBuf = m_source_buf_pool->get_buffer();
-    if (pBuf)
+    if (pBuf && (current_dim.iWidth != m_src_dim.iWidth || current_dim.iHeight != m_src_dim.iHeight))
     {
-        AL_PixMapBuffer_SetDimension(pBuf, SRC_resolution());
+        AL_PixMapBuffer_SetDimension(pBuf, current_dim);
     }
+    m_src_dim = current_dim;
 
     return pBuf;
 }
@@ -619,44 +650,25 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
     return true;
 }
 
-void RTEncoder<SourceMode::FILE>::init_source_buf_pool()
-{
-    AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
-    std::vector<AL_TPlaneDescription> plane_descs;
-    size_t chunk_size = build_pixmap_plane_descs(m_pic_format, m_src_fourcc, tDim, plane_descs);
-
-    m_source_buf_pool = std::make_unique<PixMapBufPool>();
-    m_source_buf_pool->set_format(tDim, m_src_fourcc);
-    m_source_buf_pool->add_chunk(chunk_size, plane_descs);
-
-    if (!m_source_buf_pool->init(m_pAllocator, m_cfg.num_src_bufs, "source_pool"))
-    {
-        throw std::runtime_error("Failed to initialize source buffer pool");
-    }
-
-    VIDEO_INFO_PRINT("Source buffer pool initialized: format=%s, size=%ux%u, planes=%zu, chunk_size=%zu, num_bufs=%u",
-                     FOURCC2STR(m_src_fourcc).c_str(), tDim.iWidth, tDim.iHeight, plane_descs.size(), chunk_size,
-                     m_cfg.num_src_bufs);
-}
-
 void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const * /*pSrc*/)
 {
     // for file mode, source buffer is owned by the encoder and need do nothing on release callback
 }
 
-RTEncoder<SourceMode::V4L2>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
+// Implementation for V4L2_MMAP source mode
+RTEncoder<SourceMode::V4L2_MMAP>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : RTEncoderBase(cfg, std::move(cb))
 {
 }
 
-void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
+void RTEncoder<SourceMode::V4L2_MMAP>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
 {
     std::lock_guard<std::mutex> lock(m_fd_mutex);
     m_release_cb = std::move(releaseCb);
     m_usr_data = userData;
 }
 
-bool RTEncoder<SourceMode::V4L2>::submit_dma_fd(int fd, size_t data_size)
+bool RTEncoder<SourceMode::V4L2_MMAP>::submit_dma_fd(int fd, size_t data_size)
 {
     if (m_stopped.load() || m_error.load())
     {
@@ -718,7 +730,7 @@ bool RTEncoder<SourceMode::V4L2>::submit_dma_fd(int fd, size_t data_size)
     return true;
 }
 
-void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
+void RTEncoder<SourceMode::V4L2_MMAP>::release_sources(AL_TBuffer const *pSrc)
 {
     int fd = -1;
     SourceReleaseCallback release_cb;
@@ -744,6 +756,131 @@ void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
         if (release_cb)
         {
             release_cb(fd, m_usr_data);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        m_error.store(true);
+        VIDEO_ERROR_PRINT("Exception in source release callback: %s", e.what());
+    }
+}
+
+// Implementation for V4L2_DMABUF source mode
+RTEncoder<SourceMode::V4L2_MDMA>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
+    : RTEncoderBase(cfg, std::move(cb))
+{
+}
+
+RTEncoder<SourceMode::V4L2_MDMA>::~RTEncoder()
+{
+    // Ensure all buffers are released back to the pool
+    std::lock_guard<std::mutex> lock(m_idx_mutex);
+    for (const auto &entry : m_idx_map)
+    {
+        AL_Buffer_Unref(entry);
+    }
+    m_idx_map.clear();
+}
+
+void RTEncoder<SourceMode::V4L2_MDMA>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
+{
+    std::lock_guard<std::mutex> lock(m_idx_mutex);
+    m_release_cb = std::move(releaseCb);
+    m_usr_data = userData;
+}
+
+std::vector<int> RTEncoder<SourceMode::V4L2_MDMA>::acquire_dma_fds(int count)
+{
+    if (static_cast<size_t>(count) > m_cfg.num_src_bufs)
+    {
+        VIDEO_ERROR_PRINT("Requested DMA fd count %d exceeds pool capacity %u", count, m_cfg.num_src_bufs);
+        return {};
+    }
+
+    std::vector<int> fds;
+    fds.reserve(count);
+
+    std::lock_guard<std::mutex> lock(m_idx_mutex);
+    for (int i = 0; i < count; i++)
+    {
+        auto *pBuf = m_source_buf_pool->get_buffer();
+        if (!pBuf)
+        {
+            VIDEO_ERROR_PRINT("Failed to acquire source buffer from pool");
+            break;
+        }
+
+        auto dma_fd =
+            AL_LinuxDmaAllocator_GetFd(reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator), pBuf->hBufs[0]);
+        if (dma_fd < 0)
+        {
+            VIDEO_ERROR_PRINT("Failed to get DMA fd from buffer");
+            AL_Buffer_Unref(pBuf);
+            break;
+        }
+        m_idx_map.push_back(pBuf);
+        fds.push_back(dma_fd);
+    }
+
+    return fds;
+}
+
+bool RTEncoder<SourceMode::V4L2_MDMA>::submit_dma_index(int idx)
+{
+    if (m_stopped.load() || m_error.load())
+    {
+        return false;
+    }
+
+    AL_TBuffer *pSrcBuf = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_idx_mutex);
+        if (idx < 0 || static_cast<size_t>(idx) >= m_idx_map.size())
+        {
+            VIDEO_ERROR_PRINT("Invalid buffer index %d", idx);
+            return false;
+        }
+        pSrcBuf = m_idx_map[idx];
+    }
+
+    if (!AL_Encoder_Process(m_hEnc, pSrcBuf, nullptr))
+    {
+        VIDEO_ERROR_PRINT("Failed to submit dmabuf index %d to encoder", idx);
+        m_error.store(true);
+        return false;
+    }
+
+    return true;
+}
+
+void RTEncoder<SourceMode::V4L2_MDMA>::release_sources(AL_TBuffer const *pSrc)
+{
+    int idx = -1;
+    SourceReleaseCallback release_cb;
+    {
+        std::lock_guard<std::mutex> lock(m_idx_mutex);
+        for (int i = 0; i < static_cast<int>(m_idx_map.size()); i++)
+        {
+            if (m_idx_map[i] == pSrc)
+            {
+                idx = i;
+                break;
+            }
+        }
+        release_cb = m_release_cb;
+    }
+
+    if (idx < 0)
+    {
+        VIDEO_ERROR_PRINT("Failed to find index for released source buffer");
+        m_error.store(true);
+    }
+
+    try
+    {
+        if (release_cb)
+        {
+            release_cb(idx, m_usr_data);
         }
     }
     catch (const std::exception &e)
