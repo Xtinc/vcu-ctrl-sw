@@ -97,7 +97,7 @@ static uint32_t write_filler_data_section(DMAProxy &mem_ctl, AL_TBuffer *source,
     return section.uLength;
 }
 
-static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int firstSection)
+static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int firstSection, bool &eof)
 {
     uint32_t size = 0;
     auto meta = (AL_TStreamMetaData *)(AL_Buffer_GetMetaData(stream, AL_META_TYPE_STREAM));
@@ -115,83 +115,129 @@ static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int fi
         {
             size += write_one_section(mem_ctl, stream, stream, static_cast<int>(size), i);
         }
+
+        if (!eof && meta->pSections[i].eFlags & AL_SECTION_END_FRAME_FLAG)
+        {
+            eof = true;
+        }
     }
 
     return size;
 }
 
 RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
-    : m_cfg(cfg), m_callback(std::move(cb)), m_dma_proxy(cfg.dma_dev_path.c_str()), m_pAllocator(nullptr),
-      m_pScheduler(nullptr), m_pic_format{}, m_src_fourcc{}, m_stopped(false), m_eos_signaled(false), m_error(false)
+
+    : m_fps(0.0), m_bitrate(0), m_frame_count(0), m_bytes_count(0), m_fps_last_time(std::chrono::steady_clock::now()),
+      m_cfg(cfg), m_callback(std::move(cb)), m_dma_proxy(cfg.dma_dev_path.c_str()), m_pAllocator(nullptr),
+      m_pScheduler(nullptr), m_pic_format{}, m_src_fourcc{}, m_stopped(false), m_eos_signaled(false), m_error(false),
+      m_lib_initialized(false)
 {
-    if (!m_callback)
+    try
     {
-        throw std::invalid_argument("RealtimeEncoder: callback must not be null");
-    }
+        if (!m_callback)
+        {
+            throw std::invalid_argument("RealtimeEncoder: callback must not be null");
+        }
 
-    AL_ERR err = AL_Lib_Encoder_Init(AL_LIB_ENCODER_ARCH_HOST);
-    if (err != AL_SUCCESS)
+        AL_ERR err = AL_Lib_Encoder_Init(AL_LIB_ENCODER_ARCH_HOST);
+        if (err != AL_SUCCESS)
+        {
+            throw std::runtime_error(std::string("AL_Lib_Encoder_Init failed: ") + AL_Codec_ErrorToString(err));
+        }
+        m_lib_initialized = true;
+
+        m_pAllocator = AL_DmaAlloc_Create(m_cfg.enc_dev_path.c_str());
+        if (!m_pAllocator)
+        {
+            throw std::runtime_error("Failed to create DMA allocator for device: " + m_cfg.enc_dev_path);
+        }
+
+        m_pScheduler =
+            AL_SchedulerMcu_Create(AL_GetHardwareDriver(), reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator),
+                                   m_cfg.enc_dev_path.c_str());
+        if (!m_pScheduler)
+        {
+            throw std::runtime_error("Failed to create MCU scheduler");
+        }
+
+        m_pic_format = AL_EncGetSrcPicFormat(m_cfg.chroma_mode, m_cfg.bit_depth, AL_SRC_RASTER);
+        m_src_fourcc = AL_EncGetSrcFourCC(m_pic_format);
+
+        AL_TEncSettings settings{};
+        AL_Settings_SetDefaults(&settings);
+        AL_Settings_SetDefaultParam(&settings);
+        init_settings(settings);
+
+        auto result = AL_Settings_CheckValidity(&settings, &settings.tChParam[0], nullptr);
+        if (result > 0)
+        {
+            throw std::runtime_error("AL_Settings_CheckValidity found " + std::to_string(result) +
+                                     " invalid parameter(s)");
+        }
+
+        result = AL_Settings_CheckCoherency(&settings, &settings.tChParam[0], m_src_fourcc, nullptr);
+        if (result < 0)
+        {
+            throw std::runtime_error("AL_Settings_CheckCoherency: fatal incoherency");
+        }
+
+        err = AL_Encoder_Create(&m_hEnc, m_pScheduler, m_pAllocator, &settings, {&RTEncoderBase::sdk_callback, this});
+        if (err != AL_SUCCESS || m_hEnc == nullptr)
+        {
+            throw std::runtime_error(std::string("AL_Encoder_Create failed: ") + AL_Codec_ErrorToString(err));
+        }
+
+        if (!AL_Encoder_SetAutoQP(m_hEnc, true))
+        {
+            VIDEO_ERROR_PRINT("AL_Encoder_SetAutoQP failed: %s",
+                              AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
+        }
+
+        init_source_buf_pool();
+        init_stream_buf_pool();
+        push_stream_buffers();
+        set_resolution(m_cfg.width, m_cfg.height);
+    }
+    catch (...)
     {
-        throw std::runtime_error(std::string("AL_Lib_Encoder_Init failed: ") + AL_Codec_ErrorToString(err));
+        if (m_hEnc)
+        {
+            AL_Encoder_Destroy(m_hEnc);
+            m_hEnc = nullptr;
+        }
+
+        if (m_source_buf_pool)
+        {
+            m_source_buf_pool->decommit();
+            m_source_buf_pool.reset();
+        }
+
+        if (m_stream_buf_pool)
+        {
+            m_stream_buf_pool->decommit();
+            m_stream_buf_pool.reset();
+        }
+
+        if (m_pScheduler)
+        {
+            AL_IEncScheduler_Destroy(m_pScheduler);
+            m_pScheduler = nullptr;
+        }
+
+        if (m_pAllocator)
+        {
+            AL_Allocator_Destroy(m_pAllocator);
+            m_pAllocator = nullptr;
+        }
+
+        if (m_lib_initialized)
+        {
+            AL_Lib_Encoder_DeInit();
+            m_lib_initialized = false;
+        }
+
+        throw;
     }
-
-    m_pAllocator = AL_DmaAlloc_Create(m_cfg.enc_dev_path.c_str());
-    if (!m_pAllocator)
-    {
-        AL_Lib_Encoder_DeInit();
-        throw std::runtime_error("Failed to create DMA allocator for device: " + m_cfg.enc_dev_path);
-    }
-
-    m_pScheduler = AL_SchedulerMcu_Create(
-        AL_GetHardwareDriver(), reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator), m_cfg.enc_dev_path.c_str());
-    if (!m_pScheduler)
-    {
-        AL_Allocator_Destroy(m_pAllocator);
-        m_pAllocator = nullptr;
-        AL_Lib_Encoder_DeInit();
-        throw std::runtime_error("Failed to create MCU scheduler");
-    }
-
-    m_pic_format = AL_EncGetSrcPicFormat(m_cfg.chroma_mode, m_cfg.bit_depth, AL_SRC_RASTER);
-    m_src_fourcc = AL_EncGetSrcFourCC(m_pic_format);
-
-    AL_TEncSettings settings{};
-    AL_Settings_SetDefaults(&settings);
-    AL_Settings_SetDefaultParam(&settings);
-    init_settings(settings);
-
-    auto result = AL_Settings_CheckValidity(&settings, &settings.tChParam[0], nullptr);
-    if (result > 0)
-    {
-        throw std::runtime_error("AL_Settings_CheckValidity found " + std::to_string(result) + " invalid parameter(s)");
-    }
-
-    result = AL_Settings_CheckCoherency(&settings, &settings.tChParam[0], m_src_fourcc, nullptr);
-    if (result < 0)
-    {
-        throw std::runtime_error("AL_Settings_CheckCoherency: fatal incoherency");
-    }
-
-    err = AL_Encoder_Create(&m_hEnc, m_pScheduler, m_pAllocator, &settings, {&RTEncoderBase::sdk_callback, this});
-    if (err != AL_SUCCESS || m_hEnc == nullptr)
-    {
-        AL_IEncScheduler_Destroy(m_pScheduler);
-        m_pScheduler = nullptr;
-        AL_Allocator_Destroy(m_pAllocator);
-        m_pAllocator = nullptr;
-        AL_Lib_Encoder_DeInit();
-        throw std::runtime_error(std::string("AL_Encoder_Create failed: ") + AL_Codec_ErrorToString(err));
-    }
-
-    if (!AL_Encoder_SetAutoQP(m_hEnc, true))
-    {
-        VIDEO_ERROR_PRINT("AL_Encoder_SetAutoQP failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
-    }
-
-    init_source_buf_pool();
-    init_stream_buf_pool();
-    push_stream_buffers();
-    set_resolution(m_cfg.width, m_cfg.height);
 }
 
 RTEncoderBase::~RTEncoderBase()
@@ -237,7 +283,11 @@ RTEncoderBase::~RTEncoderBase()
         m_pAllocator = nullptr;
     }
 
-    AL_Lib_Encoder_DeInit();
+    if (m_lib_initialized)
+    {
+        AL_Lib_Encoder_DeInit();
+        m_lib_initialized = false;
+    }
 }
 
 void RTEncoderBase::flush()
@@ -387,6 +437,12 @@ AL_TDimension RTEncoderBase::SRC_resolution() const
     return AL_TDimension{m_cfg.width, m_cfg.height};
 }
 
+std::pair<double, double> RTEncoderBase::fps() const
+{
+    std::lock_guard<std::mutex> lock(m_fps_mutex);
+    return {m_fps, m_bitrate};
+}
+
 void RTEncoderBase::sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int /*iLayerID*/)
 {
     auto *pThis = static_cast<RTEncoderBase *>(pUserParam);
@@ -430,12 +486,14 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
     }
 
     auto pMeta = reinterpret_cast<AL_TStreamMetaData *>(AL_Buffer_GetMetaData(pStream, AL_META_TYPE_STREAM));
+    bool eof = false;
     if (pMeta)
     {
         if (pMeta->uNumSection > 0)
         {
             const auto *pBase = AL_Buffer_GetData(pStream);
-            const auto uSize = reconstruct_stream(m_dma_proxy, pStream, 0);
+            const auto uSize = reconstruct_stream(m_dma_proxy, pStream, 0, eof);
+            m_bytes_count += uSize;
 
             if (m_callback && uSize)
             {
@@ -458,7 +516,37 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
         m_error.store(true);
     }
 
-    release_sources(pSrc);
+    if (eof)
+    {
+        release_sources(pSrc);
+        update_frame_rate();
+    }
+}
+
+void RTEncoderBase::update_frame_rate()
+{
+    if (++m_frame_count % 100 != 0)
+    {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_fps_last_time).count();
+    if (elapsed <= 0)
+    {
+        return;
+    }
+
+    double fps = (m_frame_count * 1000.0) / static_cast<double>(elapsed);
+    double bitrate = (m_bytes_count * 8000.0) / static_cast<double>(elapsed);
+    {
+        std::lock_guard<std::mutex> lock(m_fps_mutex);
+        m_fps = 0.1 * m_fps + 0.9 * fps; // EMA with alpha=0.9
+        m_bitrate = 0.1 * m_bitrate + 0.9 * bitrate;
+    }
+    m_fps_last_time = now;
+    m_frame_count = 0;
+    m_bytes_count = 0;
 }
 
 void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
@@ -501,6 +589,7 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
         ch.uNumSlices = kMaxSliceNum;
         ch.uSliceSize = 0;
         ch.bSubframeLatency = true;
+        rc.eRCMode = AL_RC_LOW_LATENCY;
     }
     else
     {
@@ -617,13 +706,20 @@ AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
     {
         return nullptr;
     }
-    auto current_dim = SRC_resolution();
-    auto pBuf = m_source_buf_pool->get_buffer();
-    if (pBuf && (current_dim.iWidth != m_src_dim.iWidth || current_dim.iHeight != m_src_dim.iHeight))
+
+    if (!m_source_buf_pool)
     {
-        AL_PixMapBuffer_SetDimension(pBuf, current_dim);
+        m_error.store(true);
+        return nullptr;
     }
-    m_src_dim = current_dim;
+
+    auto pBuf = m_source_buf_pool->get_buffer();
+    if (!pBuf)
+    {
+        return nullptr;
+    }
+
+    AL_PixMapBuffer_SetDimension(pBuf, SRC_resolution());
 
     return pBuf;
 }
@@ -637,7 +733,7 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
 
     AL_BufferGuard buf_guard(pBuf, &AL_Buffer_Unref);
 
-    if (m_stopped.load() || m_error.load())
+    if (!m_hEnc || m_stopped.load() || m_error.load())
     {
         return false;
     }
@@ -654,6 +750,7 @@ void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const * /*pSrc*/)
 {
     // for file mode, source buffer is owned by the encoder and need do nothing on release callback
 }
+
 // Implementation for V4L2_DMABUF source mode
 RTEncoder<SourceMode::V4L2>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : RTEncoderBase(cfg, std::move(cb))
@@ -662,25 +759,37 @@ RTEncoder<SourceMode::V4L2>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCal
 
 RTEncoder<SourceMode::V4L2>::~RTEncoder()
 {
-    // Ensure all buffers are released back to the pool
-    std::lock_guard<std::mutex> lock(m_idx_mutex);
-    for (const auto &entry : m_idx_map)
+    // Derived destructor runs before base destructor: flush here
+    try
     {
-        AL_Buffer_Unref(entry);
+        flush();
     }
-    m_idx_map.clear();
+    catch (...)
+    {
+    }
+    std::lock_guard<std::mutex> lock(m_idx_mutex);
+    m_release_cb = nullptr;
+    for (auto &slot : m_slots)
+    {
+        if (slot.buf)
+        {
+            AL_Buffer_Unref(slot.buf);
+            slot.buf = nullptr;
+        }
+        slot.inflight = false;
+    }
+    m_slots.clear();
 }
 
-void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback releaseCb, void *userData)
+void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback releaseCb)
 {
     std::lock_guard<std::mutex> lock(m_idx_mutex);
     m_release_cb = std::move(releaseCb);
-    m_usr_data = userData;
 }
 
-std::vector<int> RTEncoder<SourceMode::V4L2>::acquire_dma_fds(int count)
+std::vector<int> RTEncoder<SourceMode::V4L2>::acquire_dma_fds(unsigned int count)
 {
-    if (static_cast<size_t>(count) > m_cfg.num_src_bufs)
+    if (count > m_cfg.num_src_bufs)
     {
         VIDEO_ERROR_PRINT("Requested DMA fd count %d exceeds pool capacity %u", count, m_cfg.num_src_bufs);
         return {};
@@ -688,33 +797,49 @@ std::vector<int> RTEncoder<SourceMode::V4L2>::acquire_dma_fds(int count)
 
     std::vector<int> fds;
     fds.reserve(count);
-
     std::lock_guard<std::mutex> lock(m_idx_mutex);
-    for (int i = 0; i < count; i++)
+    if (!m_slots.empty())
+    {
+        VIDEO_ERROR_PRINT("DMA FDs already acquired, repeated acquisition is not allowed");
+        return {};
+    }
+
+    for (unsigned int i = 0; i < count; ++i)
     {
         auto *pBuf = m_source_buf_pool->get_buffer();
         if (!pBuf)
         {
             VIDEO_ERROR_PRINT("Failed to acquire source buffer from pool");
-            break;
+            goto error_cleanup;
         }
 
-        auto dma_fd =
+        int dma_fd =
             AL_LinuxDmaAllocator_GetFd(reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator), pBuf->hBufs[0]);
         if (dma_fd < 0)
         {
             VIDEO_ERROR_PRINT("Failed to get DMA fd from buffer");
             AL_Buffer_Unref(pBuf);
-            break;
+            goto error_cleanup;
         }
-        m_idx_map.push_back(pBuf);
+        m_slots.push_back({pBuf, false});
         fds.push_back(dma_fd);
     }
 
     return fds;
+
+error_cleanup:
+    for (auto &slot : m_slots)
+    {
+        if (slot.buf)
+        {
+            AL_Buffer_Unref(slot.buf);
+        }
+    }
+    m_slots.clear();
+    return {};
 }
 
-bool RTEncoder<SourceMode::V4L2>::submit_dma_index(int idx)
+bool RTEncoder<SourceMode::V4L2>::submit_dma_index(unsigned int idx)
 {
     if (m_stopped.load() || m_error.load())
     {
@@ -724,17 +849,34 @@ bool RTEncoder<SourceMode::V4L2>::submit_dma_index(int idx)
     AL_TBuffer *pSrcBuf = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_idx_mutex);
-        if (idx < 0 || static_cast<size_t>(idx) >= m_idx_map.size())
+        if (idx >= m_slots.size())
         {
             VIDEO_ERROR_PRINT("Invalid buffer index %d", idx);
             return false;
         }
-        pSrcBuf = m_idx_map[idx];
+
+        auto &slot = m_slots[idx];
+        if (slot.inflight)
+        {
+            VIDEO_ERROR_PRINT("Buffer index %d is already in-flight", idx);
+            return false;
+        }
+
+        if (!slot.buf)
+        {
+            VIDEO_ERROR_PRINT("Source buffer at index %d is null", idx);
+            return false;
+        }
+
+        slot.inflight = true;
+        pSrcBuf = slot.buf;
     }
 
     if (!AL_Encoder_Process(m_hEnc, pSrcBuf, nullptr))
     {
         VIDEO_ERROR_PRINT("Failed to submit dmabuf index %d to encoder", idx);
+        std::lock_guard<std::mutex> lock(m_idx_mutex);
+        m_slots[idx].inflight = false;
         m_error.store(true);
         return false;
     }
@@ -748,11 +890,12 @@ void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
     SourceReleaseCallback release_cb;
     {
         std::lock_guard<std::mutex> lock(m_idx_mutex);
-        for (int i = 0; i < static_cast<int>(m_idx_map.size()); i++)
+        for (int i = 0; i < static_cast<int>(m_slots.size()); ++i)
         {
-            if (m_idx_map[i] == pSrc)
+            if (m_slots[i].buf == pSrc)
             {
                 idx = i;
+                m_slots[i].inflight = false;
                 break;
             }
         }
@@ -763,13 +906,14 @@ void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
     {
         VIDEO_ERROR_PRINT("Failed to find index for released source buffer");
         m_error.store(true);
+        return;
     }
 
     try
     {
         if (release_cb)
         {
-            release_cb(idx, m_usr_data);
+            release_cb(idx);
         }
     }
     catch (const std::exception &e)
