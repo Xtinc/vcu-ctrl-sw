@@ -29,14 +29,9 @@ add_library(lib_encode_core_obj OBJECT ${LIB_ENCODE_CORE_SRC})
 set(LIB_ISCHEDULER_SRC
     I_EncScheduler.c
     EncSchedulerCommon.c
+    DriverDataConversions.c
+    EncSchedulerMcu.c
 )
-
-if(ENABLE_MICROBLAZE)
-    list(APPEND LIB_ISCHEDULER_SRC
-        DriverDataConversions.c
-        EncSchedulerMcu.c
-    )
-endif()
 
 add_library(lib_ischeduler_enc_obj OBJECT ${LIB_ISCHEDULER_SRC})
 
@@ -49,6 +44,7 @@ set(ALL_ENCODE_OBJECTS
     $<TARGET_OBJECTS:lib_common_obj>
     $<TARGET_OBJECTS:lib_common_enc_obj>
     $<TARGET_OBJECTS:lib_rtos_obj>
+    $<TARGET_OBJECTS:lib_sync_obj>
 )
 
 add_library(liballegro_encode_static STATIC ${ALL_ENCODE_OBJECTS})

@@ -11,9 +11,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # All objects compiled with -fPIC (required when linking into shared libraries)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-include(cmake/options.cmake)
-include(cmake/version.cmake)
-include(cmake/compile_flags.cmake)
+# Warning flags by compiler family
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    add_compile_options(/W4)
+else()
+    add_compile_options(
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Werror=pedantic
+        -Wwrite-strings
+        -Wredundant-decls
+        # -Wshadow
+        -Wformat=2
+        # -Wconversion
+        -Wnull-dereference
+        -Wunreachable-code
+    )
+endif()
+
+add_compile_definitions(AL_ENABLE_64BIT=1)
 
 find_package(Threads REQUIRED)
 
@@ -35,6 +52,7 @@ add_subdirectory(lib_common_enc)
 
 add_subdirectory(lib_common_dec)
 add_subdirectory(lib_parsing)
+add_subdirectory(lib_sync_ip)
 
 # ---------- Batch 2: app-facing deliverables ----------
 # User app layer + final SDK libraries consumed by applications.
@@ -44,3 +62,4 @@ add_subdirectory(lib_encode)
 add_subdirectory(lib_decode)
 add_subdirectory(lib_app)
 add_subdirectory(app_encoder)
+# add_subdirectory(app_decoder)
