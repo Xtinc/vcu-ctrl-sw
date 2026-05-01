@@ -27,10 +27,10 @@ add_library(lib_encode_core_obj OBJECT ${LIB_ENCODE_CORE_SRC})
 
 # ---- IScheduler / MCU scheduler sources ----
 set(LIB_ISCHEDULER_SRC
-    I_EncScheduler.c
-    EncSchedulerCommon.c
     DriverDataConversions.c
+    EncSchedulerCommon.c
     EncSchedulerMcu.c
+    I_EncScheduler.c
 )
 
 add_library(lib_ischeduler_enc_obj OBJECT ${LIB_ISCHEDULER_SRC})
@@ -51,5 +51,4 @@ add_library(liballegro_encode_static STATIC ${ALL_ENCODE_OBJECTS})
 
 target_link_libraries(liballegro_encode_static PUBLIC Threads::Threads)
 set_target_properties(liballegro_encode_static PROPERTIES OUTPUT_NAME allegro_encode)
-
 set_target_properties(liballegro_encode_static PROPERTIES SUFFIX ".a")

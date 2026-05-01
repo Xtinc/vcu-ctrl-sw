@@ -23,6 +23,7 @@ set(LIB_COMMON_SRC
     FourCC.c
     HardwareConfig.c
     HardwareDriver.c
+    HDR.c
     HevcLevelsLimit.c
     HevcUtils.c
     HwScalingList.c
@@ -40,9 +41,6 @@ set(LIB_COMMON_SRC
 
 if(ENABLE_ENC_SW_MULTIPASS)
     list(APPEND LIB_COMMON_SRC BufferLookAheadMeta.c)
-endif()
-if(ENABLE_HIGH_DYNAMIC_RANGE)
-    list(APPEND LIB_COMMON_SRC HDR.c)
 endif()
 
 add_library(lib_common_obj OBJECT ${LIB_COMMON_SRC})

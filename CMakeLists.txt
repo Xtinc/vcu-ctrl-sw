@@ -30,6 +30,7 @@ else()
     )
 endif()
 
+option(ENABLE_ENC_SW_MULTIPASS "Enable encoder software multi-pass" OFF)
 add_compile_definitions(AL_ENABLE_64BIT=1)
 
 find_package(Threads REQUIRED)
