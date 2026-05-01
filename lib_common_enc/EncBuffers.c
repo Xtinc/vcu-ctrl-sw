@@ -74,7 +74,6 @@ static uint32_t GetChromaAllocSize(AL_EChromaMode eChromaMode, uint32_t uAllocSi
 
 int AL_EncGetMinPitch(int iWidth, AL_TPicFormat const* pPicFormat)
 {
-
   return ComputeRndPitch(iWidth, pPicFormat, AL_ENC_PITCH_ALIGNMENT);
 }
 

@@ -272,7 +272,8 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
             ++totalEncodedUnits;
         });
 
-        V4L2Source v4l2src(v4l2_dev, cfg.width, cfg.height, STR2FOURCC("NV12"), cfg.num_src_bufs);
+        V4L2Source v4l2src(v4l2_dev, cfg.width, cfg.height, STR2FOURCC("NV12"), cfg.num_src_bufs, true,
+                           cfg.low_delay_mode ? "/dev/xlnxsync0" : "");
         encoder->set_release_callback([&v4l2src, &requeue_failed](unsigned int idx) {
             if (!v4l2src.queue_idx(idx))
             {
@@ -282,8 +283,8 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
                 }
             }
         });
-        auto fds = encoder->acquire_dma_fds(cfg.num_src_bufs);
-        if (!v4l2src.import_fds(fds))
+        auto dmaBuffers = encoder->acquire_dma_buffers(cfg.num_src_bufs);
+        if (!v4l2src.import_fds(dmaBuffers))
         {
             VIDEO_ERROR_PRINT("Failed to import dma fds to V4L2 device");
             return EXIT_FAILURE;

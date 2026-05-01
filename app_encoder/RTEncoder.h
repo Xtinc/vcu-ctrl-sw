@@ -1,12 +1,12 @@
 #ifndef REALTIME_ENCODER_H
 #define REALTIME_ENCODER_H
 
+#include "DMAFd.h"
 #include "MemMgr.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -16,26 +16,6 @@ extern "C"
 #include "lib_common_enc/EncChanParam.h"
 #include "lib_common_enc/Settings.h"
 #include "lib_encode/lib_encoder.h"
-}
-
-inline std::string FOURCC2STR(TFourCC fourcc)
-{
-    char buf[5]{};
-    buf[0] = static_cast<char>(fourcc & 0xFF);
-    buf[1] = static_cast<char>((fourcc >> 8) & 0xFF);
-    buf[2] = static_cast<char>((fourcc >> 16) & 0xFF);
-    buf[3] = static_cast<char>((fourcc >> 24) & 0xFF);
-    return std::string(buf);
-}
-
-inline TFourCC STR2FOURCC(const std::string &str)
-{
-    if (str.size() != 4)
-    {
-        return 0;
-    }
-    return static_cast<uint32_t>(str[0]) | (static_cast<uint32_t>(str[1]) << 8) |
-           (static_cast<uint32_t>(str[2]) << 16) | (static_cast<uint32_t>(str[3]) << 24);
 }
 
 struct EncoderConfig
@@ -87,10 +67,10 @@ class RTEncoderBase
     bool set_framerate(uint32_t uFrameRate, uint32_t uClkRatio = 1000);
     bool set_resolution(uint32_t uWidth, uint32_t uHeight);
 
-    TFourCC SRC_FourCC() const;
-    uint8_t SRC_bitdepth() const;
-    AL_EChromaMode SRC_chroma() const;
-    AL_TDimension SRC_resolution() const;
+    TFourCC src_fourCC() const;
+    uint8_t src_bitdepth() const;
+    AL_EChromaMode src_chroma() const;
+    AL_TDimension src_resolution() const;
     std::pair<double, double> fps() const;
 
   protected:
@@ -159,20 +139,21 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
 
 template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
 {
+  public:
     struct Slot
     {
         AL_TBuffer *buf = nullptr;
         bool inflight = false;
+        DMAFd desc{};
     };
 
-  public:
     using SourceReleaseCallback = std::function<void(int idx)>;
 
     RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
     ~RTEncoder() override;
 
     void set_release_callback(SourceReleaseCallback releaseCb);
-    std::vector<int> acquire_dma_fds(unsigned int count);
+    std::vector<DMAFd> acquire_dma_buffers(unsigned int count);
     bool submit_dma_index(unsigned int idx);
 
   private:

@@ -11,10 +11,15 @@ extern "C"
 #include <cstdint>
 #include <deque>
 #include <linux/videodev2.h>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "DMAFd.h"
+
+class XilinxSyncIP;
 
 /**
  * @brief V4L2Source encapsulates a V4L2 video capture device using external DMA buffer import (DMABUF).
@@ -73,6 +78,7 @@ class V4L2Source
     {
         v4l2_buffer buf;
         v4l2_plane plane[1];
+        DMAFd sync_desc{};
     };
 
   public:
@@ -84,10 +90,11 @@ class V4L2Source
      * @param req_fourcc Requested pixel format (FOURCC)
      * @param buf_cnt Number of buffers
      * @param multiple_planes Use multi-planar format (default: true)
+     * @param sync_dev_path Xilinx sync device path. If empty or open fails, Xilinx sync is disabled (default: "")
      * @throw std::exception Throws on initialization failure
      */
     V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, int buf_cnt,
-               bool multiple_planes = true);
+               bool multiple_planes = true, const std::string &sync_dev_path = "");
     ~V4L2Source();
     V4L2Source(const V4L2Source &) = delete;
     V4L2Source &operator=(const V4L2Source &) = delete;
@@ -97,7 +104,7 @@ class V4L2Source
      * @param fds Array of DMA buffer file descriptors. Must match buf_cnt.
      * @return true on success, false on failure
      */
-    bool import_fds(const std::vector<int> &fds);
+    bool import_fds(const std::vector<DMAFd> &buffers);
 
     /**
      * @brief Start V4L2 streaming (STREAMON), transition to STREAMING state.
@@ -153,6 +160,7 @@ class V4L2Source
     int m_timeout_error_threshold;
 
     std::vector<v4l2_buffer_info> m_buffers;
+    std::unique_ptr<XilinxSyncIP> m_sync_ip;
 };
 
 #endif // V4L2_SOURCE_H

@@ -6,6 +6,7 @@ extern "C"
 #include "lib_common/BufferAPI.h"
 #include "lib_common/BufferStreamMeta.h"
 #include "lib_common/HardwareDriver.h"
+#include "lib_common/PixMapBuffer.h"
 #include "lib_common/RoundUp.h"
 #include "lib_common/StreamBuffer.h"
 #include "lib_common_enc/EncBuffers.h"
@@ -416,22 +417,22 @@ bool RTEncoderBase::set_resolution(uint32_t uWidth, uint32_t uHeight)
     return true;
 }
 
-TFourCC RTEncoderBase::SRC_FourCC() const
+TFourCC RTEncoderBase::src_fourCC() const
 {
     return m_src_fourcc;
 }
 
-uint8_t RTEncoderBase::SRC_bitdepth() const
+uint8_t RTEncoderBase::src_bitdepth() const
 {
     return m_cfg.bit_depth;
 }
 
-AL_EChromaMode RTEncoderBase::SRC_chroma() const
+AL_EChromaMode RTEncoderBase::src_chroma() const
 {
     return m_cfg.chroma_mode;
 }
 
-AL_TDimension RTEncoderBase::SRC_resolution() const
+AL_TDimension RTEncoderBase::src_resolution() const
 {
     std::lock_guard<std::mutex> lock(m_cfg_mutex);
     return AL_TDimension{m_cfg.width, m_cfg.height};
@@ -609,10 +610,10 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
 
 void RTEncoderBase::init_source_buf_pool()
 {
-    if (m_cfg.low_delay_mode)
-    {
-        m_cfg.num_src_bufs = std::max(m_cfg.num_src_bufs, static_cast<uint32_t>(kMaxSliceNum + 2));
-    }
+    // if (m_cfg.low_delay_mode)
+    // {
+    //     m_cfg.num_src_bufs = std::max(m_cfg.num_src_bufs, static_cast<uint32_t>(kMaxSliceNum + 2));
+    // }
 
     AL_TDimension tDim{static_cast<int32_t>(m_cfg.width), static_cast<int32_t>(m_cfg.height)};
     std::vector<AL_TPlaneDescription> plane_descs;
@@ -719,7 +720,7 @@ AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
         return nullptr;
     }
 
-    AL_PixMapBuffer_SetDimension(pBuf, SRC_resolution());
+    AL_PixMapBuffer_SetDimension(pBuf, src_resolution());
 
     return pBuf;
 }
@@ -787,7 +788,7 @@ void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback rel
     m_release_cb = std::move(releaseCb);
 }
 
-std::vector<int> RTEncoder<SourceMode::V4L2>::acquire_dma_fds(unsigned int count)
+std::vector<DMAFd> RTEncoder<SourceMode::V4L2>::acquire_dma_buffers(unsigned int count)
 {
     if (count > m_cfg.num_src_bufs)
     {
@@ -795,12 +796,12 @@ std::vector<int> RTEncoder<SourceMode::V4L2>::acquire_dma_fds(unsigned int count
         return {};
     }
 
-    std::vector<int> fds;
-    fds.reserve(count);
+    std::vector<DMAFd> descs;
+    descs.reserve(count);
     std::lock_guard<std::mutex> lock(m_idx_mutex);
     if (!m_slots.empty())
     {
-        VIDEO_ERROR_PRINT("DMA FDs already acquired, repeated acquisition is not allowed");
+        VIDEO_ERROR_PRINT("DMA buffers already acquired, repeated acquisition is not allowed");
         return {};
     }
 
@@ -813,19 +814,46 @@ std::vector<int> RTEncoder<SourceMode::V4L2>::acquire_dma_fds(unsigned int count
             goto error_cleanup;
         }
 
-        int dma_fd =
+        DMAFd desc{};
+        desc.dma_fd =
             AL_LinuxDmaAllocator_GetFd(reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator), pBuf->hBufs[0]);
-        if (dma_fd < 0)
+        if (desc.dma_fd < 0)
         {
             VIDEO_ERROR_PRINT("Failed to get DMA fd from buffer");
             AL_Buffer_Unref(pBuf);
             goto error_cleanup;
         }
-        m_slots.push_back({pBuf, false});
-        fds.push_back(dma_fd);
+
+        auto dim = src_resolution();
+        if (dim.iWidth <= 0 || dim.iHeight <= 0)
+        {
+            VIDEO_ERROR_PRINT("Invalid source resolution for DMA buffer description");
+            AL_Buffer_Unref(pBuf);
+            goto error_cleanup;
+        }
+
+        desc.width = static_cast<uint32_t>(dim.iWidth);
+        desc.height = static_cast<uint32_t>(dim.iHeight);
+        desc.fourcc = AL_PixMapBuffer_GetFourCC(pBuf);
+        desc.y_offset = 0;
+        desc.y_pitch = static_cast<uint32_t>(AL_PixMapBuffer_GetPlanePitch(pBuf, AL_PLANE_Y));
+        desc.uv_pitch = static_cast<uint32_t>(AL_PixMapBuffer_GetPlanePitch(pBuf, AL_PLANE_UV));
+        int strideH = AL_RoundUp(dim.iHeight, kHeightAlign);
+        desc.uv_offset = static_cast<uint32_t>(
+            AL_GetAllocSizeSrc_PixPlane(&m_pic_format, static_cast<int>(desc.y_pitch), strideH, AL_PLANE_Y));
+
+        if (desc.y_pitch == 0 || desc.uv_pitch == 0)
+        {
+            VIDEO_ERROR_PRINT("Invalid plane pitch in DMA buffer description");
+            AL_Buffer_Unref(pBuf);
+            goto error_cleanup;
+        }
+
+        m_slots.push_back({pBuf, false, desc});
+        descs.push_back(desc);
     }
 
-    return fds;
+    return descs;
 
 error_cleanup:
     for (auto &slot : m_slots)

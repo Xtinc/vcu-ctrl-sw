@@ -1,4 +1,5 @@
 #include "V4L2Source.h"
+#include "XilinxSyncIP.h"
 
 extern "C"
 {
@@ -120,6 +121,21 @@ static bool wait_readable(int fd, int timeout_ms)
     return true;
 }
 
+static bool set_xilinx_low_latency_mode(int fd, bool enable)
+{
+    v4l2_control control{};
+    control.id = V4L2_CID_XILINX_LOW_LATENCY;
+    control.value = enable ? XVIP_LOW_LATENCY_ENABLE : XVIP_LOW_LATENCY_DISABLE;
+
+    if (ioctl(fd, VIDIOC_S_CTRL, &control) == -1)
+    {
+        VIDEO_ERROR_PRINT("Failed to %s Xilinx low-latency mode: %s", enable ? "enable" : "disable",
+                          std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 static void dump_v4l2_format(const v4l2_format &fmt)
 {
     if (V4L2_TYPE_IS_MULTIPLANAR(fmt.type))
@@ -137,10 +153,11 @@ static void dump_v4l2_format(const v4l2_format &fmt)
 }
 
 V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, int buf_cnt,
-                       bool multiple_planes)
+                       bool multiple_planes, const std::string &sync_dev_path)
     : m_fd(-1), m_buffer_count(buf_cnt),
       m_buf_type(multiple_planes ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE), m_plane_size(0),
-      m_state(State::INIT), m_consecutive_timeout_count(0), m_timeout_error_threshold(MAX_TIMEOUT_THRESHOLD)
+      m_state(State::INIT), m_consecutive_timeout_count(0), m_timeout_error_threshold(MAX_TIMEOUT_THRESHOLD),
+      m_sync_ip(nullptr)
 {
     if (req_width <= 0 || req_height <= 0 || m_buffer_count <= 0)
     {
@@ -158,6 +175,22 @@ V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TF
     if (m_fd < 0)
     {
         throw std::runtime_error("Failed to open V4L2 device: " + dev + " - " + std::strerror(errno));
+    }
+
+    // Initialize Xilinx sync IP if sync_dev_path is provided
+    if (!sync_dev_path.empty() && set_xilinx_low_latency_mode(m_fd, true))
+    {
+        m_sync_ip = std::make_unique<XilinxSyncIP>(sync_dev_path);
+        if (!m_sync_ip->init())
+        {
+            VIDEO_ERROR_PRINT("Xilinx sync IP init failed, fallback to standard mode");
+            m_sync_ip.reset();
+            (void)set_xilinx_low_latency_mode(m_fd, false);
+        }
+        else
+        {
+            VIDEO_INFO_PRINT("Xilinx hardware synchronization enabled [%s]", sync_dev_path.c_str());
+        }
     }
 
     try
@@ -225,11 +258,8 @@ V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TF
     }
     catch (...)
     {
-        if (m_fd >= 0)
-        {
-            ::close(m_fd);
-            m_fd = -1;
-        }
+        ::close(m_fd);
+        m_fd = -1;
         throw;
     }
 }
@@ -261,7 +291,7 @@ V4L2Source::~V4L2Source()
     m_state.store(State::CLOSED);
 }
 
-bool V4L2Source::import_fds(const std::vector<int> &fds)
+bool V4L2Source::import_fds(const std::vector<DMAFd> &buffers)
 {
     if (m_fd < 0)
     {
@@ -283,9 +313,10 @@ bool V4L2Source::import_fds(const std::vector<int> &fds)
         return false;
     }
 
-    if (fds.size() != static_cast<size_t>(m_buffer_count))
+    if (buffers.size() != static_cast<size_t>(m_buffer_count))
     {
-        VIDEO_ERROR_PRINT("Number of provided FDs (%zu) does not match buffer count (%d)", fds.size(), m_buffer_count);
+        VIDEO_ERROR_PRINT("Number of provided buffers (%zu) does not match buffer count (%d)", buffers.size(),
+                          m_buffer_count);
         return false;
     }
 
@@ -299,9 +330,10 @@ bool V4L2Source::import_fds(const std::vector<int> &fds)
         b.buf.index = i;
         b.buf.type = m_buf_type;
         b.buf.memory = V4L2_MEMORY_DMABUF;
-        if (fds[i] < 0)
+        b.sync_desc = buffers[i];
+        if (b.sync_desc.dma_fd < 0)
         {
-            VIDEO_ERROR_PRINT("Invalid dma fd at index %zu: %d", i, fds[i]);
+            VIDEO_ERROR_PRINT("Invalid dma fd at index %zu: %d", i, b.sync_desc.dma_fd);
             enter_error_state();
             return false;
         }
@@ -310,13 +342,13 @@ bool V4L2Source::import_fds(const std::vector<int> &fds)
         {
             b.buf.length = 1;
             b.buf.m.planes = b.plane;
-            b.plane[0].m.fd = fds[i];
+            b.plane[0].m.fd = b.sync_desc.dma_fd;
             b.plane[0].length = m_plane_size;
         }
         else
         {
             b.buf.length = m_plane_size;
-            b.buf.m.fd = fds[i];
+            b.buf.m.fd = b.sync_desc.dma_fd;
         }
 
         if (!qbuf_idx(i))
@@ -380,6 +412,26 @@ bool V4L2Source::start()
         return false;
     }
 
+    if (m_sync_ip && !m_sync_ip->start())
+    {
+        VIDEO_ERROR_PRINT("Failed to start Xilinx sync IP");
+        goto error_cleanup;
+    }
+
+    if (m_sync_ip)
+    {
+        v4l2_control control{};
+        control.id = V4L2_CID_XILINX_LOW_LATENCY;
+        control.value = XVIP_START_DMA;
+
+        if (ioctl(m_fd, VIDIOC_S_CTRL, &control) == -1)
+        {
+            VIDEO_ERROR_PRINT("Failed to start DMA: %s", std::strerror(errno));
+            goto error_cleanup;
+        }
+        VIDEO_INFO_PRINT("Start Xilinx DMA synchronization");
+    }
+
     stop_requeue_worker();
     m_state.store(State::STREAMING);
     try
@@ -389,12 +441,15 @@ bool V4L2Source::start()
     catch (const std::exception &e)
     {
         VIDEO_ERROR_PRINT("Failed to start requeue worker: %s", e.what());
-        (void)ioctl_retry(m_fd, VIDIOC_STREAMOFF, &type);
-        enter_error_state();
-        return false;
+        goto error_cleanup;
     }
     m_consecutive_timeout_count = 0;
     return true;
+
+error_cleanup:
+    (void)ioctl_retry(m_fd, VIDIOC_STREAMOFF, &type);
+    enter_error_state();
+    return false;
 }
 
 bool V4L2Source::stop()
@@ -549,6 +604,16 @@ bool V4L2Source::qbuf_idx(unsigned int idx)
     }
 
     auto &b = m_buffers[idx];
+
+    // Add buffer to Xilinx sync IP if enabled
+    if (m_sync_ip)
+    {
+        if (!m_sync_ip->add_buffer(b.sync_desc))
+        {
+            VIDEO_ERROR_PRINT("Failed to add sync metadata for idx=%u, continue with QBUF", idx);
+        }
+    }
+
     if (ioctl_retry(m_fd, VIDIOC_QBUF, &b.buf) < 0)
     {
         VIDEO_ERROR_PRINT("Failed to queue buffer idx=%d: %s", idx, std::strerror(errno));

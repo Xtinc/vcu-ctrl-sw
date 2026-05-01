@@ -28,10 +28,12 @@
 #include "xvfbsync.h"
 #include "lib_rtos/message.h"
 #include <assert.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 
 typedef uint8_t u8;
@@ -342,7 +344,30 @@ static int xvfbsync_syncip_add_buffer(SyncIp *syncip, struct xlnxsync_chan_confi
     ret = ioctl(syncip->fd, XLNXSYNC_CHAN_SET_CONFIG, fb_config);
 
     if (ret)
-        VIDEO_ERROR_PRINT("SyncIp: Couldn't add buffer");
+    {
+        struct xlnxsync_stat chan_status = {0};
+        struct xlnxsync_fbdone fbdone_status = {0};
+        int saved_errno = errno;
+        VIDEO_ERROR_PRINT("SyncIp: Couldn't add buffer (errno=%d, reason=%s)", saved_errno, strerror(saved_errno));
+
+        chan_status.hdr_ver = XLNXSYNC_IOCTL_HDR_VER;
+        if (!ioctl(syncip->fd, XLNXSYNC_CHAN_GET_STATUS, &chan_status))
+        {
+            VIDEO_ERROR_PRINT(
+                "SyncIp status: enable=%u fbdone=[[%u,%u],[%u,%u],[%u,%u]] err[p_sync=%u p_wdg=%u c_sync=%u "
+                "c_wdg=%u ldiff=%u cdiff=%u]",
+                chan_status.enable, chan_status.fbdone[0][XLNXSYNC_PROD], chan_status.fbdone[0][XLNXSYNC_CONS],
+                chan_status.fbdone[1][XLNXSYNC_PROD], chan_status.fbdone[1][XLNXSYNC_CONS],
+                chan_status.fbdone[2][XLNXSYNC_PROD], chan_status.fbdone[2][XLNXSYNC_CONS], chan_status.err.prod_sync,
+                chan_status.err.prod_wdg, chan_status.err.cons_sync, chan_status.err.cons_wdg, chan_status.err.ldiff,
+                chan_status.err.cdiff);
+        }
+        else
+        {
+            VIDEO_ERROR_PRINT("SyncIp: Failed to read channel status on add failure (errno=%d, reason=%s)", errno,
+                              strerror(errno));
+        }
+    }
 
     return ret;
 }
@@ -899,9 +924,9 @@ static int xvfbsync_enc_sync_chan_add_buffer_(EncSyncChannel *enc_sync_chan, XLN
 
             config = set_enc_framebuffer_config(buf, enc_sync_chan->hardware_horizontal_stride_alignment,
                                                 enc_sync_chan->hardware_vertical_stride_alignment);
-
-            print_framebuffer_config(&config, enc_sync_chan->sync_channel->sync->max_users,
-                                     enc_sync_chan->sync_channel->sync->max_cores);
+            // for debug
+            //  print_framebuffer_config(&config, enc_sync_chan->sync_channel->sync->max_users,
+            //                           enc_sync_chan->sync_channel->sync->max_cores);
 
             ret = xvfbsync_syncip_add_buffer(enc_sync_chan->sync_channel->sync, &config);
 
