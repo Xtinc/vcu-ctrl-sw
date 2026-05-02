@@ -346,7 +346,6 @@ static int xvfbsync_syncip_add_buffer(SyncIp *syncip, struct xlnxsync_chan_confi
     if (ret)
     {
         struct xlnxsync_stat chan_status = {0};
-        struct xlnxsync_fbdone fbdone_status = {0};
         int saved_errno = errno;
         VIDEO_ERROR_PRINT("SyncIp: Couldn't add buffer (errno=%d, reason=%s)", saved_errno, strerror(saved_errno));
 
@@ -616,37 +615,37 @@ static int get_offset_uv(XLNXLLBuf *buf)
     return buf->t_planes[PLANE_UV].i_offset;
 }
 
-static void print_framebuffer_config(struct xlnxsync_chan_config *config, u8 max_users, u8 max_cores)
-{
-    VIDEO_DEBUG_PRINT("************xvfbsync*************");
-    VIDEO_DEBUG_PRINT("luma_margin:%d", config->luma_margin);
-    VIDEO_DEBUG_PRINT("chroma_margin:%d", config->chroma_margin);
+// static void print_framebuffer_config(struct xlnxsync_chan_config *config, u8 max_users, u8 max_cores)
+// {
+//     VIDEO_DEBUG_PRINT("************xvfbsync*************");
+//     VIDEO_DEBUG_PRINT("luma_margin:%d", config->luma_margin);
+//     VIDEO_DEBUG_PRINT("chroma_margin:%d", config->chroma_margin);
 
-    for (u8 user = 0; user < max_users; ++user)
-    {
-        VIDEO_DEBUG_PRINT("%s[%d]:",
-                          (user == XLNXSYNC_PROD)   ? "prod"
-                          : (user == XLNXSYNC_CONS) ? "cons"
-                                                    : "unknown",
-                          user);
-        VIDEO_DEBUG_PRINT("\t-fb_id:%d %s", config->fb_id[user],
-                          config->fb_id[user] == XLNXSYNC_AUTO_SEARCH ? "(auto_search)" : "");
-        VIDEO_DEBUG_PRINT("\t-ismono:%s", (config->ismono[user] == 0) ? "false" : "true");
-        VIDEO_DEBUG_PRINT("\t-luma_start_offset:%" PRIx64, config->luma_start_offset[user]);
-        VIDEO_DEBUG_PRINT("\t-luma_end_offset:%" PRIx64, config->luma_end_offset[user]);
-        VIDEO_DEBUG_PRINT("\t-chroma_start_offset:%" PRIx64, config->chroma_start_offset[user]);
-        VIDEO_DEBUG_PRINT("\t-chroma_end_offset:%" PRIx64, config->chroma_end_offset[user]);
-    }
+//     for (u8 user = 0; user < max_users; ++user)
+//     {
+//         VIDEO_DEBUG_PRINT("%s[%d]:",
+//                           (user == XLNXSYNC_PROD)   ? "prod"
+//                           : (user == XLNXSYNC_CONS) ? "cons"
+//                                                     : "unknown",
+//                           user);
+//         VIDEO_DEBUG_PRINT("\t-fb_id:%d %s", config->fb_id[user],
+//                           config->fb_id[user] == XLNXSYNC_AUTO_SEARCH ? "(auto_search)" : "");
+//         VIDEO_DEBUG_PRINT("\t-ismono:%s", (config->ismono[user] == 0) ? "false" : "true");
+//         VIDEO_DEBUG_PRINT("\t-luma_start_offset:%" PRIx64, config->luma_start_offset[user]);
+//         VIDEO_DEBUG_PRINT("\t-luma_end_offset:%" PRIx64, config->luma_end_offset[user]);
+//         VIDEO_DEBUG_PRINT("\t-chroma_start_offset:%" PRIx64, config->chroma_start_offset[user]);
+//         VIDEO_DEBUG_PRINT("\t-chroma_end_offset:%" PRIx64, config->chroma_end_offset[user]);
+//     }
 
-    for (int core = 0; core < max_cores; ++core)
-    {
-        VIDEO_DEBUG_PRINT("core[%i]:", core);
-        VIDEO_DEBUG_PRINT("\t-luma_core_offset:%d", config->luma_core_offset[core]);
-        VIDEO_DEBUG_PRINT("\t-chroma_core_offset:%d", config->chroma_core_offset[core]);
-    }
+//     for (int core = 0; core < max_cores; ++core)
+//     {
+//         VIDEO_DEBUG_PRINT("core[%i]:", core);
+//         VIDEO_DEBUG_PRINT("\t-luma_core_offset:%d", config->luma_core_offset[core]);
+//         VIDEO_DEBUG_PRINT("\t-chroma_core_offset:%d", config->chroma_core_offset[core]);
+//     }
 
-    VIDEO_DEBUG_PRINT("********************************");
-}
+//     VIDEO_DEBUG_PRINT("********************************");
+// }
 
 static struct xlnxsync_chan_config set_enc_framebuffer_config(XLNXLLBuf *buf, u32 hardware_horizontal_stride_alignment,
                                                               u32 hardware_vertical_stride_alignment)
