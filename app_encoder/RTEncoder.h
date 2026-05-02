@@ -5,11 +5,6 @@
 #include "MemMgr.h"
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <functional>
-#include <mutex>
-#include <string>
-#include <vector>
 
 extern "C"
 {
@@ -140,26 +135,18 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
 template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
 {
   public:
-    struct Slot
-    {
-        AL_TBuffer *buf = nullptr;
-        bool inflight = false;
-        DMAFd desc{};
-    };
-
-    using SourceReleaseCallback = std::function<void(int idx)>;
+    using SourceReleaseCallback = std::function<void(AL_TBuffer const *pSrc)>;
 
     RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
     ~RTEncoder() override;
 
     void set_release_callback(SourceReleaseCallback releaseCb);
-    std::vector<DMAFd> acquire_dma_buffers(unsigned int count);
-    bool submit_dma_index(unsigned int idx);
+    DMAFdArray acquire_dma_buffers(unsigned int count);
+    bool submit_source_buffer(AL_TBuffer *pBuf);
 
   private:
     void release_sources(AL_TBuffer const *pSrc) override;
-    std::mutex m_idx_mutex;
-    std::vector<Slot> m_slots;
+    std::mutex m_mutex;
     SourceReleaseCallback m_release_cb;
 };
 

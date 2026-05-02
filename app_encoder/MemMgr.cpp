@@ -183,6 +183,12 @@ AL_TBuffer *BufPool::get_buffer(bool block)
     return pBuf;
 }
 
+size_t BufPool::available_count()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_fifo.size();
+}
+
 void BufPool::commit()
 {
     {

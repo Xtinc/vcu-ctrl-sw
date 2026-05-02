@@ -1,21 +1,12 @@
 #ifndef V4L2_SOURCE_H
 #define V4L2_SOURCE_H
 
-extern "C"
-{
-#include "lib_common/FourCC.h"
-}
-
 #include <atomic>
 #include <condition_variable>
-#include <cstdint>
 #include <deque>
 #include <linux/videodev2.h>
-#include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
-#include <vector>
 
 #include "DMAFd.h"
 
@@ -33,32 +24,32 @@ class XilinxSyncIP;
  *
  *   INIT:
  *     import_fds        -> IMPORTED
+ *     stop              -> STOPPED
  *     destructor        -> CLOSED
  *   IMPORTED:
  *     start             -> STREAMING
  *     stop              -> STOPPED
- *     enter_error_state -> ERROR
+ *     enter_error_state -> ERROR -> STOPPED
  *     destructor        -> CLOSED
  *   STREAMING:
- *     queue_idx/dqueue_idx/requeue_worker active
+ *     queue/dqueue/requeue_worker active
  *     stop              -> STOPPED
- *     enter_error_state -> ERROR
+ *     enter_error_state -> ERROR -> STOPPED
  *     destructor        -> CLOSED
  *   STOPPED:
  *     import_fds        -> IMPORTED
- *     start             -> STREAMING
- *     enter_error_state -> ERROR
+ *     enter_error_state -> ERROR -> STOPPED
+ *     stop              -> STOPPED
  *     destructor        -> CLOSED
  *   ERROR:
- *     stop (best-effort streamoff) -> STOPPED
- *     destructor        -> CLOSED
+ *     Only entered by enter_error_state, will immediately auto stop to STOPPED, no direct transitions allowed
  *   CLOSED:
  *     terminal state
  *
  * Key features:
  *   - Single atomic state machine for all lifecycle transitions
  *   - Import of external DMA buffers (no internal allocation)
- *   - Thread-safe asynchronous buffer requeueing
+ *   - Thread-safe asynchronous requeue by AL_TBuffer* identity
  *   - Strict error handling and resource cleanup
  *   - Designed for use with hardware encoders/decoders and zero-copy pipelines
  */
@@ -78,12 +69,12 @@ class V4L2Source
     {
         v4l2_buffer buf;
         v4l2_plane plane[1];
-        DMAFd sync_desc{};
+        DMAFd sync_desc;
     };
 
   public:
     /**
-     * @brief Construct a V4L2Source object, open the device, configure format, and request buffers.
+     * @brief Construct a V4L2Source object, open the device, and configure format.
      * @param dev Device node path, e.g. "/dev/video0"
      * @param req_width Requested width
      * @param req_height Requested height
@@ -93,44 +84,53 @@ class V4L2Source
      * @param sync_dev_path Xilinx sync device path. If empty or open fails, Xilinx sync is disabled (default: "")
      * @throw std::exception Throws on initialization failure
      */
-    V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, int buf_cnt,
+    V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, size_t buf_cnt,
                bool multiple_planes = true, const std::string &sync_dev_path = "");
     ~V4L2Source();
     V4L2Source(const V4L2Source &) = delete;
     V4L2Source &operator=(const V4L2Source &) = delete;
 
     /**
-     * @brief Import externally allocated DMA buffer file descriptors and initialize V4L2 buffers.
-     * @param fds Array of DMA buffer file descriptors. Must match buf_cnt.
+     * @brief Import externally allocated DMA buffers, recreate V4L2 queue resources, and pre-queue buffers.
+     * @param buffers Array of DMAFd entries. Must match buf_cnt.
      * @return true on success, false on failure
      */
-    bool import_fds(const std::vector<DMAFd> &buffers);
+    bool import_fds(DMAFdArray &&buffers);
 
     /**
      * @brief Start V4L2 streaming (STREAMON), transition to STREAMING state.
+     * @note start() is valid only after a successful import_fds().
      * @return true on success, false on failure
      */
     bool start();
 
     /**
-     * @brief Stop V4L2 streaming (STREAMOFF), transition to STOPPED state.
+     * @brief Stop V4L2 streaming and fully release V4L2 queue resources, transition to STOPPED state.
+     * @note After stop(), import_fds() must be called again before start().
      * @return true on success, false on failure
      */
     bool stop();
 
     /**
-     * @brief Request to requeue a buffer by index (asynchronous, thread-safe).
-     * @param idx Buffer index (0~buf_cnt-1)
-     * @return true on success, false on failure
+     * @brief Re-queue a previously dequeued buffer back to the V4L2 input queue.
+     *
+     * The API is asynchronous: it only enqueues an index into an internal pending queue.
+     * Actual VIDIOC_QBUF is executed by an internal worker thread.
+     *
+     * @param buffer Buffer identity pointer returned by dqueue().
+     * @return true if accepted for requeue, false on invalid state/input or lookup failure
      */
-    bool queue_idx(unsigned int idx);
+    bool queue(AL_TBuffer const *buffer);
 
     /**
-     * @brief Dequeue a completed buffer index (blocking, with timeout).
-     * @param[out] idx Returns the dequeued buffer index
-     * @return true on success, false on failure or timeout
+     * @brief Dequeue one filled frame buffer from V4L2.
+     *
+     * This call waits up to an internal timeout for frame readiness. On success it returns
+     * the imported AL_TBuffer* identity associated with the dequeued slot.
+     *
+     * @return Non-null AL_TBuffer* on success, nullptr on timeout/error/invalid state
      */
-    bool dqueue_idx(unsigned int &idx);
+    AL_TBuffer *dqueue();
 
   private:
     static const char *state_to_cstr(State state);
@@ -146,7 +146,7 @@ class V4L2Source
     void requeue_worker_loop();
 
     int m_fd;
-    const int m_buffer_count;
+    const size_t m_buffer_cnt;
     const int m_buf_type;
     uint32_t m_plane_size;
     std::atomic<State> m_state;
@@ -158,6 +158,7 @@ class V4L2Source
 
     int m_consecutive_timeout_count;
     int m_timeout_error_threshold;
+    std::atomic<bool> m_buffers_queued;
 
     std::vector<v4l2_buffer_info> m_buffers;
     std::unique_ptr<XilinxSyncIP> m_sync_ip;

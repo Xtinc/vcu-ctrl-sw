@@ -274,17 +274,16 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
 
         V4L2Source v4l2src(v4l2_dev, cfg.width, cfg.height, STR2FOURCC("NV12"), cfg.num_src_bufs, true,
                            cfg.low_delay_mode ? "/dev/xlnxsync0" : "");
-        encoder->set_release_callback([&v4l2src, &requeue_failed](unsigned int idx) {
-            if (!v4l2src.queue_idx(idx))
+        encoder->set_release_callback([&v4l2src, &requeue_failed](AL_TBuffer const *buffer) {
+            if (!v4l2src.queue(buffer))
             {
                 if (!requeue_failed.exchange(true))
                 {
-                    VIDEO_ERROR_PRINT("Failed to requeue V4L2 buffer idx=%u from encoder callback", idx);
+                    VIDEO_ERROR_PRINT("Failed to requeue buffer back to V4L2 device");
                 }
             }
         });
-        auto dmaBuffers = encoder->acquire_dma_buffers(cfg.num_src_bufs);
-        if (!v4l2src.import_fds(dmaBuffers))
+        if (!v4l2src.import_fds(encoder->acquire_dma_buffers(cfg.num_src_bufs)))
         {
             VIDEO_ERROR_PRINT("Failed to import dma fds to V4L2 device");
             return EXIT_FAILURE;
@@ -306,14 +305,14 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
                 break;
             }
 
-            unsigned int idx = 0;
-            if (!v4l2src.dqueue_idx(idx))
+            AL_TBuffer *srcBuf = v4l2src.dqueue();
+            if (!srcBuf)
             {
                 VIDEO_ERROR_PRINT("Failed to dequeue buffer at frame %u", i);
                 encode_ok = false;
                 break;
             }
-            if (!encoder->submit_dma_index(idx))
+            if (!encoder->submit_source_buffer(srcBuf))
             {
                 VIDEO_ERROR_PRINT("Failed to submit dma fd at frame %u", i);
                 encode_ok = false;

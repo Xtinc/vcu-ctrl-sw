@@ -6,6 +6,7 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -46,7 +47,7 @@ bool V4L2Source::can_import(State state)
 
 bool V4L2Source::can_start(State state)
 {
-    return state == State::IMPORTED || state == State::STOPPED;
+    return state == State::IMPORTED;
 }
 
 bool V4L2Source::can_stop(State state)
@@ -136,6 +137,26 @@ static bool set_xilinx_low_latency_mode(int fd, bool enable)
     return true;
 }
 
+static bool release_v4l2_buffers(int fd, int buf_type)
+{
+    if (fd < 0)
+    {
+        return true;
+    }
+
+    v4l2_requestbuffers reqbuf{};
+    reqbuf.count = 0;
+    reqbuf.type = buf_type;
+    reqbuf.memory = V4L2_MEMORY_DMABUF;
+    if (ioctl_retry(fd, VIDIOC_REQBUFS, &reqbuf) < 0 && errno != EINVAL)
+    {
+        VIDEO_ERROR_PRINT("Failed to release V4L2 buffers: %s", std::strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
 static void dump_v4l2_format(const v4l2_format &fmt)
 {
     if (V4L2_TYPE_IS_MULTIPLANAR(fmt.type))
@@ -152,14 +173,14 @@ static void dump_v4l2_format(const v4l2_format &fmt)
     }
 }
 
-V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, int buf_cnt,
+V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, size_t buf_cnt,
                        bool multiple_planes, const std::string &sync_dev_path)
-    : m_fd(-1), m_buffer_count(buf_cnt),
+    : m_fd(-1), m_buffer_cnt(buf_cnt),
       m_buf_type(multiple_planes ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE), m_plane_size(0),
       m_state(State::INIT), m_consecutive_timeout_count(0), m_timeout_error_threshold(MAX_TIMEOUT_THRESHOLD),
-      m_sync_ip(nullptr)
+      m_buffers_queued(false), m_sync_ip(nullptr)
 {
-    if (req_width <= 0 || req_height <= 0 || m_buffer_count <= 0)
+    if (req_width <= 0 || req_height <= 0 || buf_cnt == 0)
     {
         throw std::invalid_argument("Invalid V4L2 source geometry/buffer count");
     }
@@ -245,16 +266,6 @@ V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TF
         }
 
         dump_v4l2_format(fmt);
-
-        v4l2_requestbuffers reqbuf{};
-        reqbuf.count = m_buffer_count;
-        reqbuf.type = m_buf_type;
-        reqbuf.memory = V4L2_MEMORY_DMABUF;
-        xioctl(m_fd, VIDIOC_REQBUFS, &reqbuf, "request buffers");
-        if (reqbuf.count < static_cast<uint32_t>(m_buffer_count))
-        {
-            throw std::runtime_error("V4L2 device could not allocate enough buffers");
-        }
     }
     catch (...)
     {
@@ -267,31 +278,13 @@ V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TF
 V4L2Source::~V4L2Source()
 {
     (void)stop();
-
-    if (m_fd >= 0)
-    {
-        v4l2_requestbuffers reqbuf{};
-        reqbuf.count = 0;
-        reqbuf.type = m_buf_type;
-        reqbuf.memory = V4L2_MEMORY_DMABUF;
-        if (ioctl_retry(m_fd, VIDIOC_REQBUFS, &reqbuf) < 0 && errno != EINVAL)
-        {
-            VIDEO_ERROR_PRINT("Failed to release V4L2 buffers: %s", std::strerror(errno));
-        }
-    }
-
     m_buffers.clear();
-
-    if (m_fd >= 0)
-    {
-        ::close(m_fd);
-        m_fd = -1;
-    }
-
+    ::close(m_fd);
+    m_fd = -1;
     m_state.store(State::CLOSED);
 }
 
-bool V4L2Source::import_fds(const std::vector<DMAFd> &buffers)
+bool V4L2Source::import_fds(DMAFdArray &&fds)
 {
     if (m_fd < 0)
     {
@@ -301,7 +294,7 @@ bool V4L2Source::import_fds(const std::vector<DMAFd> &buffers)
     }
 
     const State state = m_state.load();
-    if (state == State::CLOSED || state == State::ERROR)
+    if (state == State::CLOSED)
     {
         VIDEO_ERROR_PRINT("Cannot import FDs in state=%s", state_to_cstr(state));
         return false;
@@ -313,16 +306,32 @@ bool V4L2Source::import_fds(const std::vector<DMAFd> &buffers)
         return false;
     }
 
-    if (buffers.size() != static_cast<size_t>(m_buffer_count))
+    if (fds.size() != m_buffer_cnt)
     {
-        VIDEO_ERROR_PRINT("Number of provided buffers (%zu) does not match buffer count (%d)", buffers.size(),
-                          m_buffer_count);
+        VIDEO_ERROR_PRINT("Number of provided buffers (%zu) does not match buffer count (%zu)", fds.size(), m_buffer_cnt);
         return false;
     }
 
-    m_buffers.resize(m_buffer_count);
+    v4l2_requestbuffers reqbuf{};
+    reqbuf.count = m_buffer_cnt;
+    reqbuf.type = m_buf_type;
+    reqbuf.memory = V4L2_MEMORY_DMABUF;
+    if (ioctl_retry(m_fd, VIDIOC_REQBUFS, &reqbuf) < 0)
+    {
+        VIDEO_ERROR_PRINT("Failed to request V4L2 buffers: %s", std::strerror(errno));
+        enter_error_state();
+        return false;
+    }
+    if (reqbuf.count < static_cast<uint32_t>(m_buffer_cnt))
+    {
+        VIDEO_ERROR_PRINT("V4L2 device could not allocate enough buffers (%u < %zu)", reqbuf.count, m_buffer_cnt);
+        enter_error_state();
+        return false;
+    }
 
-    for (size_t i = 0; i < static_cast<size_t>(m_buffer_count); ++i)
+    m_buffers.resize(m_buffer_cnt);
+
+    for (size_t i = 0; i < m_buffer_cnt; ++i)
     {
         auto &b = m_buffers[i];
         std::memset(&b.buf, 0, sizeof(b.buf));
@@ -330,7 +339,7 @@ bool V4L2Source::import_fds(const std::vector<DMAFd> &buffers)
         b.buf.index = i;
         b.buf.type = m_buf_type;
         b.buf.memory = V4L2_MEMORY_DMABUF;
-        b.sync_desc = buffers[i];
+        b.sync_desc = std::move(fds[i]);
         if (b.sync_desc.dma_fd < 0)
         {
             VIDEO_ERROR_PRINT("Invalid dma fd at index %zu: %d", i, b.sync_desc.dma_fd);
@@ -358,8 +367,8 @@ bool V4L2Source::import_fds(const std::vector<DMAFd> &buffers)
         }
     }
 
+    m_buffers_queued.store(true);
     m_state.store(State::IMPORTED);
-
     return true;
 }
 
@@ -389,18 +398,6 @@ bool V4L2Source::start()
     {
         VIDEO_ERROR_PRINT("Cannot start V4L2 stream in state=%s", state_to_cstr(cur_state));
         return false;
-    }
-
-    if (cur_state == State::STOPPED)
-    {
-        for (int i = 0; i < m_buffer_count; ++i)
-        {
-            if (!qbuf_idx(i))
-            {
-                VIDEO_ERROR_PRINT("Failed to requeue buffer idx=%d before STREAMON", i);
-                return false;
-            }
-        }
     }
 
     int type = m_buf_type;
@@ -461,19 +458,6 @@ bool V4L2Source::stop()
         return true;
     }
 
-    if (state == State::INIT)
-    {
-        stop_requeue_worker();
-        return true;
-    }
-
-    if (state != State::STREAMING && state != State::ERROR)
-    {
-        m_state.store(State::STOPPED);
-        stop_requeue_worker();
-        return true;
-    }
-
     m_state.store(State::STOPPED);
     stop_requeue_worker();
 
@@ -483,20 +467,26 @@ bool V4L2Source::stop()
         return true;
     }
 
-    int type = m_buf_type;
-    auto ret = ioctl_retry(m_fd, VIDIOC_STREAMOFF, &type);
-    if (ret != 0)
+    if (state == State::STREAMING || state == State::ERROR)
     {
-        if (errno == EINVAL)
+        int type = m_buf_type;
+        auto ret = ioctl_retry(m_fd, VIDIOC_STREAMOFF, &type);
+        if (ret != 0 && errno != EINVAL)
         {
-            // Device may already be in non-streaming state.
-            m_state.store(State::STOPPED);
-            return true;
+            VIDEO_ERROR_PRINT("Failed to stop streaming: %s", std::strerror(errno));
+            m_state.store(State::ERROR);
+            return false;
         }
-        VIDEO_ERROR_PRINT("Failed to stop streaming: %s", std::strerror(errno));
+    }
+
+    if (!release_v4l2_buffers(m_fd, m_buf_type))
+    {
         m_state.store(State::ERROR);
         return false;
     }
+
+    m_buffers_queued.store(false);
+    m_buffers.clear();
 
     {
         std::lock_guard<std::mutex> lock(m_requeue_mutex);
@@ -506,29 +496,44 @@ bool V4L2Source::stop()
     return true;
 }
 
-bool V4L2Source::queue_idx(unsigned int idx)
+bool V4L2Source::queue(AL_TBuffer const *buffer)
 {
-    if (!can_queue(m_state.load()) || idx >= m_buffers.size())
+    if (!buffer)
     {
+        VIDEO_ERROR_PRINT("Cannot queue null buffer");
         return false;
     }
 
+    if (!can_queue(m_state.load()))
+    {
+        VIDEO_ERROR_PRINT("Cannot queue buffer in state=%s", state_to_cstr(m_state.load()));
+        return false;
+    }
+
+    auto iter = std::find_if(m_buffers.cbegin(), m_buffers.cend(),
+                             [buffer](const v4l2_buffer_info &b) { return b.sync_desc.buffer == buffer; });
+    if (iter == m_buffers.cend())
+    {
+        VIDEO_ERROR_PRINT("Provided buffer pointer does not match any imported buffer");
+        return false;
+    }
+
+    auto idx = std::distance(m_buffers.cbegin(), iter);
     {
         std::lock_guard<std::mutex> lock(m_requeue_mutex);
         m_requeue_pending.push_back(idx);
     }
 
     m_requeue_cv.notify_one();
-
     return true;
 }
 
-bool V4L2Source::dqueue_idx(unsigned int &idx)
+AL_TBuffer *V4L2Source::dqueue()
 {
     if (!can_dequeue(m_state.load()))
     {
         VIDEO_ERROR_PRINT("Cannot dequeue in state=%s", state_to_cstr(m_state.load()));
-        return false;
+        return nullptr;
     }
 
     if (!wait_readable(m_fd, V4L2_DQ_TIMEOUT_MS))
@@ -541,10 +546,10 @@ bool V4L2Source::dqueue_idx(unsigned int &idx)
                 VIDEO_ERROR_PRINT("V4L2 dequeue timed out %d times consecutively", m_consecutive_timeout_count);
                 enter_error_state();
             }
-            return false;
+            return nullptr;
         }
         enter_error_state();
-        return false;
+        return nullptr;
     }
 
     v4l2_buffer buf{};
@@ -567,7 +572,7 @@ bool V4L2Source::dqueue_idx(unsigned int &idx)
                 VIDEO_ERROR_PRINT("V4L2 dequeue EAGAIN %d times consecutively", m_consecutive_timeout_count);
                 enter_error_state();
             }
-            return false;
+            return nullptr;
         }
 
         if (errno == EPIPE || errno == EINVAL)
@@ -580,20 +585,19 @@ bool V4L2Source::dqueue_idx(unsigned int &idx)
             VIDEO_ERROR_PRINT("Failed to dequeue buffer: %s", std::strerror(errno));
         }
         enter_error_state();
-        return false;
+        return nullptr;
     }
 
     m_consecutive_timeout_count = 0;
 
-    if (buf.index >= static_cast<uint32_t>(m_buffer_count))
+    if (buf.index >= m_buffer_cnt)
     {
         VIDEO_ERROR_PRINT("Driver returned invalid dequeued index: %u", buf.index);
         enter_error_state();
-        return false;
+        return nullptr;
     }
 
-    idx = buf.index;
-    return true;
+    return m_buffers[buf.index].sync_desc.buffer;
 }
 
 bool V4L2Source::qbuf_idx(unsigned int idx)
@@ -666,5 +670,7 @@ void V4L2Source::requeue_worker_loop()
 void V4L2Source::enter_error_state()
 {
     m_state.store(State::ERROR);
+    m_buffers_queued.store(false);
     m_requeue_cv.notify_all();
+    (void)stop();
 }

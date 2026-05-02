@@ -45,6 +45,7 @@ class BufPool
     bool init(AL_TAllocator *pAllocator, uint32_t uNumBuf);
     bool add_metadata(AL_TMetaData *pMetaData);
     AL_TBuffer *get_buffer(bool block = true);
+    size_t available_count();
     void commit();
     void decommit();
 

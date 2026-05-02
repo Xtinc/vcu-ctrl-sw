@@ -3,23 +3,39 @@
 
 extern "C"
 {
+#include "lib_common/BufferAPI.h"
 #include "lib_common/FourCC.h"
 }
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 struct DMAFd
 {
-    int dma_fd = -1;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    TFourCC fourcc = 0;
-    uint32_t y_offset = 0;
-    uint32_t y_pitch = 0;
-    uint32_t uv_offset = 0;
-    uint32_t uv_pitch = 0;
+    DMAFd();
+    DMAFd(int fd, AL_TBuffer *buf, uint32_t w, uint32_t h, AL_TPicFormat pic_fmt);
+    ~DMAFd();
+
+    // Disable copy semantics, allow move semantics
+    DMAFd(const DMAFd &) = delete;
+    DMAFd &operator=(const DMAFd &) = delete;
+    DMAFd(DMAFd &&other) noexcept;
+    DMAFd &operator=(DMAFd &&other) noexcept;
+
+    int dma_fd;
+    AL_TBuffer *buffer;
+    uint32_t width;
+    uint32_t height;
+    TFourCC fourcc;
+    uint32_t y_offset;
+    uint32_t y_pitch;
+    uint32_t uv_offset;
+    uint32_t uv_pitch;
 };
+
+using DMAFdArray = std::vector<DMAFd>;
 
 inline std::string FOURCC2STR(TFourCC fourcc)
 {

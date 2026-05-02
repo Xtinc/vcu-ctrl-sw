@@ -1,12 +1,9 @@
 #include "RTEncoder.h"
-#include <algorithm>
 
 extern "C"
 {
-#include "lib_common/BufferAPI.h"
 #include "lib_common/BufferStreamMeta.h"
 #include "lib_common/HardwareDriver.h"
-#include "lib_common/PixMapBuffer.h"
 #include "lib_common/RoundUp.h"
 #include "lib_common/StreamBuffer.h"
 #include "lib_common_enc/EncBuffers.h"
@@ -16,6 +13,8 @@ extern "C"
 #include "lib_fpga/DmaAllocLinux.h"
 #include "lib_rtos/message.h"
 }
+
+#include <algorithm>
 
 static constexpr int kStreamSmoothingCount = 2;
 static constexpr int kHeightAlign = 8;
@@ -708,12 +707,6 @@ AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
         return nullptr;
     }
 
-    if (!m_source_buf_pool)
-    {
-        m_error.store(true);
-        return nullptr;
-    }
-
     auto pBuf = m_source_buf_pool->get_buffer();
     if (!pBuf)
     {
@@ -749,7 +742,66 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
 
 void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const * /*pSrc*/)
 {
-    // for file mode, source buffer is owned by the encoder and need do nothing on release callback
+    // File mode source buffers are owned by the encoder; nothing to do on source-release callback.
+}
+
+// Implementation for DMAFd
+DMAFd::DMAFd()
+    : dma_fd(-1), buffer(nullptr), width(0), height(0), fourcc(0), y_offset(0), y_pitch(0), uv_offset(0), uv_pitch(0)
+{
+}
+
+DMAFd::DMAFd(int fd, AL_TBuffer *buf, uint32_t w, uint32_t h, AL_TPicFormat pic_fmt)
+    : dma_fd(fd), buffer(buf), width(w), height(h), fourcc(AL_PixMapBuffer_GetFourCC(buf)), y_offset(0), y_pitch(0),
+      uv_offset(0), uv_pitch(0)
+{
+    y_pitch = static_cast<uint32_t>(AL_PixMapBuffer_GetPlanePitch(buffer, AL_PLANE_Y));
+    int strideH = AL_RoundUp(h, kHeightAlign);
+    uv_offset =
+        static_cast<uint32_t>(AL_GetAllocSizeSrc_PixPlane(&pic_fmt, static_cast<int>(y_pitch), strideH, AL_PLANE_Y));
+    uv_pitch = static_cast<uint32_t>(AL_PixMapBuffer_GetPlanePitch(buffer, AL_PLANE_UV));
+}
+
+DMAFd::~DMAFd()
+{
+    if (buffer)
+    {
+        AL_Buffer_Unref(buffer);
+        buffer = nullptr;
+    }
+}
+
+DMAFd::DMAFd(DMAFd &&other) noexcept
+    : dma_fd(other.dma_fd), buffer(other.buffer), width(other.width), height(other.height), fourcc(other.fourcc),
+      y_offset(other.y_offset), y_pitch(other.y_pitch), uv_offset(other.uv_offset), uv_pitch(other.uv_pitch)
+{
+    other.dma_fd = -1;
+    other.buffer = nullptr;
+}
+
+DMAFd &DMAFd::operator=(DMAFd &&other) noexcept
+{
+    if (this != &other)
+    {
+        if (buffer)
+        {
+            AL_Buffer_Unref(buffer);
+        }
+
+        dma_fd = other.dma_fd;
+        buffer = other.buffer;
+        width = other.width;
+        height = other.height;
+        fourcc = other.fourcc;
+        y_offset = other.y_offset;
+        y_pitch = other.y_pitch;
+        uv_offset = other.uv_offset;
+        uv_pitch = other.uv_pitch;
+
+        other.dma_fd = -1;
+        other.buffer = nullptr;
+    }
+    return *this;
 }
 
 // Implementation for V4L2_DMABUF source mode
@@ -768,60 +820,49 @@ RTEncoder<SourceMode::V4L2>::~RTEncoder()
     catch (...)
     {
     }
-    std::lock_guard<std::mutex> lock(m_idx_mutex);
+
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_release_cb = nullptr;
-    for (auto &slot : m_slots)
-    {
-        if (slot.buf)
-        {
-            AL_Buffer_Unref(slot.buf);
-            slot.buf = nullptr;
-        }
-        slot.inflight = false;
-    }
-    m_slots.clear();
 }
 
 void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback releaseCb)
 {
-    std::lock_guard<std::mutex> lock(m_idx_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_release_cb = std::move(releaseCb);
 }
 
-std::vector<DMAFd> RTEncoder<SourceMode::V4L2>::acquire_dma_buffers(unsigned int count)
+DMAFdArray RTEncoder<SourceMode::V4L2>::acquire_dma_buffers(unsigned int count)
 {
-    if (count > m_cfg.num_src_bufs)
+    auto available_cnt = m_source_buf_pool->available_count();
+    if (count > available_cnt)
     {
-        VIDEO_ERROR_PRINT("Requested DMA fd count %d exceeds pool capacity %u", count, m_cfg.num_src_bufs);
+        VIDEO_ERROR_PRINT("Requested DMA fd count %u exceeds pool capacity %zu", count, available_cnt);
         return {};
     }
 
-    std::vector<DMAFd> descs;
+    bool ok = true;
+    DMAFdArray descs;
     descs.reserve(count);
-    std::lock_guard<std::mutex> lock(m_idx_mutex);
-    if (!m_slots.empty())
-    {
-        VIDEO_ERROR_PRINT("DMA buffers already acquired, repeated acquisition is not allowed");
-        return {};
-    }
 
     for (unsigned int i = 0; i < count; ++i)
     {
         auto *pBuf = m_source_buf_pool->get_buffer();
         if (!pBuf)
         {
-            VIDEO_ERROR_PRINT("Failed to acquire source buffer from pool");
-            goto error_cleanup;
+            VIDEO_ERROR_PRINT("Failed to acquire %uth source buffer from pool.", i);
+            ok = false;
+            break;
         }
 
-        DMAFd desc{};
-        desc.dma_fd =
+        auto dma_fd =
             AL_LinuxDmaAllocator_GetFd(reinterpret_cast<AL_TLinuxDmaAllocator *>(m_pAllocator), pBuf->hBufs[0]);
-        if (desc.dma_fd < 0)
+        if (dma_fd < 0)
         {
-            VIDEO_ERROR_PRINT("Failed to get DMA fd from buffer");
+            VIDEO_ERROR_PRINT("Buffer acquired but failed to get DMA fd for buffer %d: %s", i,
+                              AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
             AL_Buffer_Unref(pBuf);
-            goto error_cleanup;
+            ok = false;
+            break;
         }
 
         auto dim = src_resolution();
@@ -829,82 +870,35 @@ std::vector<DMAFd> RTEncoder<SourceMode::V4L2>::acquire_dma_buffers(unsigned int
         {
             VIDEO_ERROR_PRINT("Invalid source resolution for DMA buffer description");
             AL_Buffer_Unref(pBuf);
-            goto error_cleanup;
+            ok = false;
+            break;
         }
 
-        desc.width = static_cast<uint32_t>(dim.iWidth);
-        desc.height = static_cast<uint32_t>(dim.iHeight);
-        desc.fourcc = AL_PixMapBuffer_GetFourCC(pBuf);
-        desc.y_offset = 0;
-        desc.y_pitch = static_cast<uint32_t>(AL_PixMapBuffer_GetPlanePitch(pBuf, AL_PLANE_Y));
-        desc.uv_pitch = static_cast<uint32_t>(AL_PixMapBuffer_GetPlanePitch(pBuf, AL_PLANE_UV));
-        int strideH = AL_RoundUp(dim.iHeight, kHeightAlign);
-        desc.uv_offset = static_cast<uint32_t>(
-            AL_GetAllocSizeSrc_PixPlane(&m_pic_format, static_cast<int>(desc.y_pitch), strideH, AL_PLANE_Y));
-
+        DMAFd desc(dma_fd, pBuf, dim.iWidth, dim.iHeight, m_pic_format);
         if (desc.y_pitch == 0 || desc.uv_pitch == 0)
         {
             VIDEO_ERROR_PRINT("Invalid plane pitch in DMA buffer description");
-            AL_Buffer_Unref(pBuf);
-            goto error_cleanup;
+            ok = false;
+            break;
         }
 
-        m_slots.push_back({pBuf, false, desc});
-        descs.push_back(desc);
+        descs.push_back(std::move(desc));
     }
 
-    return descs;
-
-error_cleanup:
-    for (auto &slot : m_slots)
-    {
-        if (slot.buf)
-        {
-            AL_Buffer_Unref(slot.buf);
-        }
-    }
-    m_slots.clear();
-    return {};
+    return ok ? std::move(descs) : DMAFdArray{};
 }
 
-bool RTEncoder<SourceMode::V4L2>::submit_dma_index(unsigned int idx)
+bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
 {
-    if (m_stopped.load() || m_error.load())
+    if (m_stopped.load() || m_error.load() || !pBuf)
     {
         return false;
     }
 
-    AL_TBuffer *pSrcBuf = nullptr;
+    if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))
     {
-        std::lock_guard<std::mutex> lock(m_idx_mutex);
-        if (idx >= m_slots.size())
-        {
-            VIDEO_ERROR_PRINT("Invalid buffer index %d", idx);
-            return false;
-        }
-
-        auto &slot = m_slots[idx];
-        if (slot.inflight)
-        {
-            VIDEO_ERROR_PRINT("Buffer index %d is already in-flight", idx);
-            return false;
-        }
-
-        if (!slot.buf)
-        {
-            VIDEO_ERROR_PRINT("Source buffer at index %d is null", idx);
-            return false;
-        }
-
-        slot.inflight = true;
-        pSrcBuf = slot.buf;
-    }
-
-    if (!AL_Encoder_Process(m_hEnc, pSrcBuf, nullptr))
-    {
-        VIDEO_ERROR_PRINT("Failed to submit dmabuf index %d to encoder", idx);
-        std::lock_guard<std::mutex> lock(m_idx_mutex);
-        m_slots[idx].inflight = false;
+        VIDEO_ERROR_PRINT("Failed to submit source buffer to encoder: %s",
+                          AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
         m_error.store(true);
         return false;
     }
@@ -914,34 +908,17 @@ bool RTEncoder<SourceMode::V4L2>::submit_dma_index(unsigned int idx)
 
 void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
 {
-    int idx = -1;
     SourceReleaseCallback release_cb;
     {
-        std::lock_guard<std::mutex> lock(m_idx_mutex);
-        for (int i = 0; i < static_cast<int>(m_slots.size()); ++i)
-        {
-            if (m_slots[i].buf == pSrc)
-            {
-                idx = i;
-                m_slots[i].inflight = false;
-                break;
-            }
-        }
+        std::lock_guard<std::mutex> lock(m_mutex);
         release_cb = m_release_cb;
-    }
-
-    if (idx < 0)
-    {
-        VIDEO_ERROR_PRINT("Failed to find index for released source buffer");
-        m_error.store(true);
-        return;
     }
 
     try
     {
         if (release_cb)
         {
-            release_cb(idx);
+            release_cb(pSrc);
         }
     }
     catch (const std::exception &e)
