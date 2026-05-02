@@ -34,8 +34,8 @@ class RTDecoder
 
     explicit RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb);
     ~RTDecoder();
-
     RTDecoder(const RTDecoder &) = delete;
+
     RTDecoder &operator=(const RTDecoder &) = delete;
     RTDecoder(RTDecoder &&) = delete;
     RTDecoder &operator=(RTDecoder &&) = delete;
