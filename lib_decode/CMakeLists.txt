@@ -9,6 +9,7 @@ set(LIB_DECODE_CORE_SRC
     AvcDecoder.c
     AvcHwBufInitialization.c
     DecoderFeeder.c
+    DecSchedulerMcu.c
     DecSettings.c
     DefaultDecoder.c
     FrameParam.c
@@ -24,10 +25,6 @@ set(LIB_DECODE_CORE_SRC
     UnsplitBufferFeeder.c
     WorkPool.c
 )
-
-if(ENABLE_MICROBLAZE)
-    list(APPEND LIB_DECODE_CORE_SRC DecSchedulerMcu.c)
-endif()
 
 add_library(lib_decode_core_obj OBJECT ${LIB_DECODE_CORE_SRC})
 
