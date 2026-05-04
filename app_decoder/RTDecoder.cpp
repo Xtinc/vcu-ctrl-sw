@@ -443,8 +443,7 @@ AL_ERR RTDecoder::on_resolution_found(int iBufferNumber, AL_TStreamSettings cons
             return AL_ERR_NO_MEMORY;
         }
 
-        // Give buffer to decoder for use during decoding            return AL_ERR_NO_MEMORY;
-
+        // Give buffer to decoder for use during decoding
         if (!AL_Decoder_PutDisplayPicture(m_decoder, pDecPict.get()))
         {
             return AL_ERR_REQUEST_MALFORMED;
@@ -540,12 +539,10 @@ void RTDecoder::on_error(AL_ERR eError)
 
     if (AL_IS_ERROR_CODE(eError))
     {
-        std::lock_guard<std::mutex> lock(m_state_mutex);
-        m_allow_pushback = false;
-    }
-
-    if (AL_IS_ERROR_CODE(eError))
-    {
+        {
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            m_allow_pushback = false;
+        }
         signal_done();
     }
 }
@@ -564,7 +561,7 @@ void RTDecoder::configure_output_settings(AL_TStreamSettings const &stream_setti
     pic_format.bCompressed = false;
     ConfigureOutputPlaneMode(pic_format);
 
-    if (pic_format.eStorageMode == AL_FB_RASTER && pic_format.uBitDepth == 10)
+    if (pic_format.uBitDepth == 10)
     {
         pic_format.eSamplePackMode = AL_SAMPLE_PACK_MODE_PACKED_XV;
     }
