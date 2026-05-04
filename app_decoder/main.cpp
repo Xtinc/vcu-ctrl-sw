@@ -105,11 +105,9 @@ int main(int argc, char **argv)
         AL_TDimension last_dim { 0, 0 };
 
         RTDecoder decoder(cfg, [&](AL_TBuffer *frame, AL_TInfoDecode const &info) {
-            if (info.eOutputID != AL_OUTPUT_MAIN && info.eOutputID != AL_OUTPUT_POSTPROC)
-            {
-                return;
-            }
-
+            // Note: RTDecoder guarantees this callback only receives main/postproc frames
+            
+            // Apply crop information to display metadata
             auto *display_meta = reinterpret_cast<AL_TDisplayInfoMetaData *>(
                 AL_Buffer_GetMetaData(frame, AL_META_TYPE_DISPLAY_INFO));
             if (display_meta)

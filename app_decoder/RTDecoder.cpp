@@ -3,15 +3,15 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
-#include <string>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 extern "C"
 {
+#include "lib_common/BufCommon.h"
 #include "lib_common/BufferAPI.h"
 #include "lib_common/BufferPictureDecMeta.h"
-#include "lib_common/BufCommon.h"
 #include "lib_common/DisplayInfoMeta.h"
 #include "lib_common/FourCC.h"
 #include "lib_common/PicFormat.h"
@@ -94,10 +94,9 @@ static size_t ReadSizedChunk(std::ifstream &input, std::ifstream &sizes, AL_TBuf
     flags = AL_STREAM_BUF_FLAG_ENDOFSLICE | AL_STREAM_BUF_FLAG_ENDOFFRAME;
     return static_cast<size_t>(frame_size);
 }
-}
+} // namespace
 
-RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
-    : m_cfg(cfg), m_frame_cb(std::move(cb))
+RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb) : m_cfg(cfg), m_frame_cb(std::move(cb))
 {
     try
     {
@@ -143,17 +142,18 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
             throw std::runtime_error("RTDecoder: failed to create MCU decoder scheduler");
         }
 
-        m_callbacks.displayCB = { &RTDecoder::s_display, this };
-        m_callbacks.resolutionFoundCB = { &RTDecoder::s_resolution_found, this };
-        m_callbacks.errorCB = { &RTDecoder::s_error, this };
+        m_cbbundles.displayCB = {&RTDecoder::sdk_display, this};
+        m_cbbundles.resolutionFoundCB = {&RTDecoder::sdk_resolution_found, this};
+        m_cbbundles.errorCB = {&RTDecoder::sdk_error, this};
 
-        auto create_err = AL_Decoder_Create(&m_decoder, m_scheduler, m_allocator, &m_dec_settings, &m_callbacks);
+        auto create_err = AL_Decoder_Create(&m_decoder, m_scheduler, m_allocator, &m_dec_settings, &m_cbbundles);
         if (AL_IS_ERROR_CODE(create_err) || !m_decoder)
         {
             throw std::runtime_error(std::string("AL_Decoder_Create failed: ") + AL_Codec_ErrorToString(create_err));
         }
 
-        if (!m_input_pool.Init(m_allocator, m_cfg.input_buffer_num, m_cfg.input_buffer_size, nullptr, "rt_decoder_input"))
+        if (!m_input_pool.Init(m_allocator, m_cfg.input_buffer_num, m_cfg.input_buffer_size, nullptr,
+                               "rt_decoder_input"))
         {
             throw std::runtime_error("RTDecoder: failed to init input buffer pool");
         }
@@ -257,75 +257,80 @@ bool RTDecoder::decode_file(const std::string &bitstream_path, const std::string
 
     try
     {
-    m_input_pool.Commit();
-    pool_committed = true;
+        m_input_pool.Commit();
+        pool_committed = true;
 
-    while (true)
-    {
-        if (AL_IS_ERROR_CODE(m_last_error.load()))
+        while (true)
         {
-            throw std::runtime_error("RTDecoder: decoder reported an asynchronous error");
+            // Check if decoder reported an error asynchronously (from callbacks)
+            if (AL_IS_ERROR_CODE(m_last_error.load()))
+            {
+                throw std::runtime_error("RTDecoder: decoder reported an asynchronous error");
+            }
+
+            auto pInput = m_input_pool.GetSharedBuffer(AL_BUF_MODE_BLOCK);
+            if (!pInput)
+            {
+                throw std::runtime_error("RTDecoder: input buffer pool returned null buffer");
+            }
+
+            uint8_t flags = AL_STREAM_BUF_FLAG_UNKNOWN;
+            size_t read_bytes = 0;
+
+            if (m_cfg.input_mode == AL_DEC_SPLIT_INPUT)
+            {
+                read_bytes = ReadSizedChunk(input, split_sizes, pInput.get(), flags);
+            }
+            else
+            {
+                auto *dst = AL_Buffer_GetData(pInput.get());
+                auto cap = AL_Buffer_GetSize(pInput.get());
+                input.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(cap));
+                read_bytes = static_cast<size_t>(input.gcount());
+            }
+
+            if (read_bytes == 0)
+            {
+                break;
+            }
+
+            if (!AL_Decoder_PushStreamBuffer(m_decoder, pInput.get(), read_bytes, flags))
+            {
+                auto err = AL_Decoder_GetLastError(m_decoder);
+                m_last_error = err;
+                throw std::runtime_error(std::string("RTDecoder: push stream buffer failed: ") +
+                                         AL_Codec_ErrorToString(err));
+            }
         }
 
-        auto pInput = m_input_pool.GetSharedBuffer(AL_BUF_MODE_BLOCK);
-        if (!pInput)
-        {
-            throw std::runtime_error("RTDecoder: input buffer pool returned null buffer");
-        }
+        // Signal end of stream to decoder
+        AL_Decoder_Flush(m_decoder);
 
-        uint8_t flags = AL_STREAM_BUF_FLAG_UNKNOWN;
-        size_t read_bytes = 0;
+        // Wait for decoder to finish processing all frames
+        std::unique_lock<std::mutex> lock(m_state_mutex);
+        bool finished = false;
 
-        if (m_cfg.input_mode == AL_DEC_SPLIT_INPUT)
+        if (m_cfg.timeout_ms == 0)
         {
-            read_bytes = ReadSizedChunk(input, split_sizes, pInput.get(), flags);
+            m_done_cv.wait(lock, [this]() { return m_done; });
+            finished = true;
         }
         else
         {
-            auto *dst = AL_Buffer_GetData(pInput.get());
-            auto cap = AL_Buffer_GetSize(pInput.get());
-            input.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(cap));
-            read_bytes = static_cast<size_t>(input.gcount());
+            finished =
+                m_done_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.timeout_ms), [this]() { return m_done; });
         }
 
-        if (read_bytes == 0)
+        m_input_pool.Decommit();
+        pool_committed = false;
+
+        if (!finished)
         {
-            break;
+            m_last_error = AL_ERROR;
+            throw std::runtime_error("RTDecoder: timeout while waiting for EOS");
         }
 
-        if (!AL_Decoder_PushStreamBuffer(m_decoder, pInput.get(), read_bytes, flags))
-        {
-            auto err = AL_Decoder_GetLastError(m_decoder);
-            m_last_error = err;
-            throw std::runtime_error(std::string("RTDecoder: push stream buffer failed: ") + AL_Codec_ErrorToString(err));
-        }
-    }
-
-    AL_Decoder_Flush(m_decoder);
-
-    std::unique_lock<std::mutex> lock(m_state_mutex);
-    bool finished = false;
-
-    if (m_cfg.timeout_ms == 0)
-    {
-        m_done_cv.wait(lock, [this]() { return m_done; });
-        finished = true;
-    }
-    else
-    {
-        finished = m_done_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.timeout_ms), [this]() { return m_done; });
-    }
-
-    m_input_pool.Decommit();
-    pool_committed = false;
-
-    if (!finished)
-    {
-        m_last_error = AL_ERROR;
-        throw std::runtime_error("RTDecoder: timeout while waiting for EOS");
-    }
-
-    return !AL_IS_ERROR_CODE(m_last_error.load());
+        return !AL_IS_ERROR_CODE(m_last_error.load());
     }
     catch (...)
     {
@@ -352,7 +357,7 @@ AL_ERR RTDecoder::last_error() const
     return m_last_error.load();
 }
 
-AL_ERR RTDecoder::s_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
+AL_ERR RTDecoder::sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                      AL_TCropInfo const *pCropInfo, void *pUserParam)
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
@@ -367,7 +372,7 @@ AL_ERR RTDecoder::s_resolution_found(int iBufferNumber, AL_TStreamSettings const
     }
 }
 
-void RTDecoder::s_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam)
+void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam)
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
     try
@@ -380,7 +385,7 @@ void RTDecoder::s_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUser
     }
 }
 
-void RTDecoder::s_error(AL_ERR eError, void *pUserParam)
+void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
     self->on_error(eError);
@@ -391,6 +396,7 @@ AL_ERR RTDecoder::on_resolution_found(int iBufferNumber, AL_TStreamSettings cons
 {
     (void)pCropInfo;
 
+    // Configure output settings based on stream properties
     configure_output_settings(*pStreamSettings);
 
     if (!AL_Decoder_ConfigureOutputSettings(m_decoder, &m_output_settings))
@@ -398,25 +404,29 @@ AL_ERR RTDecoder::on_resolution_found(int iBufferNumber, AL_TStreamSettings cons
         return AL_ERR_REQUEST_MALFORMED;
     }
 
+    // Calculate buffer dimensions (rounded up to 64-pixel alignment for hardware)
     AL_TDimension out_dim = pStreamSettings->tDim;
     out_dim.iWidth = RoundUp(out_dim.iWidth, 64);
     out_dim.iHeight = RoundUp(out_dim.iHeight, 64);
 
     const int min_pitch = AL_Decoder_GetMinPitch(out_dim.iWidth, &m_output_settings.tPicFormat);
 
+    // Check if existing reconstruction buffer pool can be reused
     if (m_rec_pool_initialized)
     {
         return can_reuse_rec_pool(m_output_settings.tPicFormat, out_dim, min_pitch) ? AL_SUCCESS : AL_ERR_NO_MEMORY;
     }
-
+    // Configure and initialize the reconstruction buffer pool
     configure_rec_pool(m_output_settings.tPicFormat, out_dim, min_pitch);
 
+    // Allocate one extra buffer beyond decoder's requirement
     const int num_buf = iBufferNumber + 1;
     if (!m_rec_pool.Init(m_allocator, num_buf, "rt_decoder_rec"))
     {
         return AL_ERR_NO_MEMORY;
     }
 
+    // Create and push all reconstruction buffers to the decoder
     for (int i = 0; i < num_buf; ++i)
     {
         auto pDecPict = m_rec_pool.GetSharedBuffer(AL_BUF_MODE_NONBLOCK);
@@ -426,10 +436,14 @@ AL_ERR RTDecoder::on_resolution_found(int iBufferNumber, AL_TStreamSettings cons
         }
 
         AL_Buffer_Cleanup(pDecPict.get());
+
+        // Attach metadata for decoded picture information
         if (!attach_display_metadata(pDecPict.get()))
         {
             return AL_ERR_NO_MEMORY;
         }
+
+        // Give buffer to decoder for use during decoding            return AL_ERR_NO_MEMORY;
 
         if (!AL_Decoder_PutDisplayPicture(m_decoder, pDecPict.get()))
         {
@@ -446,20 +460,25 @@ AL_ERR RTDecoder::on_resolution_found(int iBufferNumber, AL_TStreamSettings cons
 
 void RTDecoder::on_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 {
+    // End of stream: both pFrame and pInfo are NULL
     if (IsEndOfStream(pFrame, pInfo))
     {
         signal_done();
         return;
     }
 
-    if (IsReleaseFrame(pFrame, pInfo) || !pInfo)
+    // Release frame: pFrame is valid but pInfo is NULL
+    // This means the decoder is releasing a buffer without display info
+    if (IsReleaseFrame(pFrame, pInfo))
     {
         return;
     }
 
+    // Take a reference to the frame buffer for processing
     AL_Buffer_Ref(pFrame);
     AL_Buffer_InvalidateMemory(pFrame);
 
+    // Check for frame-level errors
     auto frame_err = AL_Decoder_GetFrameError(m_decoder, pFrame);
     if (AL_IS_ERROR_CODE(frame_err))
     {
@@ -475,10 +494,12 @@ void RTDecoder::on_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     bool is_main = IsMainDisplay(*pInfo);
 
+    // Process only main display frames (not reference frames)
     if (is_main)
     {
         ++m_num_decoded;
 
+        // Call user callback with decoded frame
         try
         {
             m_frame_cb(pFrame, *pInfo);
@@ -491,12 +512,14 @@ void RTDecoder::on_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         }
     }
 
+    // Check if we should return buffer to decoder for reuse
     bool allow_pushback = false;
     {
         std::lock_guard<std::mutex> lock(m_state_mutex);
         allow_pushback = m_allow_pushback;
     }
 
+    // Return the buffer to decoder pool if allowed (and it's a main display frame)
     if (is_main && allow_pushback)
     {
         if (!AL_Decoder_PutDisplayPicture(m_decoder, pFrame))
@@ -507,6 +530,7 @@ void RTDecoder::on_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         }
     }
 
+    // Release our local reference (decoder holds another reference if we pushed it back)
     AL_Buffer_Unref(pFrame);
 }
 
@@ -583,7 +607,7 @@ void RTDecoder::configure_rec_pool(AL_TPicFormat const &pic_format, AL_TDimensio
                         ? pitch_y
                         : AL_GetChromaPitch(fourcc, pitch_y);
 
-        plane_descs.push_back(AL_TPlaneDescription { used_planes[i], offset, pitch });
+        plane_descs.push_back(AL_TPlaneDescription{used_planes[i], offset, pitch});
         offset += AL_DecGetAllocSize_Frame_PixPlane(&pic_format, dim, pitch, used_planes[i]);
     }
 
