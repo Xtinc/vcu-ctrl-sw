@@ -2,3 +2,4 @@ build
 cmake-build
 *.md
 *.json
+.vs
