@@ -129,8 +129,8 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
 
     : m_fps(0.0), m_bitrate(0), m_frame_count(0), m_bytes_count(0), m_fps_last_time(std::chrono::steady_clock::now()),
       m_cfg(cfg), m_callback(std::move(cb)), m_dma_proxy(cfg.dma_dev_path.c_str()), m_pAllocator(nullptr),
-      m_pScheduler(nullptr), m_pic_format{}, m_src_fourcc{}, m_stopped(false), m_eos_signaled(false), m_error(false),
-      m_lib_initialized(false)
+      m_pScheduler(nullptr), m_hEnc(nullptr), m_pic_format{}, m_src_fourcc{}, m_lib_initialized(false)
+// m_state is brace-initialized to State::Running in the class definition.
 {
     try
     {
@@ -242,7 +242,7 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
 
 RTEncoderBase::~RTEncoderBase()
 {
-    if (!m_stopped.load())
+    if (m_state.load() == State::Running)
     {
         try
         {
@@ -252,6 +252,10 @@ RTEncoderBase::~RTEncoderBase()
         {
         }
     }
+
+    // Enter Stopping before AL_Encoder_Destroy so that any drain callbacks
+    // fired during destroy cannot call PutStreamBuffer on a dead handle.
+    m_state.store(State::Stopping, std::memory_order_release);
 
     if (m_hEnc)
     {
@@ -292,9 +296,10 @@ RTEncoderBase::~RTEncoderBase()
 
 void RTEncoderBase::flush()
 {
-    if (m_stopped.exchange(true))
+    State expected = State::Running;
+    if (!m_state.compare_exchange_strong(expected, State::Flushing))
     {
-        return; // Already stopped
+        return; // already Flushing, Done, or Stopping
     }
 
     if (m_source_buf_pool)
@@ -305,15 +310,16 @@ void RTEncoderBase::flush()
     const auto eos_queued = AL_Encoder_Process(m_hEnc, nullptr, nullptr);
     if (!eos_queued)
     {
-        m_error.store(true);
+        m_state.store(State::Done);
         throw std::runtime_error("flush failed: unable to queue EOS");
     }
 
+    auto is_done = [this] { return m_state.load(std::memory_order_relaxed) >= State::Done; };
     std::unique_lock<std::mutex> lock(m_eos_mutex);
-    const auto got_eos = m_eos_cond.wait_for(lock, std::chrono::seconds(10), [this] { return m_eos_signaled; });
+    const auto got_eos = m_eos_cond.wait_for(lock, std::chrono::seconds(10), is_done);
     if (!got_eos)
     {
-        m_error.store(true);
+        m_state.store(State::Done);
         throw std::runtime_error("flush timeout: EOS callback not received");
     }
 }
@@ -355,7 +361,6 @@ bool RTEncoderBase::set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
     if (!ok)
     {
         VIDEO_ERROR_PRINT("set_bitrate failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
-        m_error.store(true);
         return false;
     }
 
@@ -376,7 +381,6 @@ bool RTEncoderBase::set_framerate(uint32_t uFrameRate, uint32_t uClkRatio)
     if (!AL_Encoder_SetFrameRate(m_hEnc, uFrameRate, uClkRatio))
     {
         VIDEO_ERROR_PRINT("set_framerate failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
-        m_error.store(true);
         return false;
     }
 
@@ -405,7 +409,6 @@ bool RTEncoderBase::set_resolution(uint32_t uWidth, uint32_t uHeight)
     if (!AL_Encoder_SetInputResolution(m_hEnc, dim))
     {
         VIDEO_ERROR_PRINT("set_resolution failed: %s", AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
-        m_error.store(true);
         return false;
     }
 
@@ -467,9 +470,7 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
     // eos
     if (!pStream && !pSrc)
     {
-        std::unique_lock<std::mutex> lock(m_eos_mutex);
-        m_eos_signaled = true;
-        m_eos_cond.notify_all();
+        signal_done();
         return;
     }
 
@@ -478,7 +479,7 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
     if (AL_IS_ERROR_CODE(encErr))
     {
         VIDEO_ERROR_PRINT("encoder error: %s", AL_Codec_ErrorToString(encErr));
-        m_error.store(true);
+        signal_done(); // fatal: wake flush() waiter
     }
     else if (AL_IS_WARNING_CODE(encErr))
     {
@@ -503,17 +504,22 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
                 }
                 catch (...)
                 {
-                    m_error.store(true);
+                    signal_done();
                 }
             }
         }
         AL_StreamMetaData_ClearAllSections(pMeta);
     }
 
-    if (!AL_Encoder_PutStreamBuffer(m_hEnc, pStream))
+    // Only return the stream buffer while the pipeline is alive.
+    auto s = m_state.load(std::memory_order_relaxed);
+    if (s == State::Running || s == State::Flushing)
     {
-        VIDEO_ERROR_PRINT("Failed to put stream buffer back to encoder");
-        m_error.store(true);
+        if (!AL_Encoder_PutStreamBuffer(m_hEnc, pStream))
+        {
+            VIDEO_ERROR_PRINT("Failed to put stream buffer back to encoder");
+            signal_done();
+        }
     }
 
     if (eof)
@@ -547,6 +553,17 @@ void RTEncoderBase::update_frame_rate()
     m_fps_last_time = now;
     m_frame_count = 0;
     m_bytes_count = 0;
+}
+
+void RTEncoderBase::signal_done()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_eos_mutex);
+        State cur = m_state.load(std::memory_order_relaxed);
+        if (cur == State::Running || cur == State::Flushing)
+            m_state.store(State::Done, std::memory_order_relaxed);
+    }
+    m_eos_cond.notify_all();
 }
 
 void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
@@ -686,7 +703,6 @@ void RTEncoderBase::push_stream_buffers()
 
         if (!AL_Encoder_PutStreamBuffer(m_hEnc, pBuf))
         {
-            m_error.store(true);
             AL_Buffer_Unref(pBuf);
             throw std::runtime_error("Failed to put stream buffer to encoder");
         }
@@ -702,7 +718,7 @@ RTEncoder<SourceMode::FILE>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCal
 
 AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
 {
-    if (m_stopped.load() || m_error.load())
+    if (m_state.load() != State::Running)
     {
         return nullptr;
     }
@@ -727,14 +743,14 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
 
     AL_BufferGuard buf_guard(pBuf, &AL_Buffer_Unref);
 
-    if (!m_hEnc || m_stopped.load() || m_error.load())
+    if (!m_hEnc || m_state.load() != State::Running)
     {
         return false;
     }
 
     if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))
     {
-        m_error.store(true);
+        signal_done();
         return false;
     }
     return true;
@@ -890,7 +906,7 @@ DMAFdArray RTEncoder<SourceMode::V4L2>::acquire_dma_buffers(unsigned int count)
 
 bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
 {
-    if (m_stopped.load() || m_error.load() || !pBuf)
+    if (m_state.load() != State::Running || !pBuf)
     {
         return false;
     }
@@ -899,7 +915,7 @@ bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
     {
         VIDEO_ERROR_PRINT("Failed to submit source buffer to encoder: %s",
                           AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
-        m_error.store(true);
+        signal_done();
         return false;
     }
 
@@ -923,7 +939,7 @@ void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
     }
     catch (const std::exception &e)
     {
-        m_error.store(true);
+        signal_done();
         VIDEO_ERROR_PRINT("Exception in source release callback: %s", e.what());
     }
 }

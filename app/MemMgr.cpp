@@ -191,17 +191,17 @@ size_t BufPool::available_count()
 
 void BufPool::commit()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_decommitted = false;
+}
+
+void BufPool::decommit()
+{
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_decommitted = true;
     }
     m_cond.notify_all();
-}
-
-void BufPool::decommit()
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_decommitted = false;
 }
 
 BufPool::BufPool() : m_pAllocator(nullptr), m_capacity(0), m_decommitted(false)

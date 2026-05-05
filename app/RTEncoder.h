@@ -44,9 +44,55 @@ enum class SourceMode
     V4L2
 };
 
+/**
+ * @brief RTEncoderBase is a hardware-accelerated video encoder wrapper for the Allegro DVT VCU SDK.
+ *
+ * This class manages the full encoder lifecycle: SDK initialization, DMA allocator and MCU scheduler
+ * creation, source/stream buffer pool management, GOP and rate-control parameter application, and
+ * thread-safe state transitions. Concrete subclasses (RTEncoder<FILE> and RTEncoder<V4L2>) provide
+ * source-buffer acquisition and release strategies.
+ *
+ * Lifecycle state machine (single atomic state):
+ *
+ *   RUNNING:
+ *     submit_source_buffer  -> submits frame, stays in RUNNING
+ *     flush()               -> transitions to FLUSHING
+ *     fatal SDK error       -> signal_done() -> DONE
+ *     destructor            -> flush() then STOPPING
+ *   FLUSHING:
+ *     EOS callback received -> signal_done() -> DONE
+ *     fatal SDK error       -> signal_done() -> DONE
+ *     flush() CV wakes      -> caller returns (state == DONE)
+ *   DONE:
+ *     flush() returns to caller
+ *     destructor sets       -> STOPPING
+ *   STOPPING:
+ *     terminal state set by destructor before AL_Encoder_Destroy;
+ *     all stream-buffer return calls are suppressed in this state
+ *
+ * Thread safety:
+ *   - submit_source_buffer() / flush() must be called from a single producer thread.
+ *   - SDK callbacks (on_encoded_frame) execute on an internal SDK thread.
+ *   - m_state is std::atomic; m_cfg is protected by m_cfg_mutex.
+ *
+ * Typical usage (FILE mode):
+ * @code
+ *   EncoderConfig cfg;
+ *   cfg.width = 1920; cfg.height = 1080;
+ *   RTEncoderFile enc(cfg, [](const uint8_t *data, size_t sz){ write(data, sz); });
+ *
+ *   while (have_frames) {
+ *       auto *buf = enc.acquire_source_buffer();
+ *       fill(buf);
+ *       enc.submit_source_buffer(buf);
+ *   }
+ *   enc.flush(); // blocks until EOS or timeout
+ * @endcode
+ */
 class RTEncoderBase
 {
   public:
+    /// Callback invoked for each encoded NAL unit / AU on the SDK thread.
     using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size)>;
     virtual ~RTEncoderBase();
 
@@ -55,22 +101,76 @@ class RTEncoderBase
     RTEncoderBase(RTEncoderBase &&) = delete;
     RTEncoderBase &operator=(RTEncoderBase &&) = delete;
 
-    // throw std::runtime_error on failure (e.g., EOS timeout)
+    /**
+     * @brief Flush the encoder: queue EOS and block until the EOS callback is received.
+     *
+     * Transitions state from Running -> Flushing. Waits up to 10 seconds for the SDK
+     * to drain all pending frames and deliver the EOS callback. If already flushed or
+     * stopped, returns immediately without error.
+     *
+     * @throw std::runtime_error if EOS cannot be queued or the wait times out.
+     */
     void flush();
+
+    /**
+     * @brief Force the encoder to insert an IDR frame at the next opportunity.
+     */
     void request_IDR();
+
+    /**
+     * @brief Dynamically update the target (and optionally peak) bitrate.
+     * @param uTargetBitRate Target bitrate in bps. Must be > 0.
+     * @param uMaxBitRate    VBR peak bitrate in bps. 0 = same as target (CBR).
+     * @return true on success, false on invalid arguments or SDK rejection.
+     */
     bool set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate = 0);
+
+    /**
+     * @brief Dynamically update the encode frame rate.
+     * @param uFrameRate  Frame rate numerator. Must be > 0.
+     * @param uClkRatio   Frame rate denominator (final fps = uFrameRate * 1000 / uClkRatio). Must be > 0.
+     * @return true on success, false on invalid arguments or SDK rejection.
+     */
     bool set_framerate(uint32_t uFrameRate, uint32_t uClkRatio = 1000);
+
+    /**
+     * @brief Dynamically change the active encoding resolution.
+     *
+     * Must not exceed the maximum dimensions (kMaxWidth × kMaxHeight) used at encoder creation.
+     *
+     * @param uWidth  New frame width in pixels. Must be > 0.
+     * @param uHeight New frame height in pixels. Must be > 0.
+     * @return true on success, false on out-of-range or SDK rejection.
+     */
     bool set_resolution(uint32_t uWidth, uint32_t uHeight);
 
+    /** @return The source buffer FourCC code expected by the encoder. */
     TFourCC src_fourCC() const;
+
+    /** @return The source bit depth (8 or 10). */
     uint8_t src_bitdepth() const;
+
+    /** @return The source chroma sampling format. */
     AL_EChromaMode src_chroma() const;
+
+    /** @return The current encoding resolution. Thread-safe (protected by m_cfg_mutex). */
     AL_TDimension src_resolution() const;
+
+    /**
+     * @brief Return the latest exponential-moving-average throughput statistics.
+     * @return {fps, bitrate_bps} pair. Values are 0.0 until at least 100 frames have been encoded.
+     */
     std::pair<double, double> fps() const;
 
   protected:
-    // CTOR throw std::runtime_error on initialization failure (e.g., hardware init, encoder creation)
+    /**
+     * @brief Construct the base encoder: initialize SDK, allocator, scheduler, buffer pools, and encoder handle.
+     * @param cfg Configuration parameters.
+     * @param cb  Encoded data callback. Must not be null.
+     * @throw std::runtime_error on any initialization failure. All partially allocated resources are released.
+     */
     explicit RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb);
+    void signal_done();
 
   private:
     static void sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID);
@@ -106,12 +206,17 @@ class RTEncoderBase
     AL_TPicFormat m_pic_format;
     TFourCC m_src_fourcc;
 
-    std::atomic<bool> m_stopped;
+    enum class State : uint8_t
+    {
+        Running = 0,  ///< Normal encoding: accepts frame input, allows stream buffer return
+        Flushing = 1, ///< Draining: no new input accepted, waiting for EOS callback
+        Done = 2,     ///< Terminal: EOS received or fatal error; wakes flush() waiter
+        Stopping = 3, ///< Destructor guard: stream buffer return suppressed (AL_Encoder_Destroy imminent)
+    };
+    std::atomic<State> m_state{State::Running};
+
     std::mutex m_eos_mutex;
     std::condition_variable m_eos_cond;
-    bool m_eos_signaled;
-
-    std::atomic<bool> m_error;
     bool m_lib_initialized;
 };
 
@@ -119,29 +224,102 @@ template <SourceMode mode> class RTEncoder;
 using RTEncoderFile = RTEncoder<SourceMode::FILE>;
 using RTEncoderV4L2 = RTEncoder<SourceMode::V4L2>;
 
+/**
+ * @brief File/software source encoder: the caller owns the source buffer lifecycle.
+ *
+ * The caller acquires a source buffer via acquire_source_buffer(), fills it with raw YUV data,
+ * then hands it back via submit_source_buffer(). Ownership transfers to the encoder on submit;
+ * the buffer is automatically returned to the pool via the source-release callback.
+ */
 template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
 {
   public:
+    /**
+     * @brief Construct a FILE-mode encoder.
+     * @param cfg Configuration parameters.
+     * @param cb  Encoded data callback.
+     * @throw std::runtime_error on initialization failure.
+     */
     RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
     ~RTEncoder() override = default;
 
+    /**
+     * @brief Acquire an idle source buffer from the pool.
+     *
+     * Blocks until a buffer becomes available (or the pool is decommitted on flush).
+     *
+     * @return Non-null AL_TBuffer* ready for writing, or nullptr if stopped/error.
+     */
     AL_TBuffer *acquire_source_buffer();
+
+    /**
+     * @brief Submit a filled source buffer to the encoder for encoding.
+     *
+     * Ownership transfers to the encoder; do not access @p pBuf after this call.
+     * The RAII guard inside this function unrefs the buffer regardless of success.
+     *
+     * @param pBuf Buffer previously returned by acquire_source_buffer(). Must not be null.
+     * @return true if the frame was accepted, false on encoder error or invalid state.
+     */
     bool submit_source_buffer(AL_TBuffer *pBuf);
 
   private:
     void release_sources(AL_TBuffer const *pSrc) override;
 };
 
+/**
+ * @brief V4L2 DMABUF source encoder: zero-copy pipeline from V4L2Source to VCU encoder.
+ *
+ * DMA buffers are pre-allocated by the encoder pool, exported as DMA-BUF file descriptors
+ * via acquire_dma_buffers(), and imported by V4L2Source. After the V4L2 device fills a buffer
+ * and it is dequeued, the caller submits it directly to the encoder via submit_source_buffer().
+ * When the SDK is done with the buffer the registered SourceReleaseCallback fires so the caller
+ * can requeue it back to V4L2.
+ */
 template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
 {
   public:
+    /// Callback invoked on the SDK thread when the encoder has finished reading a source buffer.
     using SourceReleaseCallback = std::function<void(AL_TBuffer const *pSrc)>;
 
+    /**
+     * @brief Construct a V4L2 DMABUF-mode encoder.
+     * @param cfg Configuration parameters.
+     * @param cb  Encoded data callback.
+     * @throw std::runtime_error on initialization failure.
+     */
     RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
     ~RTEncoder() override;
 
+    /**
+     * @brief Register the callback invoked when the SDK releases a source buffer.
+     *
+     * The callback is called from the SDK internal thread. It should requeue the buffer
+     * to V4L2Source. Thread-safe; may be called at any time before or during streaming.
+     *
+     * @param releaseCb Callback receiving the AL_TBuffer* identity of the released buffer.
+     */
     void set_release_callback(SourceReleaseCallback releaseCb);
+
+    /**
+     * @brief Acquire @p count source buffers from the pool and return their DMA-BUF descriptors.
+     *
+     * Each returned DMAFd carries an AL_TBuffer reference. The descriptors are intended to be
+     * imported by V4L2Source::import_fds(). The DMAFd destructor unrefs the buffer.
+     *
+     * @param count Number of DMA buffer descriptors to acquire. Must not exceed pool capacity.
+     * @return DMAFdArray of the requested descriptors, or empty on failure.
+     */
     DMAFdArray acquire_dma_buffers(unsigned int count);
+
+    /**
+     * @brief Submit a DMA source buffer (dequeued from V4L2) to the encoder.
+     *
+     * Does not transfer ownership; the buffer will be returned via SourceReleaseCallback.
+     *
+     * @param pBuf AL_TBuffer* identity obtained from a V4L2 dequeue operation. Must not be null.
+     * @return true if accepted, false on invalid state or SDK error.
+     */
     bool submit_source_buffer(AL_TBuffer *pBuf);
 
   private:

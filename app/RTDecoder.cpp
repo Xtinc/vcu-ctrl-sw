@@ -21,7 +21,8 @@ using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
 
 RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
     : m_cfg(cfg), m_callback(std::move(cb)), m_pAllocator(nullptr), m_pScheduler(nullptr), m_hDec(nullptr),
-      m_cbbundles{}, m_lib_initialized(false)
+      m_cbbundles{}, m_state{State::Running}, m_fps(0.0), m_frame_count(0),
+      m_fps_last_time(std::chrono::steady_clock::now()), m_lib_initialized(false)
 {
     try
     {
@@ -90,7 +91,7 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
 
 RTDecoder::~RTDecoder()
 {
-    if (!m_stopped.load())
+    if (m_state.load() == State::Running)
     {
         try
         {
@@ -102,13 +103,13 @@ RTDecoder::~RTDecoder()
         }
     }
 
-    m_allow_pushback = false;
+    m_state.store(State::Stopping, std::memory_order_release);
     cleanup();
 }
 
 bool RTDecoder::push_stream(const void *data, size_t size, uint8_t flags)
 {
-    if (m_stopped.load() || m_error.load())
+    if (m_state.load() != State::Running)
     {
         return false;
     }
@@ -119,18 +120,17 @@ bool RTDecoder::push_stream(const void *data, size_t size, uint8_t flags)
         return false;
     }
 
+    AL_BufferGuard buf_guard(buf, &AL_Buffer_Unref);
     if (size > AL_Buffer_GetSize(buf))
     {
         VIDEO_ERROR_PRINT("Input stream size %zu exceeds buffer capacity %zu", size, AL_Buffer_GetSize(buf));
-        AL_Buffer_Unref(buf);
         return false;
     }
 
     std::memcpy(AL_Buffer_GetData(buf), data, size);
-
     if (!AL_Decoder_PushStreamBuffer(m_hDec, buf, size, flags))
     {
-        m_error = true;
+        signal_error(AL_ERROR);
         return false;
     }
 
@@ -139,30 +139,32 @@ bool RTDecoder::push_stream(const void *data, size_t size, uint8_t flags)
 
 void RTDecoder::flush()
 {
-    if (m_stopped.exchange(true))
+    State expected = State::Running;
+    if (!m_state.compare_exchange_strong(expected, State::Flushing))
     {
-        return;
+        return; // already Flushing, Done, or Stopping
     }
 
     m_src_buf_pool->decommit();
     AL_Decoder_Flush(m_hDec);
 
+    auto is_done = [this] { return m_state.load(std::memory_order_relaxed) >= State::Done; };
+
     std::unique_lock<std::mutex> lock(m_eos_mutex);
     bool ok;
     if (m_cfg.flush_timeout_ms == 0)
     {
-        m_eos_cv.wait(lock, [this] { return m_eos_signaled; });
+        m_eos_cv.wait(lock, is_done);
         ok = true;
     }
     else
     {
-        ok = m_eos_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.flush_timeout_ms),
-                               [this] { return m_eos_signaled; });
+        ok = m_eos_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.flush_timeout_ms), is_done);
     }
 
     if (!ok)
     {
-        m_error = true;
+        m_state.store(State::Done); // force terminal even on timeout
         throw std::runtime_error("RTDecoder: flush timeout waiting for EOS");
     }
 }
@@ -191,14 +193,19 @@ void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUs
     }
     catch (...)
     {
-        self->on_sdk_error(AL_ERROR);
+        self->signal_error(AL_ERROR);
     }
 }
 
 void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
-    self->on_sdk_error(eError);
+    // Warnings (e.g. AL_WARN_CONCEAL_DETECT) do not stop the pipeline;
+    // they are already surfaced per-frame via AL_Decoder_GetFrameError.
+    if (AL_IS_ERROR_CODE(eError))
+    {
+        self->signal_error(eError);
+    }
 }
 
 AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
@@ -231,6 +238,7 @@ AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings 
     for (int i = 0; i < num_buf; ++i)
     {
         auto pDecPict = m_rec_buf_pool->get_buffer(false);
+        AL_BufferGuard dec_pict_guard(pDecPict, &AL_Buffer_Unref);
         if (!pDecPict)
         {
             return AL_ERR_NO_MEMORY;
@@ -240,13 +248,11 @@ AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings 
 
         if (!attach_display_metadata(pDecPict))
         {
-            AL_Buffer_Unref(pDecPict);
             return AL_ERR_NO_MEMORY;
         }
 
         if (!AL_Decoder_PutDisplayPicture(m_hDec, pDecPict))
         {
-            AL_Buffer_Unref(pDecPict);
             return AL_ERR_REQUEST_MALFORMED;
         }
     }
@@ -281,12 +287,12 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         signal_error(fr_err);
         return;
     }
-    else if (fr_err == AL_WARN_CONCEAL_DETECT || fr_err == AL_WARN_HW_CONCEAL_DETECT ||
-             fr_err == AL_WARN_INVALID_ACCESS_UNIT_STRUCTURE)
-    {
-        // m_num_concealed++;
-        return;
-    }
+    // Concealment warnings (AL_WARN_CONCEAL_DETECT, AL_WARN_HW_CONCEAL_DETECT,
+    // AL_WARN_INVALID_ACCESS_UNIT_STRUCTURE) do NOT abort processing.
+    // The frame is still a valid displayable picture (with concealment artifacts).
+    // Falling through ensures the buffer is delivered to the callback and then
+    // returned to the decoder via PutDisplayPicture, preventing pool depletion.
+    // m_num_concealed += (fr_err != AL_SUCCESS);
 
     bool is_main = pInfo->eOutputID == AL_OUTPUT_MAIN || pInfo->eOutputID == AL_OUTPUT_POSTPROC;
 
@@ -308,20 +314,31 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         return;
     }
 
-    if (m_allow_pushback.load(std::memory_order_relaxed))
+    update_fps();
+
+    // Only return the frame to the decoder while the pipeline is alive.
+    // During normal flush (Flushing state) we continue returning buffers
+    // so the hardware pipeline keeps draining.
+    auto s = m_state.load(std::memory_order_relaxed);
+    if (s == State::Running || s == State::Flushing)
     {
         if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
+        {
             signal_error(AL_ERROR);
+        }
     }
 }
 
 void RTDecoder::on_sdk_error(AL_ERR eError)
 {
-    m_error = true;
     if (AL_IS_ERROR_CODE(eError))
     {
-        m_allow_pushback = false;
-        signal_done();
+        // Fatal: stop the pipeline and wake any waiter in flush().
+        signal_error(eError);
+    }
+    else if (AL_IS_WARNING_CODE(eError))
+    {
+        VIDEO_DEBUG_PRINT("Decoder warning: %s", AL_Codec_ErrorToString(eError));
     }
 }
 
@@ -378,7 +395,7 @@ bool RTDecoder::attach_display_metadata(AL_TBuffer *pDecPict)
         return false;
     }
 
-    auto *pDisplayInfoMeta = new AL_TDisplayInfoMetaData();
+    auto *pDisplayInfoMeta = AL_DisplayInfoMetaData_Create();
     if (!pDisplayInfoMeta || !AL_Buffer_AddMetaData(pDecPict, reinterpret_cast<AL_TMetaData *>(pDisplayInfoMeta)))
     {
         if (pDisplayInfoMeta)
@@ -408,16 +425,52 @@ bool RTDecoder::can_reuse_rec_pool(AL_TPicFormat const &pic_format, AL_TDimensio
 
 void RTDecoder::signal_done()
 {
-    std::lock_guard<std::mutex> lock(m_eos_mutex);
-    m_eos_signaled = true;
+    {
+        std::lock_guard<std::mutex> lock(m_eos_mutex);
+        // Only advance to Done from an active state; never overwrite Stopping
+        // (set by the destructor) as that would allow PutDisplayPicture again.
+        State cur = m_state.load(std::memory_order_relaxed);
+        if (cur == State::Running || cur == State::Flushing)
+        {
+            m_state.store(State::Done, std::memory_order_relaxed);
+        }
+    }
     m_eos_cv.notify_all();
 }
 
 void RTDecoder::signal_error(AL_ERR err)
 {
     VIDEO_ERROR_PRINT("Decoder error: %s", AL_Codec_ErrorToString(err));
-    m_error = true;
-    signal_done();
+    signal_done(); // Done state covers both clean EOS and fatal error
+}
+
+double RTDecoder::fps() const
+{
+    std::lock_guard<std::mutex> lock(m_fps_mutex);
+    return m_fps;
+}
+
+void RTDecoder::update_fps()
+{
+    if (++m_frame_count % 100 != 0)
+    {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_fps_last_time).count();
+    if (elapsed <= 0)
+    {
+        return;
+    }
+
+    double fps = (m_frame_count * 1000.0) / static_cast<double>(elapsed);
+    {
+        std::lock_guard<std::mutex> lock(m_fps_mutex);
+        m_fps = 0.1 * m_fps + 0.9 * fps;
+    }
+    m_fps_last_time = now;
+    m_frame_count = 0;
 }
 
 void RTDecoder::cleanup()
