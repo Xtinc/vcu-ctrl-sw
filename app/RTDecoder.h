@@ -23,7 +23,6 @@ struct DecoderConfig
     AL_ECodec codec = AL_CODEC_HEVC;                    ///< Video codec (HEVC or AVC).
     AL_EDecInputMode input_mode = AL_DEC_UNSPLIT_INPUT; ///< Stream framing mode fed to the decoder.
     uint32_t input_buffer_size = 512 * 1024;            ///< Size in bytes of each input stream buffer.
-    uint32_t flush_timeout_ms = 10000;                  ///< Maximum time to wait for EOS in flush(); 0 = unlimited.
     uint32_t input_buffer_num = 4;                      ///< Number of input stream buffers in the pool.
     std::string dec_dev_path = "/dev/allegroDecodeIP";  ///< Device file path of the VCU decode IP.
     bool low_delay_mode = false;                        ///< Enable low-latency (frame-level) decode mode.
@@ -152,13 +151,17 @@ class RTDecoder
      * @brief Signal end-of-stream and wait for all frames to be delivered.
      *
      * Sends an EOS marker to the hardware decoder and blocks until every
-     * pending decoded frame has been delivered via the DecodedFrameCallback.
+     * pending decoded frame has been delivered via the DecodedFrameCallback,
+     * or until DecoderConfig::flush_timeout_ms elapses.
      *
-     * @throws std::runtime_error  If the EOS wait exceeds
-     *                             DecoderConfig::flush_timeout_ms (when > 0).
-     * @note Calling flush() more than once is a no-op after the first call.
+     * Never throws. Safe to call after a network disconnect or any abnormal condition.
+     *
+     * @return @c true  EOS received — all frames have been delivered.
+     *         @c false EOS wait timed out (5 s).
+     * @note Calling flush() more than once is a no-op after the first call
+     *       and always returns @c true.
      */
-    void flush();
+    bool flush();
 
     /**
      * @brief Return the latest exponential-moving-average decode frame rate.

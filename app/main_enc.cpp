@@ -241,12 +241,9 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
             }
         }
 
-        try
+        if (!encoder->flush())
         {
-            encoder->flush();
-        }
-        catch (...)
-        {
+            VIDEO_ERROR_PRINT("Encoder flush timed out; output may be incomplete");
         }
         VIDEO_INFO_PRINT("All tasks done. Total encoded units: %u", totalEncodedUnits);
         return EXIT_SUCCESS;
@@ -326,12 +323,9 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
             }
         }
 
-        try
+        if (!encoder->flush())
         {
-            encoder->flush();
-        }
-        catch (...)
-        {
+            VIDEO_ERROR_PRINT("Encoder flush timed out; output may be incomplete");
         }
         v4l2src.stop();
         VIDEO_INFO_PRINT("V4L2 encoding done. Total encoded units: %u", totalEncodedUnits);

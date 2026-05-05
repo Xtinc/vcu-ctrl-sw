@@ -104,13 +104,16 @@ class RTEncoderBase
     /**
      * @brief Flush the encoder: queue EOS and block until the EOS callback is received.
      *
-     * Transitions state from Running -> Flushing. Waits up to 10 seconds for the SDK
+     * Transitions state from Running -> Flushing. Waits up to 5 seconds for the SDK
      * to drain all pending frames and deliver the EOS callback. If already flushed or
-     * stopped, returns immediately without error.
+     * stopped, returns true immediately.
      *
-     * @throw std::runtime_error if EOS cannot be queued or the wait times out.
+     * Never throws. Safe to call after a network disconnect or any abnormal condition.
+     *
+     * @return @c true  EOS received — all frames have been delivered.
+     *         @c false EOS could not be queued, or the wait timed out.
      */
-    void flush();
+    bool flush();
 
     /**
      * @brief Force the encoder to insert an IDR frame at the next opportunity.

@@ -244,13 +244,7 @@ RTEncoderBase::~RTEncoderBase()
 {
     if (m_state.load() == State::Running)
     {
-        try
-        {
-            flush();
-        }
-        catch (...)
-        {
-        }
+        flush();
     }
 
     // Enter Stopping before AL_Encoder_Destroy so that any drain callbacks
@@ -294,12 +288,12 @@ RTEncoderBase::~RTEncoderBase()
     }
 }
 
-void RTEncoderBase::flush()
+bool RTEncoderBase::flush()
 {
     State expected = State::Running;
     if (!m_state.compare_exchange_strong(expected, State::Flushing))
     {
-        return; // already Flushing, Done, or Stopping
+        return true; // already Flushing, Done, or Stopping
     }
 
     if (m_source_buf_pool)
@@ -310,18 +304,21 @@ void RTEncoderBase::flush()
     const auto eos_queued = AL_Encoder_Process(m_hEnc, nullptr, nullptr);
     if (!eos_queued)
     {
+        VIDEO_ERROR_PRINT("RTEncoder: flush failed: unable to queue EOS");
         m_state.store(State::Done);
-        throw std::runtime_error("flush failed: unable to queue EOS");
+        return false;
     }
 
     auto is_done = [this] { return m_state.load(std::memory_order_relaxed) >= State::Done; };
     std::unique_lock<std::mutex> lock(m_eos_mutex);
-    const auto got_eos = m_eos_cond.wait_for(lock, std::chrono::seconds(10), is_done);
+    const auto got_eos = m_eos_cond.wait_for(lock, std::chrono::seconds(5), is_done);
     if (!got_eos)
     {
+        VIDEO_ERROR_PRINT("RTEncoder: flush timeout (5 s) waiting for EOS");
         m_state.store(State::Done);
-        throw std::runtime_error("flush timeout: EOS callback not received");
+        return false;
     }
+    return true;
 }
 
 void RTEncoderBase::request_IDR()

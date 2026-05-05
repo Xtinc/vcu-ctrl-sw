@@ -94,14 +94,7 @@ RTDecoder::~RTDecoder()
 {
     if (m_state.load() == State::Running)
     {
-        try
-        {
-            flush();
-        }
-        catch (...)
-        {
-            // ignore flush errors in destructor
-        }
+        flush();
     }
 
     m_state.store(State::Stopping, std::memory_order_release);
@@ -138,12 +131,12 @@ bool RTDecoder::push_stream(const void *data, size_t size, uint8_t flags)
     return true;
 }
 
-void RTDecoder::flush()
+bool RTDecoder::flush()
 {
     State expected = State::Running;
     if (!m_state.compare_exchange_strong(expected, State::Flushing))
     {
-        return; // already Flushing, Done, or Stopping
+        return true; // already Flushing, Done, or Stopping — treat as success
     }
 
     m_src_buf_pool->decommit();
@@ -152,22 +145,14 @@ void RTDecoder::flush()
     auto is_done = [this] { return m_state.load(std::memory_order_relaxed) >= State::Done; };
 
     std::unique_lock<std::mutex> lock(m_eos_mutex);
-    bool ok;
-    if (m_cfg.flush_timeout_ms == 0)
-    {
-        m_eos_cv.wait(lock, is_done);
-        ok = true;
-    }
-    else
-    {
-        ok = m_eos_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.flush_timeout_ms), is_done);
-    }
-
+    const bool ok = m_eos_cv.wait_for(lock, std::chrono::seconds(5), is_done);
     if (!ok)
     {
-        m_state.store(State::Done); // force terminal even on timeout
-        throw std::runtime_error("RTDecoder: flush timeout waiting for EOS");
+        VIDEO_ERROR_PRINT("RTDecoder: flush timeout (5 s) waiting for EOS");
+        m_state.store(State::Done);
     }
+
+    return ok;
 }
 
 AL_ERR RTDecoder::sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
@@ -288,6 +273,16 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     if (pFrame && !pInfo)
     {
+        // Release frame: SDK is reclaiming this buffer (e.g. during flush/destroy).
+        // Return it to the decoder pool so the pipeline does not stall.
+        auto s = m_state.load(std::memory_order_relaxed);
+        if (s == State::Running || s == State::Flushing)
+        {
+            if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
+            {
+                VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed in release-frame path");
+            }
+        }
         return;
     }
 
@@ -298,24 +293,27 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
     auto fr_err = AL_Decoder_GetFrameError(m_hDec, pFrame);
     if (AL_IS_ERROR_CODE(fr_err))
     {
+        VIDEO_ERROR_PRINT("RTDecoder: frame error %s -> signal_error", AL_Codec_ErrorToString(fr_err));
         signal_error(fr_err);
         return;
     }
-    // Concealment warnings (AL_WARN_CONCEAL_DETECT, AL_WARN_HW_CONCEAL_DETECT,
-    // AL_WARN_INVALID_ACCESS_UNIT_STRUCTURE) do NOT abort processing.
-    // The frame is still a valid displayable picture (with concealment artifacts).
-    // Falling through ensures the buffer is delivered to the callback and then
-    // returned to the decoder via PutDisplayPicture, preventing pool depletion.
-    // m_num_concealed += (fr_err != AL_SUCCESS);
 
     bool is_main = pInfo->eOutputID == AL_OUTPUT_MAIN || pInfo->eOutputID == AL_OUTPUT_POSTPROC;
 
     if (!is_main)
     {
+        // Non-main output (e.g. thumbnail/HDR): must still return the buffer.
+        auto s = m_state.load(std::memory_order_relaxed);
+        if (s == State::Running || s == State::Flushing)
+        {
+            if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
+            {
+                VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed for non-main output");
+                signal_error(AL_ERROR);
+            }
+        }
         return;
     }
-
-    // m_num_decoded++;
 
     // Call user callback with decoded frame
     try
@@ -330,12 +328,12 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     update_fps();
 
-    // Mirror SDK sample behavior: return only displayed main/postproc frames.
     auto s = m_state.load(std::memory_order_relaxed);
     if (s == State::Running || s == State::Flushing)
     {
         if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
         {
+            VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed for main frame");
             signal_error(AL_ERROR);
         }
     }
@@ -487,15 +485,22 @@ void RTDecoder::update_fps()
 
 void RTDecoder::cleanup()
 {
-    if (m_src_buf_pool)
-    {
-        m_src_buf_pool->decommit();
-    }
-
     if (m_hDec)
     {
         AL_Decoder_Destroy(m_hDec);
         m_hDec = nullptr;
+    }
+
+    if (m_src_buf_pool)
+    {
+        m_src_buf_pool->decommit();
+        m_src_buf_pool.reset();
+    }
+
+    if (m_rec_buf_pool)
+    {
+        m_rec_buf_pool->decommit();
+        m_rec_buf_pool.reset();
     }
 
     if (m_pScheduler)

@@ -87,7 +87,6 @@ int main(int argc, char *argv[])
     DecoderConfig cfg;
     cfg.codec = codec;
     cfg.input_buffer_size = kChunkSize;
-    cfg.flush_timeout_ms = 15000; // 15-second EOS timeout
 
     // ---- Create decoder and callback --------------------------------------
     RTDecoder decoder(cfg, [&](AL_TBuffer *pFrame, AL_TInfoDecode const &info) {
@@ -155,7 +154,10 @@ int main(int argc, char *argv[])
     }
 
     // ---- Drain and tear down ----------------------------------------------
-    decoder.flush();
+    if (!decoder.flush())
+    {
+        VIDEO_ERROR_PRINT("Decoder flush timed out; output may be incomplete");
+    }
 
     if (yuv_writer && yuv_writer->is_open())
     {
