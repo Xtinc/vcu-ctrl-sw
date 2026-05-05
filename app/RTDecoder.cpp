@@ -21,8 +21,8 @@ using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
 
 RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
     : m_cfg(cfg), m_callback(std::move(cb)), m_pAllocator(nullptr), m_pScheduler(nullptr), m_hDec(nullptr),
-      m_cbbundles{}, m_state{State::Running}, m_fps(0.0), m_frame_count(0),
-      m_fps_last_time(std::chrono::steady_clock::now()), m_lib_initialized(false)
+      m_cbbundles{}, m_fps(0.0), m_frame_count(0), m_fps_last_time(std::chrono::steady_clock::now()),
+      m_state{State::Running}, m_lib_initialized(false)
 {
     try
     {
@@ -200,12 +200,7 @@ void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUs
 void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
-    // Warnings (e.g. AL_WARN_CONCEAL_DETECT) do not stop the pipeline;
-    // they are already surfaced per-frame via AL_Decoder_GetFrameError.
-    if (AL_IS_ERROR_CODE(eError))
-    {
-        self->signal_error(eError);
-    }
+    self->signal_error(eError);
 }
 
 AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
