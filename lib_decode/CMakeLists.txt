@@ -38,12 +38,7 @@ set(ALL_DECODE_OBJECTS
     $<TARGET_OBJECTS:lib_parsing_obj>
 )
 
-add_library(liballegro_decode SHARED ${ALL_DECODE_OBJECTS})
 add_library(liballegro_decode_static STATIC ${ALL_DECODE_OBJECTS})
-
-foreach(_tgt liballegro_decode liballegro_decode_static)
-    target_link_libraries(${_tgt} PUBLIC Threads::Threads)
-    set_target_properties(${_tgt} PROPERTIES OUTPUT_NAME allegro_decode)
-endforeach()
-
+target_link_libraries(liballegro_decode_static PUBLIC Threads::Threads)
+set_target_properties(liballegro_decode_static PROPERTIES OUTPUT_NAME allegro_decode)
 set_target_properties(liballegro_decode_static PROPERTIES SUFFIX ".a")

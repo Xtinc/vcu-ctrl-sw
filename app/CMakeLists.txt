@@ -4,5 +4,6 @@ target_link_libraries(
     vcu_enc
     PRIVATE
     liballegro_encode_static
+    liballegro_decode_static
     liballegro_app_static
 )
