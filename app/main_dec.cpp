@@ -19,8 +19,6 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
-#include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -30,7 +28,6 @@ extern "C"
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static constexpr double kRecordDurationSec = 10.0;
 static constexpr uint32_t kChunkSize = 512u * 1024u; // 512 KB matches default input_buffer_size
 
 // ---------------------------------------------------------------------------
@@ -83,9 +80,7 @@ int main(int argc, char *argv[])
     std::mutex writer_mutex;
     std::unique_ptr<YuvFileIO> yuv_writer;
 
-    std::chrono::steady_clock::time_point record_start;
     bool first_frame = true;
-    std::atomic<bool> time_expired{false};
     uint32_t frames_written = 0;
 
     // ---- Build decoder config ---------------------------------------------
@@ -97,8 +92,6 @@ int main(int argc, char *argv[])
     // ---- Create decoder and callback --------------------------------------
     RTDecoder decoder(cfg, [&](AL_TBuffer *pFrame, AL_TInfoDecode const &info) {
         std::lock_guard<std::mutex> lock(writer_mutex);
-
-        auto now = std::chrono::steady_clock::now();
 
         // Lazy-initialise the YUV writer on the very first decoded frame so
         // we know the exact pixel format, dimensions, and FourCC.
@@ -121,22 +114,6 @@ int main(int argc, char *argv[])
 
             VIDEO_INFO_PRINT("Stream: %dx%d  FourCC=0x%08X  -> %s", width, height,
                              static_cast<unsigned>(fourcc), output_path.c_str());
-
-            record_start = now;
-        }
-
-        // Stop writing once the 10-second quota has been reached.
-        if (time_expired.load(std::memory_order_relaxed))
-        {
-            return;
-        }
-
-        double elapsed = std::chrono::duration<double>(now - record_start).count();
-        if (elapsed >= kRecordDurationSec)
-        {
-            VIDEO_INFO_PRINT("10-second quota reached after %u frames. Stopping output.", frames_written);
-            time_expired.store(true, std::memory_order_relaxed);
-            return;
         }
 
         if (!yuv_writer || !yuv_writer->is_open())
@@ -153,14 +130,14 @@ int main(int argc, char *argv[])
             ++frames_written;
             if (frames_written % 100 == 0)
             {
-                VIDEO_INFO_PRINT("Written %u frames (%.1f s elapsed)", frames_written, elapsed);
+                VIDEO_INFO_PRINT("Written %u frames", frames_written);
             }
         }
     });
 
     // ---- Feed bitstream in chunks -----------------------------------------
     std::vector<uint8_t> chunk(kChunkSize);
-    while (!time_expired.load(std::memory_order_acquire) && input_file.good())
+    while (input_file.good())
     {
         input_file.read(reinterpret_cast<char *>(chunk.data()),
                         static_cast<std::streamsize>(kChunkSize));
@@ -172,7 +149,7 @@ int main(int argc, char *argv[])
 
         if (!decoder.push_stream(chunk.data(), static_cast<size_t>(bytes_read)))
         {
-            VIDEO_ERROR_PRINT("push_stream failed – decoder has stopped");
+            VIDEO_ERROR_PRINT("push_stream failed - decoder has stopped");
             break;
         }
     }

@@ -173,8 +173,10 @@ class RTDecoder
   private:
     static AL_ERR sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                        AL_TCropInfo const *pCropInfo, void *pUserParam);
+    static void sdk_end_decoding(AL_TBuffer *pFrame, void *pUserParam);
     static void sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam);
     static void sdk_error(AL_ERR eError, void *pUserParam);
+    void on_sdk_end_decoding(AL_TBuffer *pFrame);
     AL_ERR on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                    AL_TCropInfo const *pCropInfo);
     void on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo);

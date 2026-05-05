@@ -66,6 +66,7 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
         }
 
         m_cbbundles.displayCB = {&RTDecoder::sdk_display, this};
+        m_cbbundles.endDecodingCB = {&RTDecoder::sdk_end_decoding, this};
         m_cbbundles.resolutionFoundCB = {&RTDecoder::sdk_resolution_found, this};
         m_cbbundles.errorCB = {&RTDecoder::sdk_error, this};
 
@@ -197,10 +198,28 @@ void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUs
     }
 }
 
+void RTDecoder::sdk_end_decoding(AL_TBuffer *pFrame, void *pUserParam)
+{
+    auto *self = static_cast<RTDecoder *>(pUserParam);
+    try
+    {
+        self->on_sdk_end_decoding(pFrame);
+    }
+    catch (...)
+    {
+        self->signal_error(AL_ERROR);
+    }
+}
+
 void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
     self->signal_error(eError);
+}
+
+void RTDecoder::on_sdk_end_decoding(AL_TBuffer *pFrame)
+{
+    (void)pFrame;
 }
 
 AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
@@ -311,9 +330,7 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     update_fps();
 
-    // Only return the frame to the decoder while the pipeline is alive.
-    // During normal flush (Flushing state) we continue returning buffers
-    // so the hardware pipeline keeps draining.
+    // Mirror SDK sample behavior: return only displayed main/postproc frames.
     auto s = m_state.load(std::memory_order_relaxed);
     if (s == State::Running || s == State::Flushing)
     {
