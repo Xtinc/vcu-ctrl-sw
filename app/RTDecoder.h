@@ -200,6 +200,10 @@ class RTDecoder
     void update_fps();             // called from on_sdk_display per output frame
     void cleanup();
 
+    // Latency measurement helpers
+    void parse_sei_from_stream(const uint8_t *data, size_t size);
+    void calculate_and_log_latency();
+
   private:
     DecoderConfig m_cfg;
     DecodedFrameCallback m_callback;

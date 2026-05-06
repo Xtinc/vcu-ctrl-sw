@@ -129,17 +129,9 @@ bool RTDecoder::push_stream(const void *data, size_t size, uint8_t flags)
     }
 
     // Parse SEI timestamp if latency measurement is enabled
-    if (m_cfg.enable_latency_measurement && data && size > 0)
+    if (m_cfg.enable_latency_measurement)
     {
-        uint64_t timestamp_ns = 0;
-        uint64_t frame_index = 0;
-        
-        if (SEIParser::parse_sei_timestamp(static_cast<const uint8_t*>(data), size, 
-                                          timestamp_ns, frame_index))
-        {
-            m_last_sei_timestamp_ns.store(timestamp_ns, std::memory_order_relaxed);
-            m_last_sei_frame_index.store(frame_index, std::memory_order_relaxed);
-        }
+        parse_sei_from_stream(static_cast<const uint8_t*>(data), size);
     }
 
     auto buf = m_src_buf_pool->get_buffer();
@@ -363,36 +355,9 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
     update_fps();
 
     // Calculate latency if measurement is enabled
-    if (m_cfg.enable_latency_measurement && m_clock_sync && m_latency_stats)
+    if (m_cfg.enable_latency_measurement)
     {
-        uint64_t sei_timestamp = m_last_sei_timestamp_ns.exchange(0, std::memory_order_relaxed);
-        
-        if (sei_timestamp > 0 && m_clock_sync->is_synchronized())
-        {
-            auto now = std::chrono::high_resolution_clock::now();
-            auto decode_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-            
-            int64_t clock_offset = m_clock_sync->get_offset_ns();
-            int64_t latency_ns = decode_time_ns - static_cast<int64_t>(sei_timestamp) - clock_offset;
-            double latency_ms = latency_ns / 1e6;
-            
-            // Only record positive, reasonable latencies (< 10 seconds)
-            if (latency_ms > 0 && latency_ms < 10000)
-            {
-                m_latency_stats->add_sample(latency_ms);
-                
-                // Log latency statistics every 100 frames
-                if (++m_latency_frame_count % 100 == 0)
-                {
-                    VIDEO_INFO_PRINT("[Latency] avg=%.2fms, p99=%.2fms, max=%.2fms, min=%.2fms (samples=%zu)",
-                                   m_latency_stats->get_average(),
-                                   m_latency_stats->get_p99(),
-                                   m_latency_stats->get_max(),
-                                   m_latency_stats->get_min(),
-                                   m_latency_stats->get_sample_count());
-                }
-            }
-        }
+        calculate_and_log_latency();
     }
 
     auto s = m_state.load(std::memory_order_relaxed);
@@ -548,6 +513,56 @@ void RTDecoder::update_fps()
     }
     m_fps_last_time = now;
     m_frame_count = 0;
+}
+
+void RTDecoder::parse_sei_from_stream(const uint8_t *data, size_t size)
+{
+    if (!data || size == 0)
+        return;
+
+    uint64_t timestamp_ns = 0;
+    uint64_t frame_index = 0;
+    
+    if (SEIParser::parse_sei_timestamp(data, size, timestamp_ns, frame_index))
+    {
+        m_last_sei_timestamp_ns.store(timestamp_ns, std::memory_order_relaxed);
+        m_last_sei_frame_index.store(frame_index, std::memory_order_relaxed);
+    }
+}
+
+void RTDecoder::calculate_and_log_latency()
+{
+    if (!m_clock_sync || !m_latency_stats)
+        return;
+
+    uint64_t sei_timestamp = m_last_sei_timestamp_ns.exchange(0, std::memory_order_relaxed);
+    
+    if (sei_timestamp == 0 || !m_clock_sync->is_synchronized())
+        return;
+
+    auto now = std::chrono::high_resolution_clock::now();
+    auto decode_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    
+    int64_t clock_offset = m_clock_sync->get_offset_ns();
+    int64_t latency_ns = decode_time_ns - static_cast<int64_t>(sei_timestamp) - clock_offset;
+    double latency_ms = latency_ns / 1e6;
+    
+    // Only record positive, reasonable latencies (< 10 seconds)
+    if (latency_ms <= 0 || latency_ms >= 10000)
+        return;
+
+    m_latency_stats->add_sample(latency_ms);
+    
+    // Log latency statistics every 100 frames
+    if (++m_latency_frame_count % 100 == 0)
+    {
+        VIDEO_INFO_PRINT("[Latency] avg=%.2fms, p99=%.2fms, max=%.2fms, min=%.2fms (samples=%zu)",
+                       m_latency_stats->get_average(),
+                       m_latency_stats->get_p99(),
+                       m_latency_stats->get_max(),
+                       m_latency_stats->get_min(),
+                       m_latency_stats->get_sample_count());
+    }
 }
 
 void RTDecoder::cleanup()

@@ -169,6 +169,8 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         {
             m_clock_sync = std::make_unique<ClockSync>();
             m_clock_sync->start_server(m_cfg.latency_sync_port);
+            // Pre-allocate SEI buffer (estimate: max frame size for 4K)
+            m_sei_buffer.reserve(8 * 1024 * 1024); // 8MB should cover most cases
             VIDEO_INFO_PRINT("[RTEncoder] Latency measurement enabled (sync port: %u)", m_cfg.latency_sync_port);
         }
 
@@ -507,66 +509,30 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
 
             if (m_callback && uSize)
             {
-                const uint8_t *send_data = pBase;
-                size_t send_size = uSize;
-                std::vector<uint8_t> combined_data;
-
-                // Inject SEI timestamp for latency measurement
                 if (m_cfg.enable_latency_measurement)
                 {
-                    bool is_iframe = eof;
-                    bool should_inject = m_cfg.latency_sei_per_frame || is_iframe;
-
-                    if (should_inject)
+                    // Inject SEI for latency measurement
+                    auto result = inject_sei_if_needed(pBase, uSize, eof, m_sei_buffer);
+                    try
                     {
-                        uint64_t timestamp_ns = 0;
-                        uint64_t frame_idx = 0;
-
-                        // Retrieve timestamp from map
-                        {
-                            std::lock_guard<std::mutex> lock(m_timestamp_mutex);
-                            if (!m_frame_timestamps.empty())
-                            {
-                                auto it = m_frame_timestamps.begin();
-                                frame_idx = it->first;
-                                timestamp_ns = it->second;
-                                m_frame_timestamps.erase(it);
-                            }
-                        }
-
-                        if (timestamp_ns > 0)
-                        {
-                            // Generate SEI NAL unit
-                            uint8_t sei_buffer[SEI_TIMESTAMP_MAX_SIZE];
-                            size_t sei_size = 0;
-                            int codec =
-                                (m_cfg.profile == AL_PROFILE_HEVC_MAIN || m_cfg.profile == AL_PROFILE_HEVC_MAIN10)
-                                    ? SEI_CODEC_HEVC
-                                    : SEI_CODEC_AVC;
-
-                            if (SEIParser::SEI_GenerateTimestampNAL(codec, timestamp_ns, frame_idx, sei_buffer,
-                                                                    &sei_size) == 0 &&
-                                sei_size > 0)
-                            {
-                                // Prepend SEI to encoded data
-                                combined_data.resize(sei_size + uSize);
-                                std::memcpy(combined_data.data(), sei_buffer, sei_size);
-                                std::memcpy(combined_data.data() + sei_size, pBase, uSize);
-                                send_data = combined_data.data();
-                                send_size = combined_data.size();
-                            }
-                        }
+                        m_callback(result.first, result.second);
+                    }
+                    catch (...)
+                    {
+                        signal_done();
                     }
                 }
-
-                // Send data (with or without SEI)
-                try
+                else
                 {
-                    m_callback(send_data, send_size);
-                }
-                catch (...)
-                {
-                    signal_done();
+                    // Fast path: no SEI injection
+                    try
+                    {
+                        m_callback(pBase, uSize);
+                    }
+                    catch (...)
+                    {
+                        signal_done();
+                    }
                 }
             }
         }
@@ -615,6 +581,63 @@ void RTEncoderBase::update_frame_rate()
     m_fps_last_time = now;
     m_frame_count = 0;
     m_bytes_count = 0;
+}
+
+void RTEncoderBase::record_frame_timestamp()
+{
+    auto now = std::chrono::high_resolution_clock::now();
+    auto timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+
+    std::lock_guard<std::mutex> lock(m_timestamp_mutex);
+    m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_ns);
+}
+
+std::pair<const uint8_t *, size_t> RTEncoderBase::inject_sei_if_needed(const uint8_t *encoded_data, size_t encoded_size,
+                                                                       bool is_iframe, std::vector<uint8_t> &sei_buffer)
+{
+    // Early return: not an injection point
+    if (!(m_cfg.latency_sei_per_frame || is_iframe))
+    {
+        return {encoded_data, encoded_size};
+    }
+
+    uint64_t timestamp_ns = 0;
+    uint64_t frame_idx = 0;
+
+    // Retrieve timestamp from map
+    {
+        std::lock_guard<std::mutex> lock(m_timestamp_mutex);
+        if (!m_frame_timestamps.empty())
+        {
+            auto it = m_frame_timestamps.begin();
+            frame_idx = it->first;
+            timestamp_ns = it->second;
+            m_frame_timestamps.erase(it);
+        }
+    }
+
+    if (timestamp_ns == 0)
+    {
+        return {encoded_data, encoded_size};
+    }
+
+    // Generate SEI NAL unit
+    uint8_t sei_nal[SEI_TIMESTAMP_MAX_SIZE];
+    size_t sei_size = 0;
+    int codec = (m_cfg.profile == AL_PROFILE_HEVC_MAIN || m_cfg.profile == AL_PROFILE_HEVC_MAIN10) ? SEI_CODEC_HEVC
+                                                                                                   : SEI_CODEC_AVC;
+
+    if (SEIParser::SEI_GenerateTimestampNAL(codec, timestamp_ns, frame_idx, sei_nal, &sei_size) != 0 || sei_size == 0)
+    {
+        return {encoded_data, encoded_size};
+    }
+
+    // Prepend SEI to encoded data
+    sei_buffer.resize(sei_size + encoded_size);
+    std::memcpy(sei_buffer.data(), sei_nal, sei_size);
+    std::memcpy(sei_buffer.data() + sei_size, encoded_data, encoded_size);
+
+    return {sei_buffer.data(), sei_buffer.size()};
 }
 
 void RTEncoderBase::signal_done()
@@ -813,10 +836,7 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
     // Record timestamp for latency measurement
     if (m_cfg.enable_latency_measurement)
     {
-        auto now = std::chrono::high_resolution_clock::now();
-        auto timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-        std::lock_guard<std::mutex> lock(m_timestamp_mutex);
-        m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_ns);
+        record_frame_timestamp();
     }
 
     if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))
@@ -985,10 +1005,7 @@ bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
     // Record timestamp for latency measurement
     if (m_cfg.enable_latency_measurement)
     {
-        auto now = std::chrono::high_resolution_clock::now();
-        auto timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-        std::lock_guard<std::mutex> lock(m_timestamp_mutex);
-        m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_ns);
+        record_frame_timestamp();
     }
 
     if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))

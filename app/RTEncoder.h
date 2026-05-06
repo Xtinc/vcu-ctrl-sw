@@ -193,6 +193,11 @@ class RTEncoderBase
     virtual void release_sources(AL_TBuffer const *pSrc) = 0;
 
   protected:
+    // Latency measurement helpers
+    void record_frame_timestamp();
+    std::pair<const uint8_t*, size_t> inject_sei_if_needed(
+        const uint8_t *encoded_data, size_t encoded_size, bool is_iframe, std::vector<uint8_t> &sei_buffer);
+
     mutable std::mutex m_fps_mutex;
     double m_fps;
     double m_bitrate;
@@ -234,6 +239,7 @@ class RTEncoderBase
     std::unordered_map<uint64_t, uint64_t> m_frame_timestamps; // frame_index -> timestamp_ns
     uint64_t m_frame_index;
     std::mutex m_timestamp_mutex;
+    std::vector<uint8_t> m_sei_buffer; // Pre-allocated buffer for SEI injection
 };
 
 template <SourceMode mode> class RTEncoder;
