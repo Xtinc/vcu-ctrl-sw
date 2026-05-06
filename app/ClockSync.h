@@ -49,22 +49,14 @@ class ClockSync
      */
     void start_client(const std::string &server_ip, uint16_t port);
 
-    /**
-     * @brief Get current clock offset in nanoseconds
-     * @return offset (decoder_time - encoder_time)
-     */
-    int64_t get_offset_ns() const
+    int64_t get_offset_us() const
     {
-        return offset_ns_.load(std::memory_order_relaxed);
+        return offset_us_.load(std::memory_order_relaxed);
     }
 
-    /**
-     * @brief Get last measured round-trip time in nanoseconds
-     * @return RTT in nanoseconds
-     */
-    int64_t get_rtt_ns() const
+    int64_t get_rtt_us() const
     {
-        return rtt_ns_.load(std::memory_order_relaxed);
+        return rtt_us_.load(std::memory_order_relaxed);
     }
 
     /**
@@ -80,9 +72,9 @@ class ClockSync
     {
         uint8_t type; // 0=request, 1=response
         uint8_t reserved[7];
-        uint64_t t1; // Client send time (ns)
-        uint64_t t2; // Server receive time (ns)
-        uint64_t t3; // Server send time (ns)
+        uint64_t t1; // Client send time (us)
+        uint64_t t2; // Server receive time (us)
+        uint64_t t3; // Server send time (us)
     };
 
     static_assert(alignof(SyncMessage) == 8, "SyncMessage alignment must be 8 bytes");
@@ -98,7 +90,7 @@ class ClockSync
     void handle_request(const SyncMessage &req, const asio::ip::udp::endpoint &client_endpoint);
     void handle_response(const SyncMessage &resp, uint64_t t4);
 
-    static uint64_t get_time_ns();
+    static uint64_t get_time_us();
 
     asio::io_context io_ctx_;
     asio::ip::udp::socket socket_;
@@ -106,8 +98,8 @@ class ClockSync
     asio::ip::udp::endpoint server_endpoint_;
     asio::ip::udp::endpoint remote_endpoint_;
 
-    std::atomic<int64_t> offset_ns_{0};
-    std::atomic<int64_t> rtt_ns_{0};
+    std::atomic<int64_t> offset_us_{0};
+    std::atomic<int64_t> rtt_us_{0};
     std::atomic<bool> synchronized_{false};
 
     std::thread io_thread_;

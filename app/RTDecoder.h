@@ -7,9 +7,11 @@ extern "C"
 #include "lib_decode/lib_decode.h"
 }
 
+#include "LatencyStats.h"
 #include "MemMgr.h"
 #include <atomic>
 #include <chrono>
+#include <unordered_map>
 
 /**
  * @brief Configuration parameters for RTDecoder.
@@ -28,9 +30,9 @@ struct DecoderConfig
     bool low_delay_mode = false;                        ///< Enable low-latency (frame-level) decode mode.
 
     // Latency measurement configuration
-    bool enable_latency_measurement = false;       ///< Enable end-to-end latency measurement
-    std::string latency_sync_server_ip = "";       ///< Encoder IP address for clock sync (decoder acts as client)
-    uint16_t latency_sync_server_port = 5555;      ///< Encoder clock sync server port
+    bool enable_latency_measurement = false;  ///< Enable end-to-end latency measurement
+    std::string latency_sync_server_ip = "";  ///< Encoder IP address for clock sync (decoder acts as client)
+    uint16_t latency_sync_server_port = 5555; ///< Encoder clock sync server port
 };
 
 /**
@@ -184,11 +186,13 @@ class RTDecoder
     static void sdk_end_decoding(AL_TBuffer *pFrame, void *pUserParam);
     static void sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam);
     static void sdk_error(AL_ERR eError, void *pUserParam);
+    static void sdk_end_parsing(AL_TBuffer *pParsedFrame, void *pUserParam, int iParsingId);
     void on_sdk_end_decoding(AL_TBuffer *pFrame);
     AL_ERR on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                    AL_TCropInfo const *pCropInfo);
     void on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo);
     void on_sdk_error(AL_ERR eError);
+    void on_sdk_end_parsing(AL_TBuffer *pParsedFrame, int iParsingId);
 
     static AL_TDecOutputSettings derive_output_settings(AL_TStreamSettings const &stream_settings);
     void configure_rec_pool(AL_TPicFormat const &pic_format, AL_TDimension const &dim, int pitch_y);
@@ -199,10 +203,6 @@ class RTDecoder
     void signal_error(AL_ERR err); // logs error then calls signal_done()
     void update_fps();             // called from on_sdk_display per output frame
     void cleanup();
-
-    // Latency measurement helpers
-    void parse_sei_from_stream(const uint8_t *data, size_t size);
-    void calculate_and_log_latency();
 
   private:
     DecoderConfig m_cfg;
@@ -236,13 +236,6 @@ class RTDecoder
     std::mutex m_eos_mutex;
     std::condition_variable m_eos_cv;
     bool m_lib_initialized;
-
-    // Latency measurement
-    std::unique_ptr<class ClockSync> m_clock_sync;
-    std::unique_ptr<class LatencyStats> m_latency_stats;
-    uint32_t m_latency_frame_count;
-    std::atomic<uint64_t> m_last_sei_timestamp_ns;
-    std::atomic<uint64_t> m_last_sei_frame_index;
 };
 
 #endif // REALTIME_DECODER_H

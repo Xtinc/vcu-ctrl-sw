@@ -80,75 +80,23 @@ int SEIParser::SEI_GenerateTimestampNAL(int codec, uint64_t timestamp_ns, uint64
     return 0;
 }
 
-bool SEIParser::parse_sei_timestamp(const uint8_t *data, std::size_t size, uint64_t &timestamp_ns,
+bool SEIParser::parse_sei_timestamp(const uint8_t *payload, std::size_t payload_size, uint64_t &timestamp_ns,
                                     uint64_t &frame_index)
 {
-    if (!data || size < 32)
+    // Payload layout: 16-byte UUID | 8-byte timestamp_ns (BE) | 8-byte frame_index (BE)
+    if (!payload || payload_size < 32)
     {
         return false;
     }
 
-    for (std::size_t i = 0; i < size - 32; ++i)
+    if (std::memcmp(payload, SEI_LATENCY_UUID, 16) != 0)
     {
-        if (data[i] != 0x00 || data[i + 1] != 0x00 || data[i + 2] != 0x00 || data[i + 3] != 0x01)
-        {
-            continue;
-        }
-
-        std::size_t pos = i + 4;
-        const uint8_t nal_header = data[pos];
-
-        bool is_sei = false;
-        if ((nal_header & 0x1F) == 6)
-        {
-            is_sei = true;
-            pos += 1;
-        }
-        else if ((nal_header >> 1) == 39)
-        {
-            is_sei = true;
-            pos += 2;
-        }
-
-        if (!is_sei)
-        {
-            continue;
-        }
-
-        if (pos >= size || data[pos] != 5)
-        {
-            continue;
-        }
-        ++pos;
-
-        while (pos < size && data[pos] == 0xFF)
-        {
-            ++pos;
-        }
-        if (pos >= size)
-        {
-            continue;
-        }
-        ++pos;
-
-        if (pos + 32 > size)
-        {
-            continue;
-        }
-
-        if (std::memcmp(&data[pos], SEI_LATENCY_UUID, 16) != 0)
-        {
-            continue;
-        }
-        pos += 16;
-
-        timestamp_ns = read_u64_be(&data[pos]);
-        pos += 8;
-        frame_index = read_u64_be(&data[pos]);
-        return true;
+        return false;
     }
 
-    return false;
+    timestamp_ns = read_u64_be(payload + 16);
+    frame_index  = read_u64_be(payload + 24);
+    return true;
 }
 
 uint64_t SEIParser::read_u64_be(const uint8_t *buf)

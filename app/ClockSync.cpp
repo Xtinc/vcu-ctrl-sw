@@ -99,7 +99,7 @@ void ClockSync::async_receive_request()
                                        else if (!is_server_ && msg.type == 1)
                                        {
                                            // Client: handle sync response
-                                           uint64_t t4 = get_time_ns();
+                                           uint64_t t4 = get_time_us();
                                            handle_response(msg, t4);
                                        }
                                    }
@@ -112,7 +112,7 @@ void ClockSync::async_send_probe()
     SyncMessage msg;
     msg.type = 0;
     std::memset(msg.reserved, 0, sizeof(msg.reserved));
-    msg.t1 = get_time_ns();
+    msg.t1 = get_time_us();
     msg.t2 = 0;
     msg.t3 = 0;
 
@@ -130,14 +130,14 @@ void ClockSync::async_send_probe()
 
 void ClockSync::handle_request(const SyncMessage &req, const asio::ip::udp::endpoint &client_endpoint)
 {
-    uint64_t t2 = get_time_ns();
+    uint64_t t2 = get_time_us();
 
     SyncMessage resp;
     resp.type = 1;
     std::memset(resp.reserved, 0, sizeof(resp.reserved));
     resp.t1 = req.t1;
     resp.t2 = t2;
-    resp.t3 = get_time_ns();
+    resp.t3 = get_time_us();
 
     auto send_buffer = std::make_shared<std::array<uint8_t, sizeof(SyncMessage)>>();
     std::memcpy(send_buffer->data(), &resp, sizeof(SyncMessage));
@@ -153,7 +153,6 @@ void ClockSync::handle_request(const SyncMessage &req, const asio::ip::udp::endp
 
 void ClockSync::handle_response(const SyncMessage &resp, uint64_t t4)
 {
-    // NTP algorithm
     // offset = ((T2 - T1) + (T3 - T4)) / 2
     // rtt = (T4 - T1) - (T3 - T2)
 
@@ -165,16 +164,16 @@ void ClockSync::handle_response(const SyncMessage &resp, uint64_t t4)
     int64_t offset = ((t2 - t1) + (t3 - t4_signed)) / 2;
     int64_t rtt = (t4_signed - t1) - (t3 - t2);
 
-    offset_ns_.store(offset, std::memory_order_relaxed);
-    rtt_ns_.store(rtt, std::memory_order_relaxed);
+    offset_us_.store(offset, std::memory_order_relaxed);
+    rtt_us_.store(rtt, std::memory_order_relaxed);
     synchronized_.store(true, std::memory_order_relaxed);
 
-    VIDEO_ERROR_PRINT("[ClockSync] Offset: %.3f ms, RTT: %.3f ms", offset / 1e6, rtt / 1e6);
+    VIDEO_ERROR_PRINT("[ClockSync] Offset: %.3f ms, RTT: %.3f ms", offset / 1e3, rtt / 1e3);
 }
 
-uint64_t ClockSync::get_time_ns()
+uint64_t ClockSync::get_time_us()
 {
-    auto now = std::chrono::high_resolution_clock::now();
+    auto now = std::chrono::steady_clock::now();
     auto duration = now.time_since_epoch();
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
 }

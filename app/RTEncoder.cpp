@@ -585,11 +585,11 @@ void RTEncoderBase::update_frame_rate()
 
 void RTEncoderBase::record_frame_timestamp()
 {
-    auto now = std::chrono::high_resolution_clock::now();
-    auto timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    auto now = std::chrono::steady_clock::now();
+    auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
 
     std::lock_guard<std::mutex> lock(m_timestamp_mutex);
-    m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_ns);
+    m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_us);
 }
 
 std::pair<const uint8_t *, size_t> RTEncoderBase::inject_sei_if_needed(const uint8_t *encoded_data, size_t encoded_size,

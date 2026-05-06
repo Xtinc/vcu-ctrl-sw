@@ -29,25 +29,30 @@ class SEIParser
      * Creates a complete SEI NAL unit and stores it in @p out_buffer.
      *
      * @param codec Codec type. Use @ref SEI_CODEC_AVC or @ref SEI_CODEC_HEVC.
-     * @param timestamp_ns Frame encode timestamp in nanoseconds.
+     * @param timestamp_us Frame encode timestamp.
      * @param frame_index Sequential frame index.
      * @param out_buffer Output buffer. Required capacity is at least @ref SEI_TIMESTAMP_MAX_SIZE.
      * @param out_size Output size of generated NAL unit in bytes.
      * @return 0 on success, negative value on error.
      */
-    static int SEI_GenerateTimestampNAL(int codec, uint64_t timestamp_ns, uint64_t frame_index, uint8_t *out_buffer,
+    static int SEI_GenerateTimestampNAL(int codec, uint64_t timestamp_us, uint64_t frame_index, uint8_t *out_buffer,
                                         std::size_t *out_size);
 
     /**
-     * @brief Parse bitstream chunk and extract timestamp SEI payload.
+     * @brief Parse an SEI user_data_unregistered payload and extract the timestamp.
      *
-     * @param data Pointer to bitstream data.
-     * @param size Bitstream data size in bytes.
-     * @param timestamp_ns Output timestamp in nanoseconds.
-     * @param frame_index Output frame index.
-     * @return true if a valid timestamp SEI payload is found, otherwise false.
+     * Expects the raw payload bytes as provided by the decoder's parsedSeiCB
+     * (anti-emulation already removed). The payload must begin with
+     * @ref SEI_LATENCY_UUID followed by an 8-byte big-endian timestamp and an
+     * 8-byte big-endian frame index.
+     *
+     * @param payload     Pointer to the SEI payload (UUID + timestamp + frame_index).
+     * @param payload_size Size of the payload in bytes. Must be >= 32.
+     * @param timestamp_us Output timestamp.
+     * @param frame_index  Output frame index.
+     * @return true if the payload contains a valid latency timestamp, otherwise false.
      */
-    static bool parse_sei_timestamp(const uint8_t *data, std::size_t size, uint64_t &timestamp_ns,
+    static bool parse_sei_timestamp(const uint8_t *payload, std::size_t payload_size, uint64_t &timestamp_us,
                                     uint64_t &frame_index);
 
   private:
