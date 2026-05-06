@@ -6,9 +6,9 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
-#include <mutex>
 
 extern "C"
 {
@@ -187,6 +187,26 @@ struct FrameSeiData
 };
 
 class ClockSync;
+
+class LatencyInjector
+{
+  public:
+    LatencyInjector();
+    ~LatencyInjector();
+
+    void start(const std::string &server_ip, uint16_t port);
+    void on_submitted_frame();
+    std::pair<const uint8_t *, size_t> inject_sei(AL_EProfile profile, const uint8_t *encoded_data,
+                                                  size_t encoded_size);
+
+  private:
+    std::unique_ptr<class ClockSync> m_clock_sync;
+    std::chrono::steady_clock::time_point m_latency_start_time;
+    std::unordered_map<uint64_t, uint64_t> m_frame_timestamps; // frame_index -> timestamp_ns
+    uint64_t m_frame_index;
+    std::mutex m_timestamp_mutex;
+    std::vector<uint8_t> m_sei_buffer; // Pre-allocated buffer for SEI injection
+};
 
 /**
  * @brief End-to-end latency measurer: SEI timestamp extraction + clock sync + histogram statistics.

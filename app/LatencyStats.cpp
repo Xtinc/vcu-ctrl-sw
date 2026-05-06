@@ -102,3 +102,65 @@ void LatencyMeasurer::on_frame_displayed(AL_TBuffer *pDisplayedFrame)
                          m_stats.quantile(0.99));
     }
 }
+
+LatencyInjector::LatencyInjector() : m_latency_start_time(std::chrono::steady_clock::now()), m_frame_index(0)
+{
+    m_sei_buffer.resize(16 * 1024);
+}
+
+LatencyInjector::~LatencyInjector()
+{
+}
+
+void LatencyInjector::start(const std::string &server_ip, uint16_t port)
+{
+    m_clock_sync = std::make_unique<ClockSync>();
+    m_clock_sync->start_server(port);
+}
+
+void LatencyInjector::on_submitted_frame()
+{
+    auto now = std::chrono::steady_clock::now();
+    auto timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+
+    std::lock_guard<std::mutex> lock(m_timestamp_mutex);
+    m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_us);
+}
+
+std::pair<const uint8_t *, size_t> LatencyInjector::inject_sei(AL_EProfile profile, const uint8_t *encoded_data,
+                                                               size_t encoded_size)
+{
+    uint64_t timestamp_ns = 0;
+    uint64_t frame_idx = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_timestamp_mutex);
+        if (!m_frame_timestamps.empty())
+        {
+            auto it = m_frame_timestamps.begin();
+            frame_idx = it->first;
+            timestamp_ns = it->second;
+            m_frame_timestamps.erase(it);
+        }
+    }
+
+    if (timestamp_ns == 0)
+    {
+        return {encoded_data, encoded_size};
+    }
+
+    // Generate SEI NAL unit
+    uint8_t sei_nal[SEI_TIMESTAMP_MAX_SIZE];
+    size_t sei_size = 0;
+    int codec = (profile == AL_PROFILE_HEVC_MAIN || profile == AL_PROFILE_HEVC_MAIN10) ? SEI_CODEC_HEVC : SEI_CODEC_AVC;
+
+    if (SEIParser::SEI_GenerateTimestampNAL(codec, timestamp_ns, frame_idx, sei_nal, &sei_size) != 0 || sei_size == 0)
+    {
+        return {encoded_data, encoded_size};
+    }
+
+    // Prepend SEI to encoded data
+    std::memcpy(m_sei_buffer.data(), sei_nal, sei_size);
+    std::memcpy(m_sei_buffer.data() + sei_size, encoded_data, encoded_size);
+
+    return {m_sei_buffer.data(), m_sei_buffer.size()};
+}

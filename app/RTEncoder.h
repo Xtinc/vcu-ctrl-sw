@@ -39,9 +39,9 @@ struct EncoderConfig
     bool low_delay_mode = false; // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
 
     // Latency measurement configuration
-    bool enable_latency_measurement = false;  // Enable end-to-end latency measurement
-    uint16_t latency_sync_port = 5555;        // Clock sync server port (encoder acts as server)
-    bool latency_sei_per_frame = false;       // true = insert SEI every frame, false = I-frames only
+    bool enable_latency_measurement = false; // Enable end-to-end latency measurement
+    uint16_t latency_sync_port = 5555;       // Clock sync server port (encoder acts as server)
+    bool latency_sei_per_frame = false;      // true = insert SEI every frame, false = I-frames only
 };
 
 enum class SourceMode
@@ -180,6 +180,7 @@ class RTEncoderBase
      */
     explicit RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb);
     void signal_done();
+    void record_frame_timestamp();
 
   private:
     static void sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID);
@@ -191,13 +192,11 @@ class RTEncoderBase
     void init_stream_buf_pool();
     void push_stream_buffers();
     virtual void release_sources(AL_TBuffer const *pSrc) = 0;
+    
+    std::pair<const uint8_t *, size_t> inject_sei_if_needed(const uint8_t *encoded_data, size_t encoded_size,
+                                                            bool is_iframe, std::vector<uint8_t> &sei_buffer);
 
   protected:
-    // Latency measurement helpers
-    void record_frame_timestamp();
-    std::pair<const uint8_t*, size_t> inject_sei_if_needed(
-        const uint8_t *encoded_data, size_t encoded_size, bool is_iframe, std::vector<uint8_t> &sei_buffer);
-
     mutable std::mutex m_fps_mutex;
     double m_fps;
     double m_bitrate;
@@ -232,14 +231,6 @@ class RTEncoderBase
     std::mutex m_eos_mutex;
     std::condition_variable m_eos_cond;
     bool m_lib_initialized;
-
-    // Latency measurement
-    std::unique_ptr<class ClockSync> m_clock_sync;
-    std::chrono::steady_clock::time_point m_latency_start_time;
-    std::unordered_map<uint64_t, uint64_t> m_frame_timestamps; // frame_index -> timestamp_ns
-    uint64_t m_frame_index;
-    std::mutex m_timestamp_mutex;
-    std::vector<uint8_t> m_sei_buffer; // Pre-allocated buffer for SEI injection
 };
 
 template <SourceMode mode> class RTEncoder;
