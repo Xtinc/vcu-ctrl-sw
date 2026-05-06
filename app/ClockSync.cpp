@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: © 2024 Allegro DVT <github-ip@allegrodvt.com>
-// SPDX-License-Identifier: MIT
-
 #include "ClockSync.h"
 
 extern "C"
@@ -10,8 +7,7 @@ extern "C"
 
 #include <cstring>
 
-ClockSync::ClockSync()
-    : socket_(io_ctx_), timer_(io_ctx_)
+ClockSync::ClockSync() : socket_(io_ctx_), timer_(io_ctx_)
 {
 }
 
@@ -37,32 +33,26 @@ void ClockSync::start_server(uint16_t port)
         async_receive_request();
         io_thread_ = std::thread(&ClockSync::io_thread_func, this);
     }
-    catch (const std::exception& e)
+    catch (const std::exception &e)
     {
         VIDEO_ERROR_PRINT("[ClockSync] Failed to start server: %s", e.what());
     }
 }
 
-void ClockSync::start_client(const std::string& server_ip, uint16_t port)
+void ClockSync::start_client(const std::string &server_ip, uint16_t port)
 {
     try
     {
         is_server_ = false;
         socket_.open(asio::ip::udp::v4());
-        server_endpoint_ = asio::ip::udp::endpoint(
-            asio::ip::address::from_string(server_ip), port);
+        server_endpoint_ = asio::ip::udp::endpoint(asio::ip::address::from_string(server_ip), port);
 
         VIDEO_INFO_PRINT("[ClockSync] Client connecting to %s:%u", server_ip.c_str(), port);
-
-        // Send initial probe immediately
         async_send_probe();
-
-        // Schedule periodic calibration
         schedule_calibration();
-
         io_thread_ = std::thread(&ClockSync::io_thread_func, this);
     }
-    catch (const std::exception& e)
+    catch (const std::exception &e)
     {
         VIDEO_ERROR_PRINT("[ClockSync] Failed to start client: %s", e.what());
     }
@@ -74,7 +64,7 @@ void ClockSync::io_thread_func()
     {
         io_ctx_.run();
     }
-    catch (const std::exception& e)
+    catch (const std::exception &e)
     {
         VIDEO_ERROR_PRINT("[ClockSync] IO thread error: %s", e.what());
     }
@@ -83,7 +73,7 @@ void ClockSync::io_thread_func()
 void ClockSync::schedule_calibration()
 {
     timer_.expires_after(std::chrono::seconds(30));
-    timer_.async_wait([this](const asio::error_code& ec) {
+    timer_.async_wait([this](const asio::error_code &ec) {
         if (!ec)
         {
             async_send_probe();
@@ -94,31 +84,27 @@ void ClockSync::schedule_calibration()
 
 void ClockSync::async_receive_request()
 {
-    socket_.async_receive_from(
-        asio::buffer(recv_buffer_),
-        remote_endpoint_,
-        [this](const asio::error_code& ec, std::size_t bytes_received) {
-            if (!ec && bytes_received >= sizeof(SyncMessage))
-            {
-                SyncMessage msg;
-                std::memcpy(&msg, recv_buffer_.data(), sizeof(SyncMessage));
+    socket_.async_receive_from(asio::buffer(recv_buffer_), remote_endpoint_,
+                               [this](const asio::error_code &ec, std::size_t bytes_received) {
+                                   if (!ec && bytes_received >= sizeof(SyncMessage))
+                                   {
+                                       SyncMessage msg;
+                                       std::memcpy(&msg, recv_buffer_.data(), sizeof(SyncMessage));
 
-                if (is_server_ && msg.type == 0)
-                {
-                    // Server: handle sync request
-                    handle_request(msg, remote_endpoint_);
-                }
-                else if (!is_server_ && msg.type == 1)
-                {
-                    // Client: handle sync response
-                    uint64_t t4 = get_time_ns();
-                    handle_response(msg, t4);
-                }
-            }
-
-            // Continue receiving
-            async_receive_request();
-        });
+                                       if (is_server_ && msg.type == 0)
+                                       {
+                                           // Server: handle sync request
+                                           handle_request(msg, remote_endpoint_);
+                                       }
+                                       else if (!is_server_ && msg.type == 1)
+                                       {
+                                           // Client: handle sync response
+                                           uint64_t t4 = get_time_ns();
+                                           handle_response(msg, t4);
+                                       }
+                                   }
+                                   async_receive_request();
+                               });
 }
 
 void ClockSync::async_send_probe()
@@ -133,18 +119,16 @@ void ClockSync::async_send_probe()
     auto send_buffer = std::make_shared<std::array<uint8_t, sizeof(SyncMessage)>>();
     std::memcpy(send_buffer->data(), &msg, sizeof(SyncMessage));
 
-    socket_.async_send_to(
-        asio::buffer(*send_buffer),
-        server_endpoint_,
-        [send_buffer](const asio::error_code& ec, std::size_t /*bytes_sent*/) {
-            if (ec)
-            {
-                VIDEO_WARNING_PRINT("[ClockSync] Failed to send probe: %s", ec.message().c_str());
-            }
-        });
+    socket_.async_send_to(asio::buffer(*send_buffer), server_endpoint_,
+                          [send_buffer](const asio::error_code &ec, std::size_t /*bytes_sent*/) {
+                              if (ec)
+                              {
+                                  VIDEO_ERROR_PRINT("[ClockSync] Failed to send probe: %s", ec.message().c_str());
+                              }
+                          });
 }
 
-void ClockSync::handle_request(const SyncMessage& req, const asio::ip::udp::endpoint& client_endpoint)
+void ClockSync::handle_request(const SyncMessage &req, const asio::ip::udp::endpoint &client_endpoint)
 {
     uint64_t t2 = get_time_ns();
 
@@ -158,18 +142,16 @@ void ClockSync::handle_request(const SyncMessage& req, const asio::ip::udp::endp
     auto send_buffer = std::make_shared<std::array<uint8_t, sizeof(SyncMessage)>>();
     std::memcpy(send_buffer->data(), &resp, sizeof(SyncMessage));
 
-    socket_.async_send_to(
-        asio::buffer(*send_buffer),
-        client_endpoint,
-        [send_buffer](const asio::error_code& ec, std::size_t /*bytes_sent*/) {
-            if (ec)
-            {
-                VIDEO_WARNING_PRINT("[ClockSync] Failed to send response: %s", ec.message().c_str());
-            }
-        });
+    socket_.async_send_to(asio::buffer(*send_buffer), client_endpoint,
+                          [send_buffer](const asio::error_code &ec, std::size_t /*bytes_sent*/) {
+                              if (ec)
+                              {
+                                  VIDEO_ERROR_PRINT("[ClockSync] Failed to send response: %s", ec.message().c_str());
+                              }
+                          });
 }
 
-void ClockSync::handle_response(const SyncMessage& resp, uint64_t t4)
+void ClockSync::handle_response(const SyncMessage &resp, uint64_t t4)
 {
     // NTP algorithm
     // offset = ((T2 - T1) + (T3 - T4)) / 2
@@ -187,8 +169,7 @@ void ClockSync::handle_response(const SyncMessage& resp, uint64_t t4)
     rtt_ns_.store(rtt, std::memory_order_relaxed);
     synchronized_.store(true, std::memory_order_relaxed);
 
-    VIDEO_VERBOSE_PRINT("[ClockSync] Offset: %.3f ms, RTT: %.3f ms",
-                        offset / 1e6, rtt / 1e6);
+    VIDEO_ERROR_PRINT("[ClockSync] Offset: %.3f ms, RTT: %.3f ms", offset / 1e6, rtt / 1e6);
 }
 
 uint64_t ClockSync::get_time_ns()

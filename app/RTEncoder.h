@@ -5,6 +5,7 @@
 #include "MemMgr.h"
 #include <atomic>
 #include <chrono>
+#include <unordered_map>
 
 extern "C"
 {

@@ -1,7 +1,7 @@
 #include "RTDecoder.h"
 #include "ClockSync.h"
 #include "LatencyStats.h"
-#include "SEIParser.h"
+#include "SeiParser.h"
 
 extern "C"
 {

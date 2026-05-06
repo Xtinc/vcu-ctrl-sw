@@ -1,9 +1,9 @@
 #include "RTEncoder.h"
 #include "ClockSync.h"
+#include "SeiParser.h"
 
 extern "C"
 {
-#include "SEITimestamp.h"
 #include "lib_common/BufferStreamMeta.h"
 #include "lib_common/HardwareDriver.h"
 #include "lib_common/RoundUp.h"
@@ -507,22 +507,21 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
 
             if (m_callback && uSize)
             {
-                const uint8_t* send_data = pBase;
+                const uint8_t *send_data = pBase;
                 size_t send_size = uSize;
                 std::vector<uint8_t> combined_data;
 
                 // Inject SEI timestamp for latency measurement
                 if (m_cfg.enable_latency_measurement)
                 {
-                    // Check if this is an I-frame or if we inject per frame
-                    bool is_iframe = (pMeta->eType == AL_SLICE_I || pMeta->eType == AL_SLICE_IDR);
+                    bool is_iframe = eof;
                     bool should_inject = m_cfg.latency_sei_per_frame || is_iframe;
 
                     if (should_inject)
                     {
                         uint64_t timestamp_ns = 0;
                         uint64_t frame_idx = 0;
-                        
+
                         // Retrieve timestamp from map
                         {
                             std::lock_guard<std::mutex> lock(m_timestamp_mutex);
@@ -540,11 +539,14 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
                             // Generate SEI NAL unit
                             uint8_t sei_buffer[SEI_TIMESTAMP_MAX_SIZE];
                             size_t sei_size = 0;
-                            int codec = (m_cfg.profile == AL_PROFILE_HEVC_MAIN || 
-                                       m_cfg.profile == AL_PROFILE_HEVC_MAIN_10) ? 1 : 0;
-                            
-                            if (SEI_GenerateTimestampNAL(codec, timestamp_ns, frame_idx, 
-                                                        sei_buffer, &sei_size) == 0 && sei_size > 0)
+                            int codec =
+                                (m_cfg.profile == AL_PROFILE_HEVC_MAIN || m_cfg.profile == AL_PROFILE_HEVC_MAIN10)
+                                    ? SEI_CODEC_HEVC
+                                    : SEI_CODEC_AVC;
+
+                            if (SEIParser::SEI_GenerateTimestampNAL(codec, timestamp_ns, frame_idx, sei_buffer,
+                                                                    &sei_size) == 0 &&
+                                sei_size > 0)
                             {
                                 // Prepend SEI to encoded data
                                 combined_data.resize(sei_size + uSize);

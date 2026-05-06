@@ -1,15 +1,9 @@
 # Sources shared by both apps
 set(APP_COMMON_SRC
-    MemMgr.cpp
-    MemMgr.h
-    YUVFileIO.cpp
-    YUVFileIO.h
     ClockSync.cpp
-    ClockSync.h
-    LatencyStats.h
-    SEIParser.h
-    SEITimestamp.c
-    SEITimestamp.h
+    MemMgr.cpp
+    SeiParser.cpp
+    YUVFileIO.cpp
 )
 
 # --- Encoder app ---
