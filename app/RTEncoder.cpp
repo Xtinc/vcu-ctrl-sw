@@ -747,12 +747,6 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
         return false;
     }
 
-    // Record timestamp for latency measurement
-    if (m_cfg.enable_latency_measurement)
-    {
-        record_frame_timestamp();
-    }
-
     if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))
     {
         signal_done();
@@ -914,12 +908,6 @@ bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
     if (m_state.load() != State::Running || !pBuf)
     {
         return false;
-    }
-
-    // Record timestamp for latency measurement
-    if (m_cfg.enable_latency_measurement)
-    {
-        record_frame_timestamp();
     }
 
     if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))
