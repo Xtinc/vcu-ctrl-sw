@@ -1,6 +1,4 @@
-#include "SeiParser.h"
-
-#include <cstddef>
+#include "CustomSei.h"
 #include <cstring>
 
 /*
@@ -10,9 +8,9 @@
  * 3) payloadType: 5 (user_data_unregistered)
  * 4) payloadSize: variable-length byte encoding (0xFF chunks + remainder)
  * 5) payload data:
- *    - 16 bytes UUID (SEI_LATENCY_UUID)
- *    - 8 bytes timestamp_ns (big-endian)
- *    - 8 bytes frame_index (big-endian)
+ *    - 16 bytes UUID (sei_latency_uuid)
+ *    - 8 bytes timestamp_us (big-endian)
+ *    - 8 bytes reserved_dat (big-endian)
  * 6) RBSP trailing bits: 0x80
  */
 
@@ -40,8 +38,16 @@ static std::size_t encode_payload_size(uint8_t *buf, std::size_t payload_size)
     return written;
 }
 
-int SEIParser::SEI_GenerateTimestampNAL(int codec, uint64_t timestamp_ns, uint64_t frame_index, uint8_t *out_buffer,
-                                        std::size_t *out_size)
+static uint64_t read_u64_be(const uint8_t *buf)
+{
+    return (static_cast<uint64_t>(buf[0]) << 56) | (static_cast<uint64_t>(buf[1]) << 48) |
+           (static_cast<uint64_t>(buf[2]) << 40) | (static_cast<uint64_t>(buf[3]) << 32) |
+           (static_cast<uint64_t>(buf[4]) << 24) | (static_cast<uint64_t>(buf[5]) << 16) |
+           (static_cast<uint64_t>(buf[6]) << 8) | static_cast<uint64_t>(buf[7]);
+}
+
+int sei_generate_timestamp_nal(bool is_hevc, uint64_t timestamp_us, uint64_t reserved, uint8_t *out_buffer,
+                               std::size_t *out_size)
 {
     if (!out_buffer || !out_size)
     {
@@ -56,7 +62,7 @@ int SEIParser::SEI_GenerateTimestampNAL(int codec, uint64_t timestamp_ns, uint64
     p[offset++] = 0x00;
     p[offset++] = 0x01;
 
-    if (codec == SEI_CODEC_HEVC)
+    if (is_hevc)
     {
         p[offset++] = (39 << 1); // (nal_type << 1)
         p[offset++] = 1;         // (layer_id << 3) | temporal_id_plus1
@@ -69,40 +75,31 @@ int SEIParser::SEI_GenerateTimestampNAL(int codec, uint64_t timestamp_ns, uint64
     p[offset++] = 5;
     const std::size_t payload_size = 16 + 8 + 8;
     offset += encode_payload_size(&p[offset], payload_size);
-    std::memcpy(&p[offset], SEI_LATENCY_UUID, 16);
+    std::memcpy(&p[offset], sei_latency_uuid, 16);
     offset += 16;
-    write_u64_be(&p[offset], timestamp_ns);
+    write_u64_be(&p[offset], timestamp_us);
     offset += 8;
-    write_u64_be(&p[offset], frame_index);
+    write_u64_be(&p[offset], reserved);
     offset += 8;
     p[offset++] = 0x80;
     *out_size = offset;
     return 0;
 }
 
-bool SEIParser::parse_sei_timestamp(const uint8_t *payload, std::size_t payload_size, uint64_t &timestamp_ns,
-                                    uint64_t &frame_index)
+bool parse_sei_timestamp(const uint8_t *payload, std::size_t payload_size, uint64_t &timestamp_us, uint64_t &reserved)
 {
-    // Payload layout: 16-byte UUID | 8-byte timestamp_ns (BE) | 8-byte frame_index (BE)
+    // Payload layout: 16-byte UUID | 8-byte timestamp_us (BE) | 8-byte reserved (BE)
     if (!payload || payload_size < 32)
     {
         return false;
     }
 
-    if (std::memcmp(payload, SEI_LATENCY_UUID, 16) != 0)
+    if (std::memcmp(payload, sei_latency_uuid, 16) != 0)
     {
         return false;
     }
 
-    timestamp_ns = read_u64_be(payload + 16);
-    frame_index  = read_u64_be(payload + 24);
+    timestamp_us = read_u64_be(payload + 16);
+    reserved = read_u64_be(payload + 24);
     return true;
-}
-
-uint64_t SEIParser::read_u64_be(const uint8_t *buf)
-{
-    return (static_cast<uint64_t>(buf[0]) << 56) | (static_cast<uint64_t>(buf[1]) << 48) |
-           (static_cast<uint64_t>(buf[2]) << 40) | (static_cast<uint64_t>(buf[3]) << 32) |
-           (static_cast<uint64_t>(buf[4]) << 24) | (static_cast<uint64_t>(buf[5]) << 16) |
-           (static_cast<uint64_t>(buf[6]) << 8) | static_cast<uint64_t>(buf[7]);
 }

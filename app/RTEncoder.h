@@ -180,7 +180,6 @@ class RTEncoderBase
      */
     explicit RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb);
     void signal_done();
-    void record_frame_timestamp();
 
   private:
     static void sdk_callback(void *pUserParam, AL_TBuffer *pStream, AL_TBuffer const *pSrc, int iLayerID);
@@ -192,9 +191,6 @@ class RTEncoderBase
     void init_stream_buf_pool();
     void push_stream_buffers();
     virtual void release_sources(AL_TBuffer const *pSrc) = 0;
-    
-    std::pair<const uint8_t *, size_t> inject_sei_if_needed(const uint8_t *encoded_data, size_t encoded_size,
-                                                            bool is_iframe, std::vector<uint8_t> &sei_buffer);
 
   protected:
     mutable std::mutex m_fps_mutex;

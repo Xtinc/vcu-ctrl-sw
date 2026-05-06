@@ -3,18 +3,29 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 extern "C"
 {
 #include "lib_common/BufferAPI.h"
+#include "lib_common_enc/EncChanParam.h"
 }
+
+class ClockSync;
+struct FrameSeiData
+{
+    uint64_t timestamp = 0;
+    uint64_t reserved = 0;
+};
+
+using FrameSeiMap = std::unordered_map<AL_TBuffer *, FrameSeiData>;
+using SyncClockPtr = std::unique_ptr<ClockSync>;
 
 template <size_t N> class Histogram
 {
@@ -178,74 +189,48 @@ template <size_t N> class Histogram
     double observed_max;
 };
 
-// Latency measurement: per-frame SEI association
-// parsedSeiCB stores latest parsed SEI here; endParsingCB moves it into the map
-// keyed by rec buffer pointer; displayCB consumes and erases.
-struct FrameSeiData
-{
-    uint64_t timestamp_us = 0;
-    uint64_t frame_index = 0;
-};
-
-class ClockSync;
-
 class LatencyInjector
 {
   public:
     LatencyInjector();
-    ~LatencyInjector();
+    ~LatencyInjector() = default;
 
     void start(const std::string &server_ip, uint16_t port);
-    void on_submitted_frame();
-    std::pair<const uint8_t *, size_t> inject_sei(AL_EProfile profile, const uint8_t *encoded_data,
-                                                  size_t encoded_size);
+    void on_frame_submitted(AL_TBuffer *pSrcFrame);
+    std::pair<const uint8_t *, size_t> on_frame_encoded(int profile, const uint8_t *encoded_data, size_t encoded_size,
+                                                        AL_TBuffer *pSrcFrame);
 
   private:
-    std::unique_ptr<class ClockSync> m_clock_sync;
-    std::chrono::steady_clock::time_point m_latency_start_time;
-    std::unordered_map<uint64_t, uint64_t> m_frame_timestamps; // frame_index -> timestamp_ns
-    uint64_t m_frame_index;
-    std::mutex m_timestamp_mutex;
-    std::vector<uint8_t> m_sei_buffer; // Pre-allocated buffer for SEI injection
+    uint64_t pop_frame_timestamp(AL_TBuffer *pSrcFrame);
+
+  private:
+    SyncClockPtr m_clock;
+    FrameSeiMap m_frames;
+    std::mutex m_mutex;
+    std::vector<uint8_t> m_buffer;
 };
 
-/**
- * @brief End-to-end latency measurer: SEI timestamp extraction + clock sync + histogram statistics.
- *
- * ### Usage
- *   meas.start("192.168.1.1", 5555);   // connect to encoder clock-sync server
- *   meas.on_sei(type, payload, size);   // from parsedSeiCB
- *   meas.on_frame_displayed();          // from displayCB (main output only)
- */
 class LatencyMeasurer
 {
   public:
-    using Stats = Histogram<50>;
-
     explicit LatencyMeasurer(uint32_t log_interval = 100);
-    ~LatencyMeasurer();
+    ~LatencyMeasurer() = default;
 
     void start(const std::string &server_ip, uint16_t port);
     void on_sei(AL_TBuffer *pParsedFrame, int iParsingId);
     void on_frame_displayed(AL_TBuffer *pDisplayedFrame);
 
-    Stats &stats()
-    {
-        return m_stats;
-    }
-    const Stats &stats() const
-    {
-        return m_stats;
-    }
-
   private:
-    Stats m_stats;
-    std::unique_ptr<ClockSync> m_clock_sync;
+    bool try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsingId, FrameSeiData &out_data) const;
+    bool take_frame_sei_data(AL_TBuffer *pDisplayedFrame, FrameSeiData &out_data);
+    void log_stats_if_needed(uint64_t frame_index);
+
+    Histogram<10> m_stats;
+    SyncClockPtr m_clock_sync;
     uint32_t m_log_interval;
     uint32_t m_frame_count;
-    FrameSeiData m_last_parsed_sei; // SDK decode thread only
-    std::mutex m_sei_map_mutex;     // guards m_frame_sei_map
-    std::unordered_map<AL_TBuffer *, FrameSeiData> m_frame_sei_map;
+    std::mutex m_sei_map_mutex;
+    FrameSeiMap m_frame_sei_map;
 };
 
 #endif // LATENCY_STATS_H
