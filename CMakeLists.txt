@@ -35,6 +35,11 @@ add_compile_definitions(AL_ENABLE_64BIT=1)
 
 find_package(Threads REQUIRED)
 
+# asio
+add_library(asio INTERFACE)
+target_include_directories(asio INTERFACE asio-1.30.2/include)
+target_compile_definitions(asio INTERFACE $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0601>)
+
 # Global include paths
 include_directories(
     ${CMAKE_SOURCE_DIR}

@@ -26,6 +26,11 @@ struct DecoderConfig
     uint32_t input_buffer_num = 4;                      ///< Number of input stream buffers in the pool.
     std::string dec_dev_path = "/dev/allegroDecodeIP";  ///< Device file path of the VCU decode IP.
     bool low_delay_mode = false;                        ///< Enable low-latency (frame-level) decode mode.
+
+    // Latency measurement configuration
+    bool enable_latency_measurement = false;       ///< Enable end-to-end latency measurement
+    std::string latency_sync_server_ip = "";       ///< Encoder IP address for clock sync (decoder acts as client)
+    uint16_t latency_sync_server_port = 5555;      ///< Encoder clock sync server port
 };
 
 /**
@@ -227,6 +232,13 @@ class RTDecoder
     std::mutex m_eos_mutex;
     std::condition_variable m_eos_cv;
     bool m_lib_initialized;
+
+    // Latency measurement
+    std::unique_ptr<class ClockSync> m_clock_sync;
+    std::unique_ptr<class LatencyStats> m_latency_stats;
+    uint32_t m_latency_frame_count;
+    std::atomic<uint64_t> m_last_sei_timestamp_ns;
+    std::atomic<uint64_t> m_last_sei_frame_index;
 };
 
 #endif // REALTIME_DECODER_H

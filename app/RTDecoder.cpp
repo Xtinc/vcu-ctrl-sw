@@ -1,4 +1,7 @@
 #include "RTDecoder.h"
+#include "ClockSync.h"
+#include "LatencyStats.h"
+#include "SEIParser.h"
 
 extern "C"
 {
@@ -22,7 +25,8 @@ using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
 RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
     : m_cfg(cfg), m_callback(std::move(cb)), m_pAllocator(nullptr), m_pScheduler(nullptr), m_hDec(nullptr),
       m_cbbundles{}, m_fps(0.0), m_frame_count(0), m_fps_last_time(std::chrono::steady_clock::now()),
-      m_state{State::Running}, m_lib_initialized(false)
+      m_state{State::Running}, m_lib_initialized(false), m_latency_frame_count(0),
+      m_last_sei_timestamp_ns(0), m_last_sei_frame_index(0)
 {
     try
     {
@@ -37,6 +41,22 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
             throw std::runtime_error(std::string("AL_Lib_Decoder_Init failed: ") + AL_Codec_ErrorToString(err));
         }
         m_lib_initialized = true;
+
+        // Initialize latency measurement if enabled
+        if (m_cfg.enable_latency_measurement)
+        {
+            if (m_cfg.latency_sync_server_ip.empty())
+            {
+                throw std::invalid_argument("latency_sync_server_ip must be set when enable_latency_measurement is true");
+            }
+            
+            m_clock_sync = std::make_unique<ClockSync>();
+            m_clock_sync->start_client(m_cfg.latency_sync_server_ip, m_cfg.latency_sync_server_port);
+            m_latency_stats = std::make_unique<LatencyStats>(1000);
+            
+            VIDEO_INFO_PRINT("[RTDecoder] Latency measurement enabled (sync server: %s:%u)", 
+                           m_cfg.latency_sync_server_ip.c_str(), m_cfg.latency_sync_server_port);
+        }
 
         m_pAllocator = AL_DmaAlloc_Create(m_cfg.dec_dev_path.c_str());
         if (!m_pAllocator)
@@ -106,6 +126,20 @@ bool RTDecoder::push_stream(const void *data, size_t size, uint8_t flags)
     if (m_state.load() != State::Running)
     {
         return false;
+    }
+
+    // Parse SEI timestamp if latency measurement is enabled
+    if (m_cfg.enable_latency_measurement && data && size > 0)
+    {
+        uint64_t timestamp_ns = 0;
+        uint64_t frame_index = 0;
+        
+        if (SEIParser::parse_sei_timestamp(static_cast<const uint8_t*>(data), size, 
+                                          timestamp_ns, frame_index))
+        {
+            m_last_sei_timestamp_ns.store(timestamp_ns, std::memory_order_relaxed);
+            m_last_sei_frame_index.store(frame_index, std::memory_order_relaxed);
+        }
     }
 
     auto buf = m_src_buf_pool->get_buffer();
@@ -327,6 +361,39 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
     }
 
     update_fps();
+
+    // Calculate latency if measurement is enabled
+    if (m_cfg.enable_latency_measurement && m_clock_sync && m_latency_stats)
+    {
+        uint64_t sei_timestamp = m_last_sei_timestamp_ns.exchange(0, std::memory_order_relaxed);
+        
+        if (sei_timestamp > 0 && m_clock_sync->is_synchronized())
+        {
+            auto now = std::chrono::high_resolution_clock::now();
+            auto decode_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+            
+            int64_t clock_offset = m_clock_sync->get_offset_ns();
+            int64_t latency_ns = decode_time_ns - static_cast<int64_t>(sei_timestamp) - clock_offset;
+            double latency_ms = latency_ns / 1e6;
+            
+            // Only record positive, reasonable latencies (< 10 seconds)
+            if (latency_ms > 0 && latency_ms < 10000)
+            {
+                m_latency_stats->add_sample(latency_ms);
+                
+                // Log latency statistics every 100 frames
+                if (++m_latency_frame_count % 100 == 0)
+                {
+                    VIDEO_INFO_PRINT("[Latency] avg=%.2fms, p99=%.2fms, max=%.2fms, min=%.2fms (samples=%zu)",
+                                   m_latency_stats->get_average(),
+                                   m_latency_stats->get_p99(),
+                                   m_latency_stats->get_max(),
+                                   m_latency_stats->get_min(),
+                                   m_latency_stats->get_sample_count());
+                }
+            }
+        }
+    }
 
     auto s = m_state.load(std::memory_order_relaxed);
     if (s == State::Running || s == State::Flushing)

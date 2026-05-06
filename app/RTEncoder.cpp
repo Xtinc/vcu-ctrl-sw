@@ -1,7 +1,9 @@
 #include "RTEncoder.h"
+#include "ClockSync.h"
 
 extern "C"
 {
+#include "SEITimestamp.h"
 #include "lib_common/BufferStreamMeta.h"
 #include "lib_common/HardwareDriver.h"
 #include "lib_common/RoundUp.h"
@@ -15,6 +17,7 @@ extern "C"
 }
 
 #include <algorithm>
+#include <unordered_map>
 
 static constexpr int kStreamSmoothingCount = 2;
 static constexpr int kHeightAlign = 8;
@@ -129,7 +132,8 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
 
     : m_fps(0.0), m_bitrate(0), m_frame_count(0), m_bytes_count(0), m_fps_last_time(std::chrono::steady_clock::now()),
       m_cfg(cfg), m_callback(std::move(cb)), m_dma_proxy(cfg.dma_dev_path.c_str()), m_pAllocator(nullptr),
-      m_pScheduler(nullptr), m_hEnc(nullptr), m_pic_format{}, m_src_fourcc{}, m_lib_initialized(false)
+      m_pScheduler(nullptr), m_hEnc(nullptr), m_pic_format{}, m_src_fourcc{}, m_lib_initialized(false),
+      m_latency_start_time(std::chrono::steady_clock::now()), m_frame_index(0)
 // m_state is brace-initialized to State::Running in the class definition.
 {
     try
@@ -158,6 +162,14 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         if (!m_pScheduler)
         {
             throw std::runtime_error("Failed to create MCU scheduler");
+        }
+
+        // Initialize latency measurement if enabled
+        if (m_cfg.enable_latency_measurement)
+        {
+            m_clock_sync = std::make_unique<ClockSync>();
+            m_clock_sync->start_server(m_cfg.latency_sync_port);
+            VIDEO_INFO_PRINT("[RTEncoder] Latency measurement enabled (sync port: %u)", m_cfg.latency_sync_port);
         }
 
         m_pic_format = AL_EncGetSrcPicFormat(m_cfg.chroma_mode, m_cfg.bit_depth, AL_SRC_RASTER);
@@ -495,9 +507,60 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
 
             if (m_callback && uSize)
             {
+                const uint8_t* send_data = pBase;
+                size_t send_size = uSize;
+                std::vector<uint8_t> combined_data;
+
+                // Inject SEI timestamp for latency measurement
+                if (m_cfg.enable_latency_measurement)
+                {
+                    // Check if this is an I-frame or if we inject per frame
+                    bool is_iframe = (pMeta->eType == AL_SLICE_I || pMeta->eType == AL_SLICE_IDR);
+                    bool should_inject = m_cfg.latency_sei_per_frame || is_iframe;
+
+                    if (should_inject)
+                    {
+                        uint64_t timestamp_ns = 0;
+                        uint64_t frame_idx = 0;
+                        
+                        // Retrieve timestamp from map
+                        {
+                            std::lock_guard<std::mutex> lock(m_timestamp_mutex);
+                            if (!m_frame_timestamps.empty())
+                            {
+                                auto it = m_frame_timestamps.begin();
+                                frame_idx = it->first;
+                                timestamp_ns = it->second;
+                                m_frame_timestamps.erase(it);
+                            }
+                        }
+
+                        if (timestamp_ns > 0)
+                        {
+                            // Generate SEI NAL unit
+                            uint8_t sei_buffer[SEI_TIMESTAMP_MAX_SIZE];
+                            size_t sei_size = 0;
+                            int codec = (m_cfg.profile == AL_PROFILE_HEVC_MAIN || 
+                                       m_cfg.profile == AL_PROFILE_HEVC_MAIN_10) ? 1 : 0;
+                            
+                            if (SEI_GenerateTimestampNAL(codec, timestamp_ns, frame_idx, 
+                                                        sei_buffer, &sei_size) == 0 && sei_size > 0)
+                            {
+                                // Prepend SEI to encoded data
+                                combined_data.resize(sei_size + uSize);
+                                std::memcpy(combined_data.data(), sei_buffer, sei_size);
+                                std::memcpy(combined_data.data() + sei_size, pBase, uSize);
+                                send_data = combined_data.data();
+                                send_size = combined_data.size();
+                            }
+                        }
+                    }
+                }
+
+                // Send data (with or without SEI)
                 try
                 {
-                    m_callback(pBase, uSize);
+                    m_callback(send_data, send_size);
                 }
                 catch (...)
                 {
@@ -745,6 +808,15 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
         return false;
     }
 
+    // Record timestamp for latency measurement
+    if (m_cfg.enable_latency_measurement)
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        auto timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        std::lock_guard<std::mutex> lock(m_timestamp_mutex);
+        m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_ns);
+    }
+
     if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))
     {
         signal_done();
@@ -906,6 +978,15 @@ bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
     if (m_state.load() != State::Running || !pBuf)
     {
         return false;
+    }
+
+    // Record timestamp for latency measurement
+    if (m_cfg.enable_latency_measurement)
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        auto timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        std::lock_guard<std::mutex> lock(m_timestamp_mutex);
+        m_frame_timestamps[m_frame_index++] = static_cast<uint64_t>(timestamp_ns);
     }
 
     if (!AL_Encoder_Process(m_hEnc, pBuf, nullptr))

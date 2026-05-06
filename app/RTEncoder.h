@@ -36,6 +36,11 @@ struct EncoderConfig
     std::string enc_dev_path = "/dev/allegroIP";  // Encoder device node (e.g., "/dev/allegroIP")
     std::string dma_dev_path = "/dev/dmaproxy";   // DMAProxy device node (e.g., "/dev/dmaproxy")
     bool low_delay_mode = false; // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
+
+    // Latency measurement configuration
+    bool enable_latency_measurement = false;  // Enable end-to-end latency measurement
+    uint16_t latency_sync_port = 5555;        // Clock sync server port (encoder acts as server)
+    bool latency_sei_per_frame = false;       // true = insert SEI every frame, false = I-frames only
 };
 
 enum class SourceMode
@@ -221,6 +226,13 @@ class RTEncoderBase
     std::mutex m_eos_mutex;
     std::condition_variable m_eos_cond;
     bool m_lib_initialized;
+
+    // Latency measurement
+    std::unique_ptr<class ClockSync> m_clock_sync;
+    std::chrono::steady_clock::time_point m_latency_start_time;
+    std::unordered_map<uint64_t, uint64_t> m_frame_timestamps; // frame_index -> timestamp_ns
+    uint64_t m_frame_index;
+    std::mutex m_timestamp_mutex;
 };
 
 template <SourceMode mode> class RTEncoder;

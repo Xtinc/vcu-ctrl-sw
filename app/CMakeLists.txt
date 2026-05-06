@@ -4,6 +4,12 @@ set(APP_COMMON_SRC
     MemMgr.h
     YUVFileIO.cpp
     YUVFileIO.h
+    ClockSync.cpp
+    ClockSync.h
+    LatencyStats.h
+    SEIParser.h
+    SEITimestamp.c
+    SEITimestamp.h
 )
 
 # --- Encoder app ---
@@ -22,6 +28,7 @@ target_link_libraries(vcu_enc
     PRIVATE
     liballegro_encode_static
     liballegro_app_static
+    asio
 )
 
 # --- Decoder-to-YUV app ---
@@ -35,4 +42,5 @@ target_link_libraries(vcu_dec
     PRIVATE
     liballegro_decode_static
     liballegro_app_static
+    asio
 )
