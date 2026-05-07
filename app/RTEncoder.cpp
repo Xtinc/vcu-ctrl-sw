@@ -546,7 +546,6 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
         AL_StreamMetaData_ClearAllSections(pMeta);
     }
 
-    // Only return the stream buffer while the pipeline is alive.
     auto s = m_state.load(std::memory_order_relaxed);
     if (s == State::Running || s == State::Flushing)
     {

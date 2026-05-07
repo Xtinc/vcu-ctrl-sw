@@ -1,5 +1,5 @@
 #include "RTDecoder.h"
-#include "CustomSei.h"
+#include "LatencyStats.h"
 
 extern "C"
 {
@@ -83,6 +83,12 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
                                   "rt_decoder_stream"))
         {
             throw std::runtime_error("Failed to initialize stream buffer pool");
+        }
+
+        if (m_cfg.enable_latency_measurement)
+        {
+            m_sei_measurer = std::make_unique<LatencyMeasurer>();
+            m_sei_measurer->start(m_cfg.latency_sync_server_ip, m_cfg.latency_sync_server_port);
         }
     }
     catch (...)
@@ -323,6 +329,11 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         return;
     }
 
+    if (m_sei_measurer)
+    {
+        m_sei_measurer->on_frame_displayed(pFrame);
+    }
+
     // Call user callback with decoded frame
     try
     {
@@ -362,11 +373,12 @@ void RTDecoder::on_sdk_error(AL_ERR eError)
 
 void RTDecoder::on_sdk_end_parsing(AL_TBuffer *pParsedFrame, int iParsingId)
 {
-    (void)iParsingId;
-    if (!m_cfg.enable_latency_measurement || !pParsedFrame)
+    if (!pParsedFrame || !m_sei_measurer)
     {
         return;
     }
+
+    m_sei_measurer->on_sei(pParsedFrame, iParsingId);
 }
 
 AL_TDecOutputSettings RTDecoder::derive_output_settings(AL_TStreamSettings const &stream_settings)

@@ -7,11 +7,12 @@ extern "C"
 #include "lib_decode/lib_decode.h"
 }
 
-#include "LatencyStats.h"
 #include "MemMgr.h"
 #include <atomic>
 #include <chrono>
 #include <unordered_map>
+
+class LatencyMeasurer;
 
 /**
  * @brief Configuration parameters for RTDecoder.
@@ -236,6 +237,7 @@ class RTDecoder
     std::mutex m_eos_mutex;
     std::condition_variable m_eos_cv;
     bool m_lib_initialized;
+    std::unique_ptr<LatencyMeasurer> m_sei_measurer;
 };
 
 #endif // REALTIME_DECODER_H

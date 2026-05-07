@@ -1,6 +1,5 @@
 #include "LatencyStats.h"
 #include "ClockSync.h"
-#include "CustomSei.h"
 
 extern "C"
 {
@@ -12,12 +11,62 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
-LatencyInjector::LatencyInjector()
+static constexpr std::size_t kLatencySeiPayloadSize = 32;
+static constexpr uint8_t kLatencySeiUuid[16] = {0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x47, 0x89,
+                                                0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90};
+
+static uint64_t read_u64_be(const uint8_t *buf)
 {
+    return (static_cast<uint64_t>(buf[0]) << 56) | (static_cast<uint64_t>(buf[1]) << 48) |
+           (static_cast<uint64_t>(buf[2]) << 40) | (static_cast<uint64_t>(buf[3]) << 32) |
+           (static_cast<uint64_t>(buf[4]) << 24) | (static_cast<uint64_t>(buf[5]) << 16) |
+           (static_cast<uint64_t>(buf[6]) << 8) | static_cast<uint64_t>(buf[7]);
 }
+
+static void write_u64_be(uint8_t *buf, uint64_t value)
+{
+    buf[0] = static_cast<uint8_t>((value >> 56) & 0xFF);
+    buf[1] = static_cast<uint8_t>((value >> 48) & 0xFF);
+    buf[2] = static_cast<uint8_t>((value >> 40) & 0xFF);
+    buf[3] = static_cast<uint8_t>((value >> 32) & 0xFF);
+    buf[4] = static_cast<uint8_t>((value >> 24) & 0xFF);
+    buf[5] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    buf[6] = static_cast<uint8_t>((value >> 8) & 0xFF);
+    buf[7] = static_cast<uint8_t>(value & 0xFF);
+}
+
+static void build_latency_sei_payload(uint8_t *payload, const FrameSeiData &data)
+{
+    std::memset(payload, 0, kLatencySeiPayloadSize);
+    std::memcpy(payload, kLatencySeiUuid, sizeof(kLatencySeiUuid));
+    write_u64_be(payload + 16, data.timestamp);
+    write_u64_be(payload + 24, data.reserved);
+}
+
+static bool parse_latency_sei_payload(const uint8_t *payload, std::size_t payload_size, FrameSeiData &out_data)
+{
+    if (!payload || payload_size < kLatencySeiPayloadSize)
+    {
+        return false;
+    }
+
+    if (std::memcmp(payload, kLatencySeiUuid, sizeof(kLatencySeiUuid)) != 0)
+    {
+        return false;
+    }
+
+    out_data.timestamp = read_u64_be(payload + 16);
+    out_data.reserved = read_u64_be(payload + 24);
+    return true;
+}
+
+LatencyInjector::LatencyInjector() = default;
+
+LatencyInjector::~LatencyInjector() = default;
 
 void LatencyInjector::start(const std::string &server_ip, uint16_t port)
 {
+    (void)server_ip;
     m_clock = std::make_unique<ClockSync>();
     m_clock->start_server(port);
 }
@@ -63,13 +112,8 @@ bool LatencyInjector::on_frame_encoded(AL_HEncoder hEnc, AL_TBuffer *pStream, AL
     }
 
     // user_data_unregistered payload: UUID(16) + timestamp_us(8) + reserved(8)
-    uint8_t payload[32] = {};
-    std::memcpy(payload, sei_latency_uuid, 16);
-    for (int i = 0; i < 8; ++i)
-    {
-        payload[16 + i] = static_cast<uint8_t>((data.timestamp >> ((7 - i) * 8)) & 0xFF);
-        payload[24 + i] = static_cast<uint8_t>((data.reserved >> ((7 - i) * 8)) & 0xFF);
-    }
+    uint8_t payload[kLatencySeiPayloadSize] = {};
+    build_latency_sei_payload(payload, data);
 
     auto *stream_meta = (AL_TStreamMetaData *)AL_Buffer_GetMetaData(pStream, AL_META_TYPE_STREAM);
     if (!stream_meta)
@@ -100,6 +144,8 @@ LatencyMeasurer::LatencyMeasurer(uint32_t log_interval) : m_log_interval(log_int
 {
 }
 
+LatencyMeasurer::~LatencyMeasurer() = default;
+
 void LatencyMeasurer::start(const std::string &server_ip, uint16_t port)
 {
     m_clock_sync = std::make_unique<ClockSync>();
@@ -114,10 +160,11 @@ bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsin
         return false;
     }
 
-    if (iParsingId > AL_HandleMetaData_GetNumHandles(pHandlesMeta))
+    const int num_handles = AL_HandleMetaData_GetNumHandles(pHandlesMeta);
+    if (iParsingId < 0 || iParsingId >= num_handles)
     {
         VIDEO_ERROR_PRINT("LatencyMeasurer::on_sei: ParsingId %d is out of bounds (num handles = %d)", iParsingId,
-                          AL_HandleMetaData_GetNumHandles(pHandlesMeta));
+                          num_handles);
         return false;
     }
 
@@ -134,15 +181,27 @@ bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsin
         return false;
     }
 
-    auto seiMeta = (AL_TSeiMetaData *)AL_Buffer_GetMetaData(pStream, AL_META_TYPE_SEI);
-    if (!seiMeta)
+    while (true)
     {
-        return false;
+        auto *seiMeta = (AL_TSeiMetaData *)AL_Buffer_GetMetaData(pStream, AL_META_TYPE_SEI);
+        if (!seiMeta)
+        {
+            break;
+        }
+
+        AL_Buffer_RemoveMetaData(pStream, (AL_TMetaData *)seiMeta);
+
+        auto *payload = seiMeta->payload;
+        for (int i = 0; i < seiMeta->numPayload; ++i, ++payload)
+        {
+            if (parse_latency_sei_payload(payload->pData, payload->size, out_data))
+            {
+                return true;
+            }
+        }
     }
 
-    AL_Buffer_RemoveMetaData(pStream, (AL_TMetaData *)seiMeta);
-    parse_sei_timestamp(seiMeta->payload->pData, seiMeta->payload->size, out_data.timestamp, out_data.reserved);
-    return true;
+    return false;
 }
 
 void LatencyMeasurer::on_sei(AL_TBuffer *pParsedFrame, int iParsingId)

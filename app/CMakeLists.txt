@@ -1,7 +1,6 @@
 # Sources shared by both apps
 set(APP_COMMON_SRC
     ClockSync.cpp
-    CustomSei.cpp
     LatencyStats.cpp
     MemMgr.cpp
     YUVFileIO.cpp

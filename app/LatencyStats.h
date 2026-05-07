@@ -194,7 +194,7 @@ class LatencyInjector
 {
   public:
     LatencyInjector();
-    ~LatencyInjector() = default;
+    ~LatencyInjector();
 
     void start(const std::string &server_ip, uint16_t port);
     void on_frame_submitted(AL_TBuffer *pSrcFrame);
@@ -214,7 +214,7 @@ class LatencyMeasurer
 {
   public:
     explicit LatencyMeasurer(uint32_t log_interval = 100);
-    ~LatencyMeasurer() = default;
+    ~LatencyMeasurer();
 
     void start(const std::string &server_ip, uint16_t port);
     void on_sei(AL_TBuffer *pParsedFrame, int iParsingId);
