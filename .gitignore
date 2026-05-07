@@ -3,3 +3,4 @@ cmake-build
 *.md
 *.json
 .vs
+exe_encoder

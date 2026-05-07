@@ -1,18 +1,19 @@
 #include "LatencyStats.h"
 #include "ClockSync.h"
-#include "SeiParser.h"
+#include "CustomSei.h"
 
 extern "C"
 {
 #include "lib_common/BufferHandleMeta.h"
 #include "lib_common/BufferSeiMeta.h"
+#include "lib_common/BufferStreamMeta.h"
 #include "lib_decode/lib_decode.h"
+#include "lib_encode/lib_encoder.h"
 #include "lib_rtos/message.h"
 }
 
 LatencyInjector::LatencyInjector()
 {
-    m_buffer.resize(16 * 1024);
 }
 
 void LatencyInjector::start(const std::string &server_ip, uint16_t port)
@@ -34,51 +35,65 @@ void LatencyInjector::on_frame_submitted(AL_TBuffer *pSrcFrame)
     m_frames[pSrcFrame] = FrameSeiData{static_cast<uint64_t>(timestamp_us), 0};
 }
 
-uint64_t LatencyInjector::pop_frame_timestamp(AL_TBuffer *pSrcFrame)
+bool LatencyInjector::pop_frame_data(AL_TBuffer *pSrcFrame, FrameSeiData &out_data)
 {
     if (!pSrcFrame)
     {
-        return 0;
+        return false;
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_frames.find(pSrcFrame);
     if (it == m_frames.end())
     {
-        return 0;
+        return false;
     }
 
-    const uint64_t timestamp_us = it->second.timestamp;
+    out_data = it->second;
     m_frames.erase(it);
-    return timestamp_us;
+    return true;
 }
 
-std::pair<const uint8_t *, size_t> LatencyInjector::on_frame_encoded(int profile, const uint8_t *encoded_data,
-                                                                     size_t encoded_size, AL_TBuffer *pSrcFrame)
+bool LatencyInjector::on_frame_encoded(AL_HEncoder hEnc, AL_TBuffer *pStream, AL_TBuffer *pSrcFrame)
 {
-    const uint64_t timestamp_us = pop_frame_timestamp(pSrcFrame);
-
-    if (timestamp_us == 0)
+    FrameSeiData data{};
+    if (!pop_frame_data(pSrcFrame, data))
     {
-        return {encoded_data, encoded_size};
+        return true;
     }
 
-    // Generate SEI NAL unit
-    uint8_t sei_nal[sei_timestamp_max_size];
-    size_t sei_size = 0;
-    uint64_t frame_idx = 0;
-    const bool is_hevc = (profile == AL_PROFILE_HEVC_MAIN || profile == AL_PROFILE_HEVC_MAIN10);
-
-    if (sei_generate_timestamp_nal(is_hevc, timestamp_us, frame_idx, sei_nal, &sei_size) != 0 || sei_size == 0)
+    // user_data_unregistered payload: UUID(16) + timestamp_us(8) + reserved(8)
+    uint8_t payload[32] = {};
+    std::memcpy(payload, sei_latency_uuid, 16);
+    for (int i = 0; i < 8; ++i)
     {
-        return {encoded_data, encoded_size};
+        payload[16 + i] = static_cast<uint8_t>((data.timestamp >> ((7 - i) * 8)) & 0xFF);
+        payload[24 + i] = static_cast<uint8_t>((data.reserved >> ((7 - i) * 8)) & 0xFF);
     }
 
-    // Prepend SEI to encoded data
-    std::memcpy(m_buffer.data(), sei_nal, sei_size);
-    std::memcpy(m_buffer.data() + sei_size, encoded_data, encoded_size);
+    auto *stream_meta = (AL_TStreamMetaData *)AL_Buffer_GetMetaData(pStream, AL_META_TYPE_STREAM);
+    if (!stream_meta)
+    {
+        VIDEO_ERROR_PRINT("LatencyInjector: missing stream metadata for SEI injection");
+        return false;
+    }
 
-    return {m_buffer.data(), sei_size + encoded_size};
+    constexpr int sei_payload_type_user_data_unregistered = 5;
+    const int section_id = AL_Encoder_AddSei(hEnc, pStream, true, sei_payload_type_user_data_unregistered, payload,
+                                             sizeof(payload), stream_meta->uTemporalID);
+    if (section_id < 0)
+    {
+        VIDEO_ERROR_PRINT("LatencyInjector: AL_Encoder_AddSei failed (section_id=%d)", section_id);
+        return false;
+    }
+
+    return true;
+}
+
+void LatencyInjector::on_frame_skipped(AL_TBuffer *pSrcFrame)
+{
+    FrameSeiData dummy{};
+    (void)pop_frame_data(pSrcFrame, dummy);
 }
 
 LatencyMeasurer::LatencyMeasurer(uint32_t log_interval) : m_log_interval(log_interval), m_frame_count(0)

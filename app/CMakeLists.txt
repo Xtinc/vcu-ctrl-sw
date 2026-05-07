@@ -1,8 +1,9 @@
 # Sources shared by both apps
 set(APP_COMMON_SRC
     ClockSync.cpp
+    CustomSei.cpp
+    LatencyStats.cpp
     MemMgr.cpp
-    SeiParser.cpp
     YUVFileIO.cpp
 )
 
@@ -21,7 +22,7 @@ add_executable(vcu_enc
 target_link_libraries(vcu_enc
     PRIVATE
     liballegro_encode_static
-    liballegro_app_static
+    liballegro_decode_static
     asio
 )
 
@@ -34,7 +35,7 @@ add_executable(vcu_dec
 )
 target_link_libraries(vcu_dec
     PRIVATE
+    liballegro_encode_static
     liballegro_decode_static
-    liballegro_app_static
     asio
 )

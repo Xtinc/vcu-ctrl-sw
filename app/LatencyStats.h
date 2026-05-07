@@ -15,6 +15,7 @@ extern "C"
 {
 #include "lib_common/BufferAPI.h"
 #include "lib_common_enc/EncChanParam.h"
+#include "lib_encode/lib_encoder.h"
 }
 
 class ClockSync;
@@ -197,17 +198,16 @@ class LatencyInjector
 
     void start(const std::string &server_ip, uint16_t port);
     void on_frame_submitted(AL_TBuffer *pSrcFrame);
-    std::pair<const uint8_t *, size_t> on_frame_encoded(int profile, const uint8_t *encoded_data, size_t encoded_size,
-                                                        AL_TBuffer *pSrcFrame);
+    bool on_frame_encoded(AL_HEncoder hEnc, AL_TBuffer *pStream, AL_TBuffer *pSrcFrame);
+    void on_frame_skipped(AL_TBuffer *pSrcFrame);
 
   private:
-    uint64_t pop_frame_timestamp(AL_TBuffer *pSrcFrame);
+    bool pop_frame_data(AL_TBuffer *pSrcFrame, FrameSeiData &out_data);
 
   private:
     SyncClockPtr m_clock;
     FrameSeiMap m_frames;
     std::mutex m_mutex;
-    std::vector<uint8_t> m_buffer;
 };
 
 class LatencyMeasurer

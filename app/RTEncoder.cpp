@@ -1,6 +1,6 @@
 #include "RTEncoder.h"
 #include "ClockSync.h"
-#include "SeiParser.h"
+#include "LatencyStats.h"
 
 extern "C"
 {
@@ -100,7 +100,26 @@ static uint32_t write_filler_data_section(DMAProxy &mem_ctl, AL_TBuffer *source,
     return section.uLength;
 }
 
-static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int firstSection, bool &eof)
+static void get_section_flag(const AL_TStreamMetaData *meta, int firstSection, bool &eof, bool &idr)
+{
+    eof = false;
+    idr = false;
+
+    for (int i = firstSection; i < meta->uNumSection; i++)
+    {
+        if (meta->pSections[i].eFlags & AL_SECTION_SYNC_FLAG)
+        {
+            idr = true;
+        }
+
+        if (meta->pSections[i].eFlags & AL_SECTION_END_FRAME_FLAG)
+        {
+            eof = true;
+        }
+    }
+}
+
+static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int firstSection)
 {
     uint32_t size = 0;
     auto meta = (AL_TStreamMetaData *)(AL_Buffer_GetMetaData(stream, AL_META_TYPE_STREAM));
@@ -117,11 +136,6 @@ static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int fi
         else
         {
             size += write_one_section(mem_ctl, stream, stream, static_cast<int>(size), i);
-        }
-
-        if (!eof && meta->pSections[i].eFlags & AL_SECTION_END_FRAME_FLAG)
-        {
-            eof = true;
         }
     }
 
@@ -199,6 +213,12 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         init_stream_buf_pool();
         push_stream_buffers();
         set_resolution(m_cfg.width, m_cfg.height);
+
+        if (m_cfg.enable_latency_measurement)
+        {
+            m_sei_injector = std::make_unique<LatencyInjector>();
+            m_sei_injector->start("", m_cfg.latency_sync_port);
+        }
     }
     catch (...)
     {
@@ -487,26 +507,42 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
 
     auto pMeta = reinterpret_cast<AL_TStreamMetaData *>(AL_Buffer_GetMetaData(pStream, AL_META_TYPE_STREAM));
     bool eof = false;
+    bool idr = false;
+
     if (pMeta)
     {
-        if (pMeta->uNumSection > 0)
+        get_section_flag(pMeta, 0, eof, idr);
+        if (m_sei_injector)
         {
-            const auto *pBase = AL_Buffer_GetData(pStream);
-            const auto uSize = reconstruct_stream(m_dma_proxy, pStream, 0, eof);
-            m_bytes_count += uSize;
-
-            if (m_callback && uSize)
+            if (idr)
             {
-                try
+                if (!m_sei_injector->on_frame_encoded(m_hEnc, pStream, const_cast<AL_TBuffer *>(pSrc)))
                 {
-                    m_callback(pBase, uSize);
-                }
-                catch (...)
-                {
-                    signal_done();
+                    return;
                 }
             }
+            else
+            {
+                m_sei_injector->on_frame_skipped(const_cast<AL_TBuffer *>(pSrc));
+            }
         }
+
+        const auto *pBase = AL_Buffer_GetData(pStream);
+        const auto uSize = reconstruct_stream(m_dma_proxy, pStream, 0);
+        m_bytes_count += uSize;
+
+        if (m_callback && uSize)
+        {
+            try
+            {
+                m_callback(pBase, uSize);
+            }
+            catch (...)
+            {
+                signal_done();
+            }
+        }
+
         AL_StreamMetaData_ClearAllSections(pMeta);
     }
 
@@ -752,6 +788,12 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
         signal_done();
         return false;
     }
+
+    if (m_sei_injector)
+    {
+        m_sei_injector->on_frame_submitted(pBuf);
+    }
+
     return true;
 }
 
@@ -916,6 +958,11 @@ bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
                           AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
         signal_done();
         return false;
+    }
+
+    if (m_sei_injector)
+    {
+        m_sei_injector->on_frame_submitted(pBuf);
     }
 
     return true;

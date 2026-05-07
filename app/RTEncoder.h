@@ -50,6 +50,8 @@ enum class SourceMode
     V4L2
 };
 
+class LatencyInjector;
+
 /**
  * @brief RTEncoderBase is a hardware-accelerated video encoder wrapper for the Allegro DVT VCU SDK.
  *
@@ -211,6 +213,7 @@ class RTEncoderBase
 
     std::unique_ptr<PixMapBufPool> m_source_buf_pool;
     std::unique_ptr<GenericBufPool> m_stream_buf_pool;
+    std::unique_ptr<LatencyInjector> m_sei_injector;
 
     AL_TPicFormat m_pic_format;
     TFourCC m_src_fourcc;

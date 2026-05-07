@@ -1,4 +1,5 @@
 #include "RTDecoder.h"
+#include "CustomSei.h"
 
 extern "C"
 {
@@ -14,8 +15,6 @@ extern "C"
 #include "lib_fpga/DmaAlloc.h"
 #include "lib_rtos/message.h"
 }
-
-#include "SeiParser.h"
 
 #include <cstring>
 
