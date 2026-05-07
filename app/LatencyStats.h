@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -18,7 +19,6 @@ extern "C"
 #include "lib_encode/lib_encoder.h"
 }
 
-class ClockSync;
 struct FrameSeiData
 {
     uint64_t timestamp = 0;
@@ -26,7 +26,7 @@ struct FrameSeiData
 };
 
 using FrameSeiMap = std::unordered_map<AL_TBuffer *, FrameSeiData>;
-using SyncClockPtr = std::unique_ptr<ClockSync>;
+using FrameSeiFifo = std::deque<FrameSeiData>;
 
 template <size_t N> class Histogram
 {
@@ -195,8 +195,6 @@ class LatencyInjector
   public:
     LatencyInjector();
     ~LatencyInjector();
-
-    void start(const std::string &server_ip, uint16_t port);
     void on_frame_submitted(AL_TBuffer *pSrcFrame);
     bool on_frame_encoded(AL_HEncoder hEnc, AL_TBuffer *pStream, AL_TBuffer *pSrcFrame);
     void on_frame_skipped(AL_TBuffer *pSrcFrame);
@@ -205,7 +203,6 @@ class LatencyInjector
     bool pop_frame_data(AL_TBuffer *pSrcFrame, FrameSeiData &out_data);
 
   private:
-    SyncClockPtr m_clock;
     FrameSeiMap m_frames;
     std::mutex m_mutex;
 };
@@ -213,24 +210,24 @@ class LatencyInjector
 class LatencyMeasurer
 {
   public:
-    explicit LatencyMeasurer(uint32_t log_interval = 100);
+    explicit LatencyMeasurer(bool is_low_latency);
     ~LatencyMeasurer();
-
-    void start(const std::string &server_ip, uint16_t port);
     void on_sei(AL_TBuffer *pParsedFrame, int iParsingId);
+    void on_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size);
     void on_frame_displayed(AL_TBuffer *pDisplayedFrame);
 
   private:
     bool try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsingId, FrameSeiData &out_data) const;
     bool take_frame_sei_data(AL_TBuffer *pDisplayedFrame, FrameSeiData &out_data);
-    void log_stats_if_needed(uint64_t frame_index);
+    bool take_parsed_sei_data(FrameSeiData &out_data);
+    double latency_e2e() const;
 
+  private:
     Histogram<10> m_stats;
-    SyncClockPtr m_clock_sync;
-    uint32_t m_log_interval;
-    uint32_t m_frame_count;
-    std::mutex m_sei_map_mutex;
+    const bool m_low_latency;
+    mutable std::mutex m_mutex;
     FrameSeiMap m_frame_sei_map;
+    FrameSeiFifo m_parsed_sei_fifo;
 };
 
 #endif // LATENCY_STATS_H

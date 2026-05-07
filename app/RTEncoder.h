@@ -36,12 +36,8 @@ struct EncoderConfig
     uint32_t num_stream_bufs = 4;                 // Number of output stream buffers
     std::string enc_dev_path = "/dev/allegroIP";  // Encoder device node (e.g., "/dev/allegroIP")
     std::string dma_dev_path = "/dev/dmaproxy";   // DMAProxy device node (e.g., "/dev/dmaproxy")
-    bool low_delay_mode = false; // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
-
-    // Latency measurement configuration
-    bool enable_latency_measurement = false; // Enable end-to-end latency measurement
-    uint16_t latency_sync_port = 5555;       // Clock sync server port (encoder acts as server)
-    bool latency_sei_per_frame = false;      // true = insert SEI every frame, false = I-frames only
+    bool low_delay_mode = false;                  // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
+    bool enable_latency_measurement = false;      // Enable end-to-end latency measurement
 };
 
 enum class SourceMode

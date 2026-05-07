@@ -8,15 +8,15 @@ set(APP_COMMON_SRC
 
 # --- Encoder app ---
 add_executable(vcu_enc
-    main_enc.cpp
     ${APP_COMMON_SRC}
+    DMAFd.h
+    main_enc.cpp
     RTEncoder.cpp
     RTEncoder.h
     V4L2Source.cpp
     V4L2Source.h
     XilinxSyncIP.cpp
     XilinxSyncIP.h
-    DMAFd.h
 )
 target_link_libraries(vcu_enc
     PRIVATE
@@ -27,10 +27,12 @@ target_link_libraries(vcu_enc
 
 # --- Decoder-to-YUV app ---
 add_executable(vcu_dec
-    main_dec.cpp
     ${APP_COMMON_SRC}
+    main_dec.cpp
     RTDecoder.cpp
     RTDecoder.h
+    SliceFeeder.cpp
+    SliceFeeder.h
 )
 target_link_libraries(vcu_dec
     PRIVATE

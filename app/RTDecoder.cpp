@@ -6,6 +6,7 @@ extern "C"
 #include "lib_common/BufCommon.h"
 #include "lib_common/BufferAPI.h"
 #include "lib_common/BufferPictureDecMeta.h"
+#include "lib_common/BufferSeiMeta.h"
 #include "lib_common/DisplayInfoMeta.h"
 #include "lib_common/FourCC.h"
 #include "lib_common/PicFormat.h"
@@ -19,6 +20,7 @@ extern "C"
 #include <cstring>
 
 using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
+using AL_MetaDataGuard = std::unique_ptr<AL_TMetaData, decltype(&AL_MetaData_Destroy)>;
 
 RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
     : m_cfg(cfg), m_callback(std::move(cb)), m_pAllocator(nullptr), m_pScheduler(nullptr), m_hDec(nullptr),
@@ -53,7 +55,14 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
 
         AL_DecSettings_SetDefaults(&m_dec_settings);
         m_dec_settings.eCodec = m_cfg.codec;
-        m_dec_settings.eInputMode = m_cfg.input_mode;
+        if (m_cfg.low_delay_mode)
+        {
+            m_dec_settings.bLowLat = true;
+            m_dec_settings.eDecUnit = AL_VCL_NAL_UNIT;
+            m_dec_settings.eDpbMode = AL_DPB_NO_REORDERING;
+            m_dec_settings.eInputMode = AL_DEC_SPLIT_INPUT;
+        }
+
         auto result = AL_DecSettings_CheckValidity(&m_dec_settings, nullptr);
         if (result > 0)
         {
@@ -71,6 +80,7 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
         m_cbbundles.resolutionFoundCB = {&RTDecoder::sdk_resolution_found, this};
         m_cbbundles.errorCB = {&RTDecoder::sdk_error, this};
         m_cbbundles.endParsingCB = {&RTDecoder::sdk_end_parsing, this};
+        m_cbbundles.parsedSeiCB = {&RTDecoder::sdk_parsed_sei, this};
 
         err = AL_Decoder_Create(&m_hDec, m_pScheduler, m_pAllocator, &m_dec_settings, &m_cbbundles);
         if (AL_IS_ERROR_CODE(err) || !m_hDec)
@@ -78,18 +88,17 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
             throw std::runtime_error(std::string("AL_Decoder_Create failed: ") + AL_Codec_ErrorToString(err));
         }
 
+        AL_TMetaData *stream_meta_template = reinterpret_cast<AL_TMetaData *>(AL_SeiMetaData_Create(32, 2 * 1024));
+        AL_MetaDataGuard stream_meta_guard(stream_meta_template, &AL_MetaData_Destroy);
+
         m_src_buf_pool = std::make_unique<GenericBufPool>();
-        if (!m_src_buf_pool->init(m_pAllocator, m_cfg.input_buffer_num, m_cfg.input_buffer_size, nullptr,
+        if (!m_src_buf_pool->init(m_pAllocator, m_cfg.input_buffer_num, m_cfg.input_buffer_size, stream_meta_template,
                                   "rt_decoder_stream"))
         {
             throw std::runtime_error("Failed to initialize stream buffer pool");
         }
 
-        if (m_cfg.enable_latency_measurement)
-        {
-            m_sei_measurer = std::make_unique<LatencyMeasurer>();
-            m_sei_measurer->start(m_cfg.latency_sync_server_ip, m_cfg.latency_sync_server_port);
-        }
+        m_sei_measurer = std::make_unique<LatencyMeasurer>(m_cfg.low_delay_mode);
     }
     catch (...)
     {
@@ -153,10 +162,10 @@ bool RTDecoder::flush()
     auto is_done = [this] { return m_state.load(std::memory_order_relaxed) >= State::Done; };
 
     std::unique_lock<std::mutex> lock(m_eos_mutex);
-    const bool ok = m_eos_cv.wait_for(lock, std::chrono::seconds(5), is_done);
+    const bool ok = m_eos_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.flush_timeout_ms), is_done);
     if (!ok)
     {
-        VIDEO_ERROR_PRINT("RTDecoder: flush timeout (5 s) waiting for EOS");
+        VIDEO_ERROR_PRINT("RTDecoder: flush timeout (%u ms) waiting for EOS", m_cfg.flush_timeout_ms);
         m_state.store(State::Done);
     }
 
@@ -214,6 +223,12 @@ void RTDecoder::sdk_end_parsing(AL_TBuffer *pParsedFrame, void *pUserParam, int 
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
     self->on_sdk_end_parsing(pParsedFrame, iParsingId);
+}
+
+void RTDecoder::sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam)
+{
+    auto *self = static_cast<RTDecoder *>(pUserParam);
+    self->on_sdk_parsed_sei(is_prefix, payload_type, payload, payload_size);
 }
 
 void RTDecoder::on_sdk_end_decoding(AL_TBuffer *pFrame)
@@ -379,6 +394,16 @@ void RTDecoder::on_sdk_end_parsing(AL_TBuffer *pParsedFrame, int iParsingId)
     }
 
     m_sei_measurer->on_sei(pParsedFrame, iParsingId);
+}
+
+void RTDecoder::on_sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size)
+{
+    if (!m_sei_measurer)
+    {
+        return;
+    }
+
+    m_sei_measurer->on_parsed_sei(is_prefix, payload_type, payload, payload_size);
 }
 
 AL_TDecOutputSettings RTDecoder::derive_output_settings(AL_TStreamSettings const &stream_settings)

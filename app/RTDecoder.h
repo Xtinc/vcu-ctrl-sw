@@ -23,17 +23,12 @@ class LatencyMeasurer;
  */
 struct DecoderConfig
 {
-    AL_ECodec codec = AL_CODEC_HEVC;                    ///< Video codec (HEVC or AVC).
-    AL_EDecInputMode input_mode = AL_DEC_UNSPLIT_INPUT; ///< Stream framing mode fed to the decoder.
-    uint32_t input_buffer_size = 512 * 1024;            ///< Size in bytes of each input stream buffer.
-    uint32_t input_buffer_num = 4;                      ///< Number of input stream buffers in the pool.
-    std::string dec_dev_path = "/dev/allegroDecodeIP";  ///< Device file path of the VCU decode IP.
-    bool low_delay_mode = false;                        ///< Enable low-latency (frame-level) decode mode.
-
-    // Latency measurement configuration
-    bool enable_latency_measurement = false;  ///< Enable end-to-end latency measurement
-    std::string latency_sync_server_ip = "";  ///< Encoder IP address for clock sync (decoder acts as client)
-    uint16_t latency_sync_server_port = 5555; ///< Encoder clock sync server port
+    AL_ECodec codec = AL_CODEC_HEVC;                   ///< Video codec (HEVC or AVC).
+    uint32_t input_buffer_size = 512 * 1024;           ///< Size in bytes of each input stream buffer.
+    uint32_t input_buffer_num = 4;                     ///< Number of input stream buffers in the pool.
+    std::string dec_dev_path = "/dev/allegroDecodeIP"; ///< Device file path of the VCU decode IP.
+    bool low_delay_mode = false;                       ///< Enable low-latency profile (split input + VCL unit decode).
+    uint32_t flush_timeout_ms = 5000;                  ///< Timeout in milliseconds while waiting for decoder EOS.
 };
 
 /**
@@ -188,12 +183,14 @@ class RTDecoder
     static void sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam);
     static void sdk_error(AL_ERR eError, void *pUserParam);
     static void sdk_end_parsing(AL_TBuffer *pParsedFrame, void *pUserParam, int iParsingId);
+    static void sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam);
     void on_sdk_end_decoding(AL_TBuffer *pFrame);
     AL_ERR on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                    AL_TCropInfo const *pCropInfo);
     void on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo);
     void on_sdk_error(AL_ERR eError);
     void on_sdk_end_parsing(AL_TBuffer *pParsedFrame, int iParsingId);
+    void on_sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size);
 
     static AL_TDecOutputSettings derive_output_settings(AL_TStreamSettings const &stream_settings);
     void configure_rec_pool(AL_TPicFormat const &pic_format, AL_TDimension const &dim, int pitch_y);
@@ -219,6 +216,7 @@ class RTDecoder
 
     std::unique_ptr<GenericBufPool> m_src_buf_pool;
     std::unique_ptr<PixMapBufPool> m_rec_buf_pool;
+    std::unique_ptr<LatencyMeasurer> m_sei_measurer;
 
     mutable std::mutex m_fps_mutex;
     double m_fps;
@@ -237,7 +235,6 @@ class RTDecoder
     std::mutex m_eos_mutex;
     std::condition_variable m_eos_cv;
     bool m_lib_initialized;
-    std::unique_ptr<LatencyMeasurer> m_sei_measurer;
 };
 
 #endif // REALTIME_DECODER_H

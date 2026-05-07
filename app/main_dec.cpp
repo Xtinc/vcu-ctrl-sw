@@ -10,6 +10,7 @@
  */
 
 #include "RTDecoder.h"
+#include "SliceFeeder.h"
 #include "YUVFileIO.h"
 
 extern "C"
@@ -19,10 +20,10 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
-#include <cstdint>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -30,12 +31,70 @@ extern "C"
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kChunkSize = 512u * 1024u; // 512 KB matches default input_buffer_size
 
+enum class FeedMode
+{
+    Chunk,
+    Slice,
+};
+
+static bool parse_codec_or_mode(std::string const &token, AL_ECodec &codec, FeedMode &feed_mode)
+{
+    if (token == "avc" || token == "h264")
+    {
+        codec = AL_CODEC_AVC;
+        return true;
+    }
+
+    if (token == "hevc" || token == "h265")
+    {
+        codec = AL_CODEC_HEVC;
+        return true;
+    }
+
+    if (token == "slice")
+    {
+        feed_mode = FeedMode::Slice;
+        return true;
+    }
+
+    if (token == "chunk")
+    {
+        feed_mode = FeedMode::Chunk;
+        return true;
+    }
+
+    return false;
+}
+
+static bool feed_stream_by_chunk(std::ifstream &input_file, RTDecoder &decoder)
+{
+    std::vector<uint8_t> chunk(kChunkSize);
+    while (input_file.good())
+    {
+        input_file.read(reinterpret_cast<char *>(chunk.data()), static_cast<std::streamsize>(kChunkSize));
+        std::streamsize bytes_read = input_file.gcount();
+        if (bytes_read <= 0)
+        {
+            break;
+        }
+
+        if (!decoder.push_stream(chunk.data(), static_cast<size_t>(bytes_read)))
+        {
+            VIDEO_ERROR_PRINT("push_stream failed - decoder has stopped");
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 static void print_usage(const char *app)
 {
-    VIDEO_ERROR_PRINT("Usage: %s <input.hevc|avc> <output.yuv> [hevc|avc]", app);
+    VIDEO_ERROR_PRINT("Usage: %s <input.hevc|avc> <output.yuv> [hevc|avc] [chunk|slice]", app);
     VIDEO_ERROR_PRINT("  Reads the compressed bitstream, decodes it, and writes 10 s of YUV.");
     VIDEO_ERROR_PRINT("  codec argument: hevc (default), h265, avc, or h264");
+    VIDEO_ERROR_PRINT("  input mode    : chunk (default) or slice (Annex-B NAL based)");
 }
 
 // ---------------------------------------------------------------------------
@@ -51,18 +110,22 @@ int main(int argc, char *argv[])
     const std::string input_path = argv[1];
     const std::string output_path = argv[2];
 
-    // ---- Codec selection --------------------------------------------------
+    // ---- Codec / input mode selection ------------------------------------
     AL_ECodec codec = AL_CODEC_HEVC;
-    if (argc >= 4)
+    FeedMode feed_mode = FeedMode::Chunk;
+
+    if (argc > 5)
     {
-        const std::string codec_str = argv[3];
-        if (codec_str == "avc" || codec_str == "h264")
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    for (int i = 3; i < argc; ++i)
+    {
+        const std::string token = argv[i];
+        if (!parse_codec_or_mode(token, codec, feed_mode))
         {
-            codec = AL_CODEC_AVC;
-        }
-        else if (codec_str != "hevc" && codec_str != "h265")
-        {
-            VIDEO_ERROR_PRINT("Unknown codec '%s'. Use hevc or avc.", codec_str.c_str());
+            VIDEO_ERROR_PRINT("Unknown argument '%s'. Use codec (hevc/avc) and mode (chunk/slice).", token.c_str());
             return EXIT_FAILURE;
         }
     }
@@ -79,77 +142,60 @@ int main(int argc, char *argv[])
     //      callback thread (protected by writer_mutex where needed).
     std::mutex writer_mutex;
     std::unique_ptr<YuvFileIO> yuv_writer;
-
-    bool first_frame = true;
     uint32_t frames_written = 0;
 
     // ---- Build decoder config ---------------------------------------------
     DecoderConfig cfg;
     cfg.codec = codec;
     cfg.input_buffer_size = kChunkSize;
+    cfg.low_delay_mode = (feed_mode == FeedMode::Slice);
 
     // ---- Create decoder and callback --------------------------------------
     RTDecoder decoder(cfg, [&](AL_TBuffer *pFrame, AL_TInfoDecode const &info) {
         std::lock_guard<std::mutex> lock(writer_mutex);
-
-        // Lazy-initialise the YUV writer on the very first decoded frame so
-        // we know the exact pixel format, dimensions, and FourCC.
-        if (first_frame)
+        if (!yuv_writer)
         {
-            first_frame = false; // prevent retry even on failure
             TFourCC fourcc = AL_PixMapBuffer_GetFourCC(pFrame);
             int width = info.tDim.iWidth;
             int height = info.tDim.iHeight;
 
-            yuv_writer =
-                std::make_unique<YuvFileIO>(output_path, YuvFileIO::Mode::Write, width, height, fourcc);
-
+            yuv_writer = std::make_unique<YuvFileIO>(output_path, YuvFileIO::Mode::Write, width, height, fourcc);
             if (!yuv_writer->open())
             {
                 VIDEO_ERROR_PRINT("Failed to open output file: %s", output_path.c_str());
-                yuv_writer.reset();
                 return;
             }
 
-            VIDEO_INFO_PRINT("Stream: %dx%d  FourCC=0x%08X  -> %s", width, height,
-                             static_cast<unsigned>(fourcc), output_path.c_str());
-        }
-
-        if (!yuv_writer || !yuv_writer->is_open())
-        {
-            return;
+            VIDEO_INFO_PRINT("Stream: %dx%d  FourCC=0x%08X  -> %s", width, height, static_cast<unsigned>(fourcc),
+                             output_path.c_str());
         }
 
         if (!yuv_writer->write_frame(pFrame))
         {
             VIDEO_ERROR_PRINT("Failed to write frame %u", frames_written);
+            return;
         }
-        else
+
+        if (++frames_written % 100 == 0)
         {
-            ++frames_written;
-            if (frames_written % 100 == 0)
-            {
-                VIDEO_INFO_PRINT("Written %u frames", frames_written);
-            }
+            VIDEO_INFO_PRINT("Written %u frames", frames_written);
         }
     });
 
-    // ---- Feed bitstream in chunks -----------------------------------------
-    std::vector<uint8_t> chunk(kChunkSize);
-    while (input_file.good())
+    // ---- Feed bitstream ---------------------------------------------------
+    if (feed_mode == FeedMode::Slice)
     {
-        input_file.read(reinterpret_cast<char *>(chunk.data()),
-                        static_cast<std::streamsize>(kChunkSize));
-        std::streamsize bytes_read = input_file.gcount();
-        if (bytes_read <= 0)
+        SliceFeeder feeder(codec, kChunkSize);
+        if (!feeder.feed(input_file, decoder))
         {
-            break;
+            VIDEO_ERROR_PRINT("Slice-mode input failed");
         }
-
-        if (!decoder.push_stream(chunk.data(), static_cast<size_t>(bytes_read)))
+    }
+    else
+    {
+        if (!feed_stream_by_chunk(input_file, decoder))
         {
-            VIDEO_ERROR_PRINT("push_stream failed - decoder has stopped");
-            break;
+            VIDEO_ERROR_PRINT("Chunk-mode input failed");
         }
     }
 
@@ -159,7 +205,7 @@ int main(int argc, char *argv[])
         VIDEO_ERROR_PRINT("Decoder flush timed out; output may be incomplete");
     }
 
-    if (yuv_writer && yuv_writer->is_open())
+    if (yuv_writer)
     {
         yuv_writer->close();
     }

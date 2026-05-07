@@ -1,5 +1,6 @@
 #include "LatencyStats.h"
-#include "ClockSync.h"
+
+#include <cstring>
 
 extern "C"
 {
@@ -12,6 +13,7 @@ extern "C"
 }
 
 static constexpr std::size_t kLatencySeiPayloadSize = 32;
+static constexpr int kSeiPayloadTypeUserDataUnregistered = 5;
 static constexpr uint8_t kLatencySeiUuid[16] = {0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x47, 0x89,
                                                 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90};
 
@@ -64,13 +66,6 @@ LatencyInjector::LatencyInjector() = default;
 
 LatencyInjector::~LatencyInjector() = default;
 
-void LatencyInjector::start(const std::string &server_ip, uint16_t port)
-{
-    (void)server_ip;
-    m_clock = std::make_unique<ClockSync>();
-    m_clock->start_server(port);
-}
-
 void LatencyInjector::on_frame_submitted(AL_TBuffer *pSrcFrame)
 {
     if (!pSrcFrame)
@@ -115,15 +110,14 @@ bool LatencyInjector::on_frame_encoded(AL_HEncoder hEnc, AL_TBuffer *pStream, AL
     uint8_t payload[kLatencySeiPayloadSize] = {};
     build_latency_sei_payload(payload, data);
 
-    auto *stream_meta = (AL_TStreamMetaData *)AL_Buffer_GetMetaData(pStream, AL_META_TYPE_STREAM);
+    auto *stream_meta = reinterpret_cast<AL_TStreamMetaData *>(AL_Buffer_GetMetaData(pStream, AL_META_TYPE_STREAM));
     if (!stream_meta)
     {
         VIDEO_ERROR_PRINT("LatencyInjector: missing stream metadata for SEI injection");
         return false;
     }
 
-    constexpr int sei_payload_type_user_data_unregistered = 5;
-    const int section_id = AL_Encoder_AddSei(hEnc, pStream, true, sei_payload_type_user_data_unregistered, payload,
+    const int section_id = AL_Encoder_AddSei(hEnc, pStream, true, kSeiPayloadTypeUserDataUnregistered, payload,
                                              sizeof(payload), stream_meta->uTemporalID);
     if (section_id < 0)
     {
@@ -140,21 +134,16 @@ void LatencyInjector::on_frame_skipped(AL_TBuffer *pSrcFrame)
     (void)pop_frame_data(pSrcFrame, dummy);
 }
 
-LatencyMeasurer::LatencyMeasurer(uint32_t log_interval) : m_log_interval(log_interval), m_frame_count(0)
+LatencyMeasurer::LatencyMeasurer(bool is_low_latency) : m_low_latency(is_low_latency)
 {
 }
 
 LatencyMeasurer::~LatencyMeasurer() = default;
 
-void LatencyMeasurer::start(const std::string &server_ip, uint16_t port)
-{
-    m_clock_sync = std::make_unique<ClockSync>();
-    m_clock_sync->start_client(server_ip, port);
-}
-
 bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsingId, FrameSeiData &out_data) const
 {
-    AL_THandleMetaData *pHandlesMeta = (AL_THandleMetaData *)AL_Buffer_GetMetaData(pParsedFrame, AL_META_TYPE_HANDLE);
+    AL_THandleMetaData *pHandlesMeta =
+        reinterpret_cast<AL_THandleMetaData *>(AL_Buffer_GetMetaData(pParsedFrame, AL_META_TYPE_HANDLE));
     if (!pHandlesMeta)
     {
         return false;
@@ -168,7 +157,8 @@ bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsin
         return false;
     }
 
-    AL_TDecMetaHandle *pDecMetaHandle = (AL_TDecMetaHandle *)AL_HandleMetaData_GetHandle(pHandlesMeta, iParsingId);
+    AL_TDecMetaHandle *pDecMetaHandle =
+        reinterpret_cast<AL_TDecMetaHandle *>(AL_HandleMetaData_GetHandle(pHandlesMeta, iParsingId));
     if (pDecMetaHandle->eState != AL_DEC_HANDLE_STATE_PROCESSED)
     {
         return false;
@@ -181,23 +171,26 @@ bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsin
         return false;
     }
 
-    while (true)
+    while (auto *seiMeta = reinterpret_cast<AL_TSeiMetaData *>(AL_Buffer_GetMetaData(pStream, AL_META_TYPE_SEI)))
     {
-        auto *seiMeta = (AL_TSeiMetaData *)AL_Buffer_GetMetaData(pStream, AL_META_TYPE_SEI);
-        if (!seiMeta)
-        {
-            break;
-        }
+        AL_Buffer_RemoveMetaData(pStream, reinterpret_cast<AL_TMetaData *>(seiMeta));
 
-        AL_Buffer_RemoveMetaData(pStream, (AL_TMetaData *)seiMeta);
-
+        bool matched = false;
         auto *payload = seiMeta->payload;
         for (int i = 0; i < seiMeta->numPayload; ++i, ++payload)
         {
             if (parse_latency_sei_payload(payload->pData, payload->size, out_data))
             {
-                return true;
+                matched = true;
+                break;
             }
+        }
+
+        AL_MetaData_Destroy(reinterpret_cast<AL_TMetaData *>(seiMeta));
+
+        if (matched)
+        {
+            return true;
         }
     }
 
@@ -206,13 +199,41 @@ bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsin
 
 void LatencyMeasurer::on_sei(AL_TBuffer *pParsedFrame, int iParsingId)
 {
+    if (!m_low_latency)
+    {
+        return;
+    }
+
     FrameSeiData data{};
-    std::lock_guard<std::mutex> lock(m_sei_map_mutex);
     if (!try_extract_sei_data(pParsedFrame, iParsingId, data))
     {
         return;
     }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_frame_sei_map[pParsedFrame] = data;
+}
+
+void LatencyMeasurer::on_parsed_sei(bool /*is_prefix*/, int payload_type, uint8_t *payload, int payload_size)
+{
+    if (m_low_latency)
+    {
+        return;
+    }
+
+    if (payload_type != kSeiPayloadTypeUserDataUnregistered)
+    {
+        return;
+    }
+
+    FrameSeiData data{};
+    if (!parse_latency_sei_payload(payload, static_cast<std::size_t>(payload_size), data))
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_parsed_sei_fifo.push_back(data);
 }
 
 bool LatencyMeasurer::take_frame_sei_data(AL_TBuffer *pDisplayedFrame, FrameSeiData &out_data)
@@ -228,44 +249,41 @@ bool LatencyMeasurer::take_frame_sei_data(AL_TBuffer *pDisplayedFrame, FrameSeiD
     return true;
 }
 
-void LatencyMeasurer::log_stats_if_needed(uint64_t frame_index)
+bool LatencyMeasurer::take_parsed_sei_data(FrameSeiData &out_data)
 {
-    if (++m_frame_count % m_log_interval != 0)
+    if (m_parsed_sei_fifo.empty())
     {
-        return;
+        return false;
     }
 
-    VIDEO_INFO_PRINT("[Latency] frame=%llu p50=%.2fms p95=%.2fms p99=%.2fms",
-                     static_cast<unsigned long long>(frame_index), m_stats.quantile(0.5), m_stats.quantile(0.95),
-                     m_stats.quantile(0.99));
+    out_data = m_parsed_sei_fifo.front();
+    m_parsed_sei_fifo.pop_front();
+    return true;
 }
 
 void LatencyMeasurer::on_frame_displayed(AL_TBuffer *pDisplayedFrame)
 {
-    if (!m_clock_sync || !m_clock_sync->is_synchronized())
-    {
-        return;
-    }
-
     const auto now_us =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count();
     FrameSeiData frame_data{};
+    bool found = false;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_low_latency)
     {
-        std::lock_guard<std::mutex> lock(m_sei_map_mutex);
-        if (!take_frame_sei_data(pDisplayedFrame, frame_data))
-        {
-            return;
-        }
+        found = take_frame_sei_data(pDisplayedFrame, frame_data);
+    }
+    else
+    {
+        found = take_parsed_sei_data(frame_data);
     }
 
-    const double latency_ms = (now_us - static_cast<int64_t>(frame_data.timestamp) - m_clock_sync->get_offset_us());
-
-    if (latency_ms <= 0 || latency_ms >= 10000)
+    if (!found)
     {
         return;
     }
 
+    const double latency_ms = (now_us - static_cast<int64_t>(frame_data.timestamp));
     m_stats.add(latency_ms);
-    log_stats_if_needed(frame_data.reserved);
 }

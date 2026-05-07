@@ -217,7 +217,6 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         if (m_cfg.enable_latency_measurement)
         {
             m_sei_injector = std::make_unique<LatencyInjector>();
-            m_sei_injector->start("", m_cfg.latency_sync_port);
         }
     }
     catch (...)
