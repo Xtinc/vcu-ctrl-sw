@@ -184,7 +184,6 @@ class RTDecoder
     static void sdk_error(AL_ERR eError, void *pUserParam);
     static void sdk_end_parsing(AL_TBuffer *pParsedFrame, void *pUserParam, int iParsingId);
     static void sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam);
-    void on_sdk_end_decoding(AL_TBuffer *pFrame);
     AL_ERR on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                    AL_TCropInfo const *pCropInfo);
     void on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo);
@@ -197,9 +196,9 @@ class RTDecoder
     bool attach_display_metadata(AL_TBuffer *pDecPict);
     bool can_reuse_rec_pool(AL_TPicFormat const &pic_format, AL_TDimension const &dim, int pitch_y) const;
 
-    void signal_done();            // transitions to Done and wakes flush() waiter
-    void signal_error(AL_ERR err); // logs error then calls signal_done()
-    void update_fps();             // called from on_sdk_display per output frame
+    void signal_done();                                 // transitions to Done and wakes flush() waiter
+    void signal_error(AL_ERR err);                      // logs error then calls signal_done()
+    void update_fps();                                  // called from on_sdk_display per output frame
     void cleanup();
 
   private:
@@ -218,8 +217,7 @@ class RTDecoder
     std::unique_ptr<PixMapBufPool> m_rec_buf_pool;
     std::unique_ptr<LatencyMeasurer> m_sei_measurer;
 
-    mutable std::mutex m_fps_mutex;
-    double m_fps;
+    std::atomic<double> m_fps;
     uint32_t m_frame_count;
     std::chrono::steady_clock::time_point m_fps_last_time;
 
@@ -228,7 +226,7 @@ class RTDecoder
         Running = 0,  ///< Normal operation: accepts input, allows rec-buffer return
         Flushing = 1, ///< Draining: no new input accepted, rec-buffer return still allowed
         Done = 2,     ///< Terminal: EOS received or fatal error; wakes flush() waiter
-        Stopping = 3, ///< Destructor guard: PutDisplayPicture suppressed (AL_Decoder_Destroy imminent)
+        Stopping = 3, ///< Destructor guard: set before AL_Decoder_Destroy; PutDisplayPicture suppressed
     };
     std::atomic<State> m_state;
 

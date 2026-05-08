@@ -204,40 +204,24 @@ void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUs
     }
 }
 
-void RTDecoder::sdk_end_decoding(AL_TBuffer *pFrame, void *pUserParam)
+void RTDecoder::sdk_end_decoding(AL_TBuffer * /*pFrame*/, void * /*pUserParam*/)
 {
-    auto *self = static_cast<RTDecoder *>(pUserParam);
-    try
-    {
-        self->on_sdk_end_decoding(pFrame);
-    }
-    catch (...)
-    {
-        self->signal_error(AL_ERROR);
-    }
+    // end-of-frame decoding: no action required
 }
 
 void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
 {
-    auto *self = static_cast<RTDecoder *>(pUserParam);
-    self->on_sdk_error(eError);
+    static_cast<RTDecoder *>(pUserParam)->on_sdk_error(eError);
 }
 
 void RTDecoder::sdk_end_parsing(AL_TBuffer *pParsedFrame, void *pUserParam, int iParsingId)
 {
-    auto *self = static_cast<RTDecoder *>(pUserParam);
-    self->on_sdk_end_parsing(pParsedFrame, iParsingId);
+    static_cast<RTDecoder *>(pUserParam)->on_sdk_end_parsing(pParsedFrame, iParsingId);
 }
 
 void RTDecoder::sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam)
 {
-    auto *self = static_cast<RTDecoder *>(pUserParam);
-    self->on_sdk_parsed_sei(is_prefix, payload_type, payload, payload_size);
-}
-
-void RTDecoder::on_sdk_end_decoding(AL_TBuffer *pFrame)
-{
-    (void)pFrame;
+    static_cast<RTDecoder *>(pUserParam)->on_sdk_parsed_sei(is_prefix, payload_type, payload, payload_size);
 }
 
 AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
@@ -311,16 +295,9 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     if (pFrame && !pInfo)
     {
-        // Release frame: SDK is reclaiming this buffer (e.g. during flush/destroy).
-        // Return it to the decoder pool so the pipeline does not stall.
-        auto s = m_state.load(std::memory_order_relaxed);
-        if (s == State::Running || s == State::Flushing)
-        {
-            if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
-            {
-                VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed in release-frame path");
-            }
-        }
+        // Release frame: called only from AL_Decoder_Destroy via ReleaseFramePictureUnused.
+        // At this point m_state == Stopping, so try_return_display_buffer is a no-op.
+        // This branch exists solely to avoid falling through and dereferencing null pInfo.
         return;
     }
 
@@ -340,16 +317,10 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     if (!is_main)
     {
-        // Non-main output (e.g. thumbnail/HDR): must still return the buffer.
-        auto s = m_state.load(std::memory_order_relaxed);
-        if (s == State::Running || s == State::Flushing)
-        {
-            if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
-            {
-                VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed for non-main output");
-                signal_error(AL_ERROR);
-            }
-        }
+        // AL_OUTPUT_PRIMARY / AL_OUTPUT_LCEVC: only relevant for multi-layer (LCEVC) decode
+        // which RTDecoder does not support. Log and drop — do NOT call PutDisplayPicture,
+        // consistent with exe_decoder reference implementation.
+        VIDEO_DEBUG_PRINT("RTDecoder: unexpected non-main output (eOutputID=%d), dropping frame", pInfo->eOutputID);
         return;
     }
 
@@ -358,7 +329,6 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         m_sei_measurer->on_frame_displayed(pFrame);
     }
 
-    // Call user callback with decoded frame
     try
     {
         m_callback(pFrame, *pInfo);
@@ -450,25 +420,20 @@ void RTDecoder::configure_rec_pool(AL_TPicFormat const &pic_format, AL_TDimensio
 
 bool RTDecoder::attach_display_metadata(AL_TBuffer *pDecPict)
 {
-    auto *pMeta = AL_PictureDecMetaData_Create();
-    if (!pMeta || !AL_Buffer_AddMetaData(pDecPict, reinterpret_cast<AL_TMetaData *>(pMeta)))
+    AL_MetaDataGuard pMeta(reinterpret_cast<AL_TMetaData *>(AL_PictureDecMetaData_Create()), &AL_MetaData_Destroy);
+    if (!pMeta || !AL_Buffer_AddMetaData(pDecPict, pMeta.get()))
     {
-        if (pMeta)
-        {
-            AL_MetaData_Destroy(reinterpret_cast<AL_TMetaData *>(pMeta));
-        }
         return false;
     }
+    pMeta.release();
 
-    auto *pDisplayInfoMeta = AL_DisplayInfoMetaData_Create();
-    if (!pDisplayInfoMeta || !AL_Buffer_AddMetaData(pDecPict, reinterpret_cast<AL_TMetaData *>(pDisplayInfoMeta)))
+    AL_MetaDataGuard pDisplayInfoMeta(reinterpret_cast<AL_TMetaData *>(AL_DisplayInfoMetaData_Create()),
+                                      &AL_MetaData_Destroy);
+    if (!pDisplayInfoMeta || !AL_Buffer_AddMetaData(pDecPict, pDisplayInfoMeta.get()))
     {
-        if (pDisplayInfoMeta)
-        {
-            AL_MetaData_Destroy(reinterpret_cast<AL_TMetaData *>(pDisplayInfoMeta));
-        }
         return false;
     }
+    pDisplayInfoMeta.release();
 
     return true;
 }
@@ -492,8 +457,6 @@ void RTDecoder::signal_done()
 {
     {
         std::lock_guard<std::mutex> lock(m_eos_mutex);
-        // Only advance to Done from an active state; never overwrite Stopping
-        // (set by the destructor) as that would allow PutDisplayPicture again.
         State cur = m_state.load(std::memory_order_relaxed);
         if (cur == State::Running || cur == State::Flushing)
         {
@@ -518,29 +481,21 @@ void RTDecoder::signal_error(AL_ERR err)
 
 double RTDecoder::fps() const
 {
-    std::lock_guard<std::mutex> lock(m_fps_mutex);
-    return m_fps;
+    return m_fps.load(std::memory_order_relaxed);
 }
 
 void RTDecoder::update_fps()
 {
-    if (++m_frame_count % 100 != 0)
-    {
-        return;
-    }
-
+    ++m_frame_count;
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_fps_last_time).count();
-    if (elapsed <= 0)
+    if (elapsed < 1000)
     {
         return;
     }
 
     double fps = (m_frame_count * 1000.0) / static_cast<double>(elapsed);
-    {
-        std::lock_guard<std::mutex> lock(m_fps_mutex);
-        m_fps = 0.1 * m_fps + 0.9 * fps;
-    }
+    m_fps.store(fps, std::memory_order_relaxed);
     m_fps_last_time = now;
     m_frame_count = 0;
 }

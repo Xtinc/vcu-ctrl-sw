@@ -199,7 +199,7 @@ bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsin
 
 void LatencyMeasurer::on_sei(AL_TBuffer *pParsedFrame, int iParsingId)
 {
-    if (!m_low_latency)
+    if (m_low_latency)
     {
         return;
     }
@@ -216,7 +216,7 @@ void LatencyMeasurer::on_sei(AL_TBuffer *pParsedFrame, int iParsingId)
 
 void LatencyMeasurer::on_parsed_sei(bool /*is_prefix*/, int payload_type, uint8_t *payload, int payload_size)
 {
-    if (m_low_latency)
+    if (!m_low_latency)
     {
         return;
     }
@@ -272,11 +272,11 @@ void LatencyMeasurer::on_frame_displayed(AL_TBuffer *pDisplayedFrame)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_low_latency)
     {
-        found = take_frame_sei_data(pDisplayedFrame, frame_data);
+        found = take_parsed_sei_data(frame_data);
     }
     else
     {
-        found = take_parsed_sei_data(frame_data);
+        found = take_frame_sei_data(pDisplayedFrame, frame_data);
     }
 
     if (!found)
