@@ -17,7 +17,11 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
+#include <algorithm>
 #include <cstring>
+
+static constexpr int kMaxWidth = 3840;
+static constexpr int kMaxHeight = 2160;
 
 using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
 using AL_MetaDataGuard = std::unique_ptr<AL_TMetaData, decltype(&AL_MetaData_Destroy)>;
@@ -255,7 +259,12 @@ AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings 
         return can_reuse_rec_pool(output_settings.tPicFormat, out_dim, min_pitch) ? AL_SUCCESS : AL_ERR_NO_MEMORY;
     }
 
-    configure_rec_pool(output_settings.tPicFormat, out_dim, min_pitch);
+    AL_TDimension alloc_dim;
+    alloc_dim.iWidth = RoundUp(std::max(out_dim.iWidth, kMaxWidth), 64);
+    alloc_dim.iHeight = RoundUp(std::max(out_dim.iHeight, kMaxHeight), 64);
+    const int alloc_pitch = AL_Decoder_GetMinPitch(alloc_dim.iWidth, &output_settings.tPicFormat);
+
+    configure_rec_pool(output_settings.tPicFormat, alloc_dim, alloc_pitch);
 
     const int num_buf = iBufferNumber + 1; // one extra buffer held by display consumer
     if (!m_rec_buf_pool->init(m_pAllocator, num_buf, "rt_decoder_rec"))
@@ -285,8 +294,8 @@ AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings 
         }
     }
 
-    m_rec_pool_alloc.dim = out_dim;
-    m_rec_pool_alloc.pitch_y = min_pitch;
+    m_rec_pool_alloc.dim = alloc_dim;
+    m_rec_pool_alloc.pitch_y = alloc_pitch;
     m_rec_pool_alloc.pic_format = output_settings.tPicFormat;
     return AL_SUCCESS;
 }
@@ -375,15 +384,7 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
 void RTDecoder::on_sdk_error(AL_ERR eError)
 {
-    if (AL_IS_ERROR_CODE(eError))
-    {
-        // Fatal: stop the pipeline and wake any waiter in flush().
-        signal_error(eError);
-    }
-    else if (AL_IS_WARNING_CODE(eError))
-    {
-        VIDEO_DEBUG_PRINT("Decoder warning: %s", AL_Codec_ErrorToString(eError));
-    }
+    signal_error(eError);
 }
 
 void RTDecoder::on_sdk_end_parsing(AL_TBuffer *pParsedFrame, int iParsingId)
@@ -504,8 +505,15 @@ void RTDecoder::signal_done()
 
 void RTDecoder::signal_error(AL_ERR err)
 {
-    VIDEO_ERROR_PRINT("Decoder error: %s", AL_Codec_ErrorToString(err));
-    signal_done(); // Done state covers both clean EOS and fatal error
+    if (AL_IS_ERROR_CODE(err))
+    {
+        VIDEO_ERROR_PRINT("Decoder error: %s", AL_Codec_ErrorToString(err));
+        signal_done(); // Done state covers both clean EOS and fatal error
+    }
+    else if (AL_IS_WARNING_CODE(err))
+    {
+        VIDEO_DEBUG_PRINT("Decoder warning: %s", AL_Codec_ErrorToString(err));
+    }
 }
 
 double RTDecoder::fps() const
