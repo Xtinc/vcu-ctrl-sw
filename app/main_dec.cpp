@@ -186,7 +186,18 @@ int main(int argc, char *argv[])
     if (feed_mode == FeedMode::Slice)
     {
         SliceFeeder feeder(codec, kChunkSize);
-        if (!feeder.feed(input_file, decoder))
+        std::vector<uint8_t> nal;
+        uint8_t flags = 0;
+        while (feeder.feed(input_file, nal, flags))
+        {
+            if (!decoder.push_stream(nal.data(), nal.size(), flags))
+            {
+                VIDEO_ERROR_PRINT("push_stream failed in slice mode - decoder has stopped");
+                break;
+            }
+        }
+
+        if (feeder.failed())
         {
             VIDEO_ERROR_PRINT("Slice-mode input failed");
         }
