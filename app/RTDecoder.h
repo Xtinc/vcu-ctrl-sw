@@ -179,16 +179,13 @@ class RTDecoder
   private:
     static AL_ERR sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                        AL_TCropInfo const *pCropInfo, void *pUserParam);
-    static void sdk_end_decoding(AL_TBuffer *pFrame, void *pUserParam);
     static void sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam);
     static void sdk_error(AL_ERR eError, void *pUserParam);
-    static void sdk_end_parsing(AL_TBuffer *pParsedFrame, void *pUserParam, int iParsingId);
     static void sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam);
     AL_ERR on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                    AL_TCropInfo const *pCropInfo);
     void on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo);
     void on_sdk_error(AL_ERR eError);
-    void on_sdk_end_parsing(AL_TBuffer *pParsedFrame, int iParsingId);
     void on_sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size);
 
     static AL_TDecOutputSettings derive_output_settings(AL_TStreamSettings const &stream_settings);
@@ -216,8 +213,9 @@ class RTDecoder
     std::unique_ptr<GenericBufPool> m_src_buf_pool;
     std::unique_ptr<PixMapBufPool> m_rec_buf_pool;
     std::unique_ptr<LatencyMeasurer> m_sei_measurer;
-
-    std::atomic<double> m_fps;
+    
+    mutable std::mutex m_fps_mutex;
+    double m_fps;
     uint32_t m_frame_count;
     std::chrono::steady_clock::time_point m_fps_last_time;
 

@@ -4,10 +4,7 @@
 
 extern "C"
 {
-#include "lib_common/BufferHandleMeta.h"
-#include "lib_common/BufferSeiMeta.h"
 #include "lib_common/BufferStreamMeta.h"
-#include "lib_decode/lib_decode.h"
 #include "lib_encode/lib_encoder.h"
 #include "lib_rtos/message.h"
 }
@@ -134,93 +131,12 @@ void LatencyInjector::on_frame_skipped(AL_TBuffer *pSrcFrame)
     (void)pop_frame_data(pSrcFrame, dummy);
 }
 
-LatencyMeasurer::LatencyMeasurer(bool is_low_latency) : m_low_latency(is_low_latency)
-{
-}
+LatencyMeasurer::LatencyMeasurer() = default;
 
 LatencyMeasurer::~LatencyMeasurer() = default;
 
-bool LatencyMeasurer::try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsingId, FrameSeiData &out_data) const
-{
-    AL_THandleMetaData *pHandlesMeta =
-        reinterpret_cast<AL_THandleMetaData *>(AL_Buffer_GetMetaData(pParsedFrame, AL_META_TYPE_HANDLE));
-    if (!pHandlesMeta)
-    {
-        return false;
-    }
-
-    const int num_handles = AL_HandleMetaData_GetNumHandles(pHandlesMeta);
-    if (iParsingId < 0 || iParsingId >= num_handles)
-    {
-        VIDEO_ERROR_PRINT("LatencyMeasurer::on_sei: ParsingId %d is out of bounds (num handles = %d)", iParsingId,
-                          num_handles);
-        return false;
-    }
-
-    AL_TDecMetaHandle *pDecMetaHandle =
-        reinterpret_cast<AL_TDecMetaHandle *>(AL_HandleMetaData_GetHandle(pHandlesMeta, iParsingId));
-    if (pDecMetaHandle->eState != AL_DEC_HANDLE_STATE_PROCESSED)
-    {
-        return false;
-    }
-
-    AL_TBuffer *pStream = pDecMetaHandle->pHandle;
-    if (!pStream)
-    {
-        VIDEO_ERROR_PRINT("LatencyMeasurer::on_sei: pStream is not allocated in handle for parsingId %d", iParsingId);
-        return false;
-    }
-
-    while (auto *seiMeta = reinterpret_cast<AL_TSeiMetaData *>(AL_Buffer_GetMetaData(pStream, AL_META_TYPE_SEI)))
-    {
-        AL_Buffer_RemoveMetaData(pStream, reinterpret_cast<AL_TMetaData *>(seiMeta));
-
-        bool matched = false;
-        auto *payload = seiMeta->payload;
-        for (int i = 0; i < seiMeta->numPayload; ++i, ++payload)
-        {
-            if (parse_latency_sei_payload(payload->pData, payload->size, out_data))
-            {
-                matched = true;
-                break;
-            }
-        }
-
-        AL_MetaData_Destroy(reinterpret_cast<AL_TMetaData *>(seiMeta));
-
-        if (matched)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-void LatencyMeasurer::on_sei(AL_TBuffer *pParsedFrame, int iParsingId)
-{
-    if (m_low_latency)
-    {
-        return;
-    }
-
-    FrameSeiData data{};
-    if (!try_extract_sei_data(pParsedFrame, iParsingId, data))
-    {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_frame_sei_map[pParsedFrame] = data;
-}
-
 void LatencyMeasurer::on_parsed_sei(bool /*is_prefix*/, int payload_type, uint8_t *payload, int payload_size)
 {
-    if (!m_low_latency)
-    {
-        return;
-    }
-
     if (payload_type != kSeiPayloadTypeUserDataUnregistered)
     {
         return;
@@ -236,19 +152,6 @@ void LatencyMeasurer::on_parsed_sei(bool /*is_prefix*/, int payload_type, uint8_
     m_parsed_sei_fifo.push_back(data);
 }
 
-bool LatencyMeasurer::take_frame_sei_data(AL_TBuffer *pDisplayedFrame, FrameSeiData &out_data)
-{
-    auto it = m_frame_sei_map.find(pDisplayedFrame);
-    if (it == m_frame_sei_map.end())
-    {
-        return false;
-    }
-
-    out_data = it->second;
-    m_frame_sei_map.erase(it);
-    return true;
-}
-
 bool LatencyMeasurer::take_parsed_sei_data(FrameSeiData &out_data)
 {
     if (m_parsed_sei_fifo.empty())
@@ -261,29 +164,19 @@ bool LatencyMeasurer::take_parsed_sei_data(FrameSeiData &out_data)
     return true;
 }
 
-void LatencyMeasurer::on_frame_displayed(AL_TBuffer *pDisplayedFrame)
+void LatencyMeasurer::on_frame_displayed(AL_TBuffer * /*pDisplayedFrame*/)
 {
     const auto now_us =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count();
     FrameSeiData frame_data{};
-    bool found = false;
 
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_low_latency)
-    {
-        found = take_parsed_sei_data(frame_data);
-    }
-    else
-    {
-        found = take_frame_sei_data(pDisplayedFrame, frame_data);
-    }
-
-    if (!found)
+    if (!take_parsed_sei_data(frame_data))
     {
         return;
     }
 
-    const double latency_ms = (now_us - static_cast<int64_t>(frame_data.timestamp));
+    const double latency_ms = (now_us - static_cast<double>(frame_data.timestamp)) / 1000.0;
     m_stats.add(latency_ms);
 }

@@ -65,6 +65,7 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
             m_dec_settings.eDecUnit = AL_VCL_NAL_UNIT;
             m_dec_settings.eDpbMode = AL_DPB_NO_REORDERING;
             m_dec_settings.eInputMode = AL_DEC_SPLIT_INPUT;
+            m_cfg.input_buffer_num = std::max(m_cfg.input_buffer_num, 8u);
         }
 
         auto result = AL_DecSettings_CheckValidity(&m_dec_settings, nullptr);
@@ -80,10 +81,10 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
         }
 
         m_cbbundles.displayCB = {&RTDecoder::sdk_display, this};
-        m_cbbundles.endDecodingCB = {&RTDecoder::sdk_end_decoding, this};
+        m_cbbundles.endDecodingCB = {nullptr, nullptr};
         m_cbbundles.resolutionFoundCB = {&RTDecoder::sdk_resolution_found, this};
         m_cbbundles.errorCB = {&RTDecoder::sdk_error, this};
-        m_cbbundles.endParsingCB = {&RTDecoder::sdk_end_parsing, this};
+        m_cbbundles.endParsingCB = {nullptr, nullptr};
         m_cbbundles.parsedSeiCB = {&RTDecoder::sdk_parsed_sei, this};
 
         err = AL_Decoder_Create(&m_hDec, m_pScheduler, m_pAllocator, &m_dec_settings, &m_cbbundles);
@@ -92,17 +93,14 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
             throw std::runtime_error(std::string("AL_Decoder_Create failed: ") + AL_Codec_ErrorToString(err));
         }
 
-        AL_TMetaData *stream_meta_template = reinterpret_cast<AL_TMetaData *>(AL_SeiMetaData_Create(32, 2 * 1024));
-        AL_MetaDataGuard stream_meta_guard(stream_meta_template, &AL_MetaData_Destroy);
-
         m_src_buf_pool = std::make_unique<GenericBufPool>();
-        if (!m_src_buf_pool->init(m_pAllocator, m_cfg.input_buffer_num, m_cfg.input_buffer_size, stream_meta_template,
+        if (!m_src_buf_pool->init(m_pAllocator, m_cfg.input_buffer_num, m_cfg.input_buffer_size, nullptr,
                                   "rt_decoder_stream"))
         {
             throw std::runtime_error("Failed to initialize stream buffer pool");
         }
 
-        m_sei_measurer = std::make_unique<LatencyMeasurer>(m_cfg.low_delay_mode);
+        m_sei_measurer = std::make_unique<LatencyMeasurer>();
     }
     catch (...)
     {
@@ -204,19 +202,9 @@ void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUs
     }
 }
 
-void RTDecoder::sdk_end_decoding(AL_TBuffer * /*pFrame*/, void * /*pUserParam*/)
-{
-    // end-of-frame decoding: no action required
-}
-
 void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
 {
     static_cast<RTDecoder *>(pUserParam)->on_sdk_error(eError);
-}
-
-void RTDecoder::sdk_end_parsing(AL_TBuffer *pParsedFrame, void *pUserParam, int iParsingId)
-{
-    static_cast<RTDecoder *>(pUserParam)->on_sdk_end_parsing(pParsedFrame, iParsingId);
 }
 
 void RTDecoder::sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam)
@@ -295,9 +283,6 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     if (pFrame && !pInfo)
     {
-        // Release frame: called only from AL_Decoder_Destroy via ReleaseFramePictureUnused.
-        // At this point m_state == Stopping, so try_return_display_buffer is a no-op.
-        // This branch exists solely to avoid falling through and dereferencing null pInfo.
         return;
     }
 
@@ -355,16 +340,6 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 void RTDecoder::on_sdk_error(AL_ERR eError)
 {
     signal_error(eError);
-}
-
-void RTDecoder::on_sdk_end_parsing(AL_TBuffer *pParsedFrame, int iParsingId)
-{
-    if (!pParsedFrame || !m_sei_measurer)
-    {
-        return;
-    }
-
-    m_sei_measurer->on_sei(pParsedFrame, iParsingId);
 }
 
 void RTDecoder::on_sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size)
@@ -481,21 +456,29 @@ void RTDecoder::signal_error(AL_ERR err)
 
 double RTDecoder::fps() const
 {
-    return m_fps.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(m_fps_mutex);
+    return m_fps;
 }
 
 void RTDecoder::update_fps()
 {
-    ++m_frame_count;
+    if (++m_frame_count % 100 != 0)
+    {
+        return;
+    }
+
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_fps_last_time).count();
-    if (elapsed < 1000)
+    if (elapsed <= 0)
     {
         return;
     }
 
     double fps = (m_frame_count * 1000.0) / static_cast<double>(elapsed);
-    m_fps.store(fps, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(m_fps_mutex);
+        m_fps = 0.1 * m_fps + 0.9 * fps; // EMA with alpha=0.9
+    }
     m_fps_last_time = now;
     m_frame_count = 0;
 }

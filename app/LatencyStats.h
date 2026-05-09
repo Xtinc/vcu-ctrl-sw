@@ -210,23 +210,18 @@ class LatencyInjector
 class LatencyMeasurer
 {
   public:
-    explicit LatencyMeasurer(bool is_low_latency);
+    LatencyMeasurer();
     ~LatencyMeasurer();
-    void on_sei(AL_TBuffer *pParsedFrame, int iParsingId);
     void on_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size);
     void on_frame_displayed(AL_TBuffer *pDisplayedFrame);
 
   private:
-    bool try_extract_sei_data(AL_TBuffer *pParsedFrame, int iParsingId, FrameSeiData &out_data) const;
-    bool take_frame_sei_data(AL_TBuffer *pDisplayedFrame, FrameSeiData &out_data);
     bool take_parsed_sei_data(FrameSeiData &out_data);
     double latency_e2e() const;
 
   private:
     Histogram<10> m_stats;
-    const bool m_low_latency;
     mutable std::mutex m_mutex;
-    FrameSeiMap m_frame_sei_map;
     FrameSeiFifo m_parsed_sei_fifo;
 };
 
