@@ -127,6 +127,12 @@ bool RTDecoder::push_stream(const void *data, size_t size, uint8_t flags)
         return false;
     }
 
+    if (!data && size > 0)
+    {
+        VIDEO_ERROR_PRINT("RTDecoder: null input data with non-zero size (%zu)", size);
+        return false;
+    }
+
     auto buf = m_src_buf_pool->get_buffer();
     if (!buf)
     {
