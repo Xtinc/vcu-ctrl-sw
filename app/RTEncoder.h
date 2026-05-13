@@ -126,6 +126,9 @@ class RTEncoderBase
      * @brief Force the encoder to insert an IDR frame at the next opportunity.
      */
     void request_IDR();
+
+    /**
+     * @brief Dynamically update the target (and optionally peak) bitrate.
      * @param uTargetBitRate Target bitrate in bps. Must be > 0.
      * @param uMaxBitRate    VBR peak bitrate in bps. 0 = same as target (CBR).
      * @return true on success, false on invalid arguments or SDK rejection.

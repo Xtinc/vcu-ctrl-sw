@@ -62,7 +62,13 @@ bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
     std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (!m_encoder)
         return false;
-    return m_encoder->set_bitrate(target, max);
+
+    if (!m_encoder->set_bitrate(target, max))
+        return false;
+
+    m_cfg.enc.target_bitrate = target;
+    m_cfg.enc.max_bitrate = (max > 0) ? max : target;
+    return true;
 }
 
 bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
@@ -70,7 +76,13 @@ bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
     std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (!m_encoder)
         return false;
-    return m_encoder->set_framerate(fps, clk);
+
+    if (!m_encoder->set_framerate(fps, clk))
+        return false;
+
+    m_cfg.enc.framerate = static_cast<uint16_t>(fps);
+    m_cfg.enc.clk_ratio = static_cast<uint16_t>(clk);
+    return true;
 }
 
 void EncMgr::request_IDR()
@@ -114,7 +126,11 @@ bool EncMgr::rebuild_encoder(int width, int height)
     std::unique_ptr<RTEncoderV4L2> new_enc;
     try
     {
-        EncoderConfig enc_cfg = m_cfg.enc;
+        EncoderConfig enc_cfg;
+        {
+            std::lock_guard<std::mutex> lock(m_enc_mutex);
+            enc_cfg = m_cfg.enc;
+        }
         enc_cfg.width = static_cast<uint16_t>(width);
         enc_cfg.height = static_cast<uint16_t>(height);
         new_enc = std::make_unique<RTEncoderV4L2>(enc_cfg, m_output_cb);
