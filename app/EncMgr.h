@@ -44,8 +44,9 @@ struct EncMgrConfig
  * Threading model:
  *   - start() spawns a single loop thread that drives the entire encode pipeline.
  *   - stop() signals the thread and blocks until it exits (including encoder flush).
- *   - All dynamic control methods (set_bitrate etc.) are thread-safe (delegated to
- *     RTEncoderBase which uses its own internal locks).
+ *   - All dynamic control methods (set_bitrate etc.) are thread-safe: they acquire
+ *     m_enc_mutex before touching m_encoder, which also synchronizes with the loop
+ *     thread's final flush+reset sequence.
  *
  * Typical usage:
  * @code
@@ -137,6 +138,9 @@ class EncMgr
     void loop_thread_func();
     bool build_pipeline(std::shared_ptr<V4L2Source> &out_src, int width, int height);
     void run_capture_loop(V4L2Source &src);
+    // Flush, destroy, and recreate m_encoder at the given resolution.
+    // Returns false (and leaves m_encoder null) on unrecoverable failure.
+    bool rebuild_encoder(int width, int height);
 
     EncMgrConfig m_cfg;
     EncodedFrameCallback m_output_cb;
@@ -145,6 +149,7 @@ class EncMgr
     std::thread m_loop_thread;
 
     std::atomic<bool> m_running{false};
+    mutable std::mutex m_enc_mutex; ///< Protects m_encoder pointer from concurrent access
 };
 
 #endif // ENC_MGR_H

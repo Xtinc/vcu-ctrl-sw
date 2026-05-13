@@ -77,7 +77,7 @@ class LatencyInjector;
  * Thread safety:
  *   - submit_source_buffer() / flush() must be called from a single producer thread.
  *   - SDK callbacks (on_encoded_frame) execute on an internal SDK thread.
- *   - m_state is std::atomic; m_cfg is protected by m_cfg_mutex.
+ *   - m_state is std::atomic; m_cfg is not internally locked (callers must serialize).
  *
  * Typical usage (FILE mode):
  * @code
@@ -119,13 +119,13 @@ class RTEncoderBase
      */
     bool flush();
 
+    /** @return true if the encoder is still in Running state and accepts new frames. */
+    bool is_running() const;
+
     /**
      * @brief Force the encoder to insert an IDR frame at the next opportunity.
      */
     void request_IDR();
-
-    /**
-     * @brief Dynamically update the target (and optionally peak) bitrate.
      * @param uTargetBitRate Target bitrate in bps. Must be > 0.
      * @param uMaxBitRate    VBR peak bitrate in bps. 0 = same as target (CBR).
      * @return true on success, false on invalid arguments or SDK rejection.
@@ -160,7 +160,7 @@ class RTEncoderBase
     /** @return The source chroma sampling format. */
     AL_EChromaMode src_chroma() const;
 
-    /** @return The current encoding resolution. Thread-safe (protected by m_cfg_mutex). */
+    /** @return The current encoding resolution. Caller must ensure serialized access. */
     AL_TDimension src_resolution() const;
 
     /**
@@ -198,7 +198,6 @@ class RTEncoderBase
     uint32_t m_bytes_count;
     std::chrono::steady_clock::time_point m_fps_last_time;
 
-    mutable std::mutex m_cfg_mutex;
     EncoderConfig m_cfg;
     EncodedFrameCallback m_callback;
 

@@ -342,6 +342,11 @@ bool RTEncoderBase::flush()
     return true;
 }
 
+bool RTEncoderBase::is_running() const
+{
+    return m_state.load() == State::Running;
+}
+
 void RTEncoderBase::request_IDR()
 {
     if (m_hEnc)
@@ -382,7 +387,6 @@ bool RTEncoderBase::set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(m_cfg_mutex);
     m_cfg.target_bitrate = uTargetBitRate;
     m_cfg.max_bitrate = effectiveMax;
 
@@ -402,7 +406,6 @@ bool RTEncoderBase::set_framerate(uint32_t uFrameRate, uint32_t uClkRatio)
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(m_cfg_mutex);
     m_cfg.framerate = uFrameRate;
     m_cfg.clk_ratio = uClkRatio;
 
@@ -430,7 +433,6 @@ bool RTEncoderBase::set_resolution(uint32_t uWidth, uint32_t uHeight)
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(m_cfg_mutex);
     m_cfg.width = uWidth;
     m_cfg.height = uHeight;
 
@@ -454,7 +456,6 @@ AL_EChromaMode RTEncoderBase::src_chroma() const
 
 AL_TDimension RTEncoderBase::src_resolution() const
 {
-    std::lock_guard<std::mutex> lock(m_cfg_mutex);
     return AL_TDimension{m_cfg.width, m_cfg.height};
 }
 

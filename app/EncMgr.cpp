@@ -59,6 +59,7 @@ void EncMgr::stop()
 
 bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
 {
+    std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (!m_encoder)
         return false;
     return m_encoder->set_bitrate(target, max);
@@ -66,6 +67,7 @@ bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
 
 bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
 {
+    std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (!m_encoder)
         return false;
     return m_encoder->set_framerate(fps, clk);
@@ -73,12 +75,14 @@ bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
 
 void EncMgr::request_IDR()
 {
+    std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (m_encoder)
         m_encoder->request_IDR();
 }
 
 std::pair<double, double> EncMgr::fps() const
 {
+    std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (!m_encoder)
         return {0.0, 0.0};
     return m_encoder->fps();
@@ -87,6 +91,47 @@ std::pair<double, double> EncMgr::fps() const
 // ---------------------------------------------------------------------------
 // Pipeline helpers
 // ---------------------------------------------------------------------------
+
+bool EncMgr::rebuild_encoder(int width, int height)
+{
+    // Step 1: flush the faulted encoder (returns immediately if state != Running).
+    m_encoder->flush();
+
+    // Step 2: extract and destroy the old encoder before constructing the new one.
+    // Hardware resources (scheduler, device handle) must be released first.
+    // Do the destruction outside the lock to avoid blocking external callers during
+    // the potentially slow AL_Encoder_Destroy call.
+    {
+        std::unique_ptr<RTEncoderV4L2> old_enc;
+        {
+            std::lock_guard<std::mutex> lock(m_enc_mutex);
+            old_enc = std::move(m_encoder); // m_encoder is null from here
+        }
+        // old_enc destructor runs here, outside the lock
+    }
+
+    // Step 3: construct the new encoder with the current working resolution.
+    std::unique_ptr<RTEncoderV4L2> new_enc;
+    try
+    {
+        EncoderConfig enc_cfg = m_cfg.enc;
+        enc_cfg.width = static_cast<uint16_t>(width);
+        enc_cfg.height = static_cast<uint16_t>(height);
+        new_enc = std::make_unique<RTEncoderV4L2>(enc_cfg, m_output_cb);
+    }
+    catch (const std::exception &e)
+    {
+        VIDEO_ERROR_PRINT("EncMgr: encoder rebuild failed: %s", e.what());
+        return false;
+    }
+
+    // Step 4: publish the new encoder.
+    {
+        std::lock_guard<std::mutex> lock(m_enc_mutex);
+        m_encoder = std::move(new_enc);
+    }
+    return true;
+}
 
 bool EncMgr::build_pipeline(std::shared_ptr<V4L2Source> &out_src, int width, int height)
 {
@@ -201,6 +246,16 @@ void EncMgr::loop_thread_func()
         if (!m_running.load())
             break;
 
+        // Detect encoder fault (submit_source_buffer calls signal_done on SDK error).
+        // Rebuild before attempting the next capture session.
+        if (!m_encoder->is_running())
+        {
+            VIDEO_ERROR_PRINT("EncMgr: encoder faulted, rebuilding at %dx%d", current_w, current_h);
+            if (!rebuild_encoder(current_w, current_h))
+                break;
+            VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
+        }
+
         // Probe the device's current format to detect resolution changes.
         // This is done after destroying the old V4L2Source so the fd is free.
         {
@@ -212,11 +267,20 @@ void EncMgr::loop_thread_func()
             {
                 VIDEO_INFO_PRINT("EncMgr: resolution change detected %dx%d -> %dx%d",
                                  current_w, current_h, probed_w, probed_h);
-                current_w = probed_w;
-                current_h = probed_h;
-                m_encoder->set_resolution(static_cast<uint32_t>(current_w),
-                                          static_cast<uint32_t>(current_h));
-                m_encoder->request_IDR();
+                if (m_encoder->set_resolution(static_cast<uint32_t>(probed_w),
+                                              static_cast<uint32_t>(probed_h)))
+                {
+                    current_w = probed_w;
+                    current_h = probed_h;
+                    m_encoder->request_IDR();
+                }
+                else
+                {
+                    VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder at old resolution",
+                                      probed_w, probed_h);
+                    if (!rebuild_encoder(current_w, current_h))
+                        break;
+                }
             }
         }
 
@@ -244,9 +308,19 @@ void EncMgr::loop_thread_func()
 
     m_running.store(false);
 
-    if (!m_encoder->flush())
-        VIDEO_ERROR_PRINT("EncMgr: encoder flush timed out; output may be incomplete");
+    // flush() may block up to 5 s; call outside the lock so external callers
+    // are not stalled. m_encoder is still exclusively owned by the loop thread
+    // here (run_capture_loop has already returned).
+    // Guard against null m_encoder (fatal rebuild_encoder failure).
+    if (m_encoder)
+    {
+        if (!m_encoder->flush())
+            VIDEO_ERROR_PRINT("EncMgr: encoder flush timed out; output may be incomplete");
+    }
 
-    m_encoder.reset();
+    {
+        std::lock_guard<std::mutex> lock(m_enc_mutex);
+        m_encoder.reset();
+    }
     VIDEO_INFO_PRINT("EncMgr: loop thread exited");
 }
