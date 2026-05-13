@@ -10,7 +10,7 @@ extern "C"
 #include <thread>
 
 // ---------------------------------------------------------------------------
-// EncMgr
+// EncMgr — public interface
 // ---------------------------------------------------------------------------
 
 EncMgr::EncMgr(EncMgrConfig cfg, EncodedFrameCallback output_cb)
@@ -62,10 +62,8 @@ bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
     std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (!m_encoder)
         return false;
-
     if (!m_encoder->set_bitrate(target, max))
         return false;
-
     m_cfg.enc.target_bitrate = target;
     m_cfg.enc.max_bitrate = (max > 0) ? max : target;
     return true;
@@ -76,10 +74,8 @@ bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
     std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (!m_encoder)
         return false;
-
     if (!m_encoder->set_framerate(fps, clk))
         return false;
-
     m_cfg.enc.framerate = static_cast<uint16_t>(fps);
     m_cfg.enc.clk_ratio = static_cast<uint16_t>(clk);
     return true;
@@ -101,65 +97,18 @@ std::pair<double, double> EncMgr::fps() const
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline helpers
+// Pipeline helpers (called only from the loop thread)
 // ---------------------------------------------------------------------------
 
-bool EncMgr::rebuild_encoder(int width, int height)
+bool EncMgr::open_source(int width, int height)
 {
-    // Step 1: flush the faulted encoder (returns immediately if state != Running).
-    m_encoder->flush();
-
-    // Step 2: extract and destroy the old encoder before constructing the new one.
-    // Hardware resources (scheduler, device handle) must be released first.
-    // Do the destruction outside the lock to avoid blocking external callers during
-    // the potentially slow AL_Encoder_Destroy call.
-    {
-        std::unique_ptr<RTEncoderV4L2> old_enc;
-        {
-            std::lock_guard<std::mutex> lock(m_enc_mutex);
-            old_enc = std::move(m_encoder); // m_encoder is null from here
-        }
-        // old_enc destructor runs here, outside the lock
-    }
-
-    // Step 3: construct the new encoder with the current working resolution.
-    std::unique_ptr<RTEncoderV4L2> new_enc;
-    try
-    {
-        EncoderConfig enc_cfg;
-        {
-            std::lock_guard<std::mutex> lock(m_enc_mutex);
-            enc_cfg = m_cfg.enc;
-        }
-        enc_cfg.width = static_cast<uint16_t>(width);
-        enc_cfg.height = static_cast<uint16_t>(height);
-        new_enc = std::make_unique<RTEncoderV4L2>(enc_cfg, m_output_cb);
-    }
-    catch (const std::exception &e)
-    {
-        VIDEO_ERROR_PRINT("EncMgr: encoder rebuild failed: %s", e.what());
-        return false;
-    }
-
-    // Step 4: publish the new encoder.
-    {
-        std::lock_guard<std::mutex> lock(m_enc_mutex);
-        m_encoder = std::move(new_enc);
-    }
-    return true;
-}
-
-bool EncMgr::build_pipeline(std::shared_ptr<V4L2Source> &out_src, int width, int height)
-{
-    const auto &c = m_cfg;
     const size_t num_bufs = m_cfg.enc.num_src_bufs;
 
     std::shared_ptr<V4L2Source> src;
     try
     {
-        src = std::make_shared<V4L2Source>(c.v4l2_dev, width, height,
-                                           m_encoder->src_fourCC(), num_bufs,
-                                           /*multiple_planes=*/true, c.sync_dev);
+        src = std::make_shared<V4L2Source>(m_cfg.v4l2_dev, width, height, m_encoder->src_fourCC(), num_bufs,
+                                           /*multiple_planes=*/true, m_cfg.sync_dev);
     }
     catch (const std::exception &e)
     {
@@ -186,83 +135,90 @@ bool EncMgr::build_pipeline(std::shared_ptr<V4L2Source> &out_src, int width, int
         return false;
     }
 
-    out_src = std::move(src);
+    m_source = std::move(src);
+
+    // Use a weak_ptr in the callback so the lambda never extends the lifetime of
+    // m_source. If close_source() has already reset m_source, lock() returns null
+    // and the requeue is silently skipped — no use-after-free is possible.
+    std::weak_ptr<V4L2Source> weak_src = m_source;
+    m_encoder->set_release_callback([weak_src](AL_TBuffer const *buf) {
+        if (auto src = weak_src.lock())
+            if (!src->queue(buf))
+                VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
+    });
+
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Inner capture loop
-//
-// Returns:
-//   Stopped       - m_running became false (normal stop)
-//   SourceChanged - V4L2_EVENT_SOURCE_CHANGE (resolution) received
-//   DeviceError   - device error or encoder submit failure
-// ---------------------------------------------------------------------------
-EncMgr::LoopExitReason EncMgr::run_capture_loop(V4L2Source &src)
+void EncMgr::close_source()
 {
-    while (m_running.load(std::memory_order_relaxed))
-    {
-        const DQResult result = src.dqueue();
-        switch (result.s)
-        {
-        case DQStatus::OK:
-            if (!m_encoder->submit_source_buffer(result.p))
-            {
-                VIDEO_ERROR_PRINT("EncMgr: submit_source_buffer failed");
-                return LoopExitReason::DeviceError;
-            }
-            break;
-        case DQStatus::Timeout:
-            break;
-        case DQStatus::SourceChanged:
-            return LoopExitReason::SourceChanged;
-        case DQStatus::Error:
-            return LoopExitReason::DeviceError;
-        }
-    }
-    return LoopExitReason::Stopped;
-}
-
-void EncMgr::shutdown_pipeline(std::shared_ptr<V4L2Source> &src)
-{
-    if (!m_encoder)
+    if (!m_source)
         return;
 
+    // Nullify the callback first so that any residual SDK callbacks after this
+    // point are no-ops (the weak_ptr in the old lambda will also expire once
+    // m_source is reset below, providing an additional safety net).
+    // m_encoder is always non-null here: close_source() is only called from
+    // on_streaming(), which requires a live encoder to have been reached.
     m_encoder->set_release_callback(nullptr);
-    if (src)
-    {
-        src->stop();
-        src.reset();
-    }
+
+    m_source->stop();
+    m_source.reset();
 }
 
-bool EncMgr::try_apply_resolution_change(int &current_w, int &current_h)
+bool EncMgr::rebuild_encoder(int width, int height)
 {
-    int probed_w = 0;
-    int probed_h = 0;
-    const int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-
-    if (!V4L2Source::probe_format(m_cfg.v4l2_dev, buf_type, probed_w, probed_h) ||
-        probed_w <= 0 || probed_h <= 0 ||
-        (probed_w == current_w && probed_h == current_h))
+    std::lock_guard<std::mutex> lock(m_enc_mutex);
+    EncoderConfig enc_cfg = m_cfg.enc;
+    enc_cfg.width = static_cast<uint16_t>(width);
+    enc_cfg.height = static_cast<uint16_t>(height);
+    m_encoder.reset(); // release hardware resource before constructing new instance
+    try
     {
+        m_encoder = std::make_unique<RTEncoderV4L2>(enc_cfg, m_output_cb);
         return true;
     }
-
-    VIDEO_INFO_PRINT("EncMgr: resolution change %dx%d -> %dx%d", current_w, current_h, probed_w, probed_h);
-    if (m_encoder->set_resolution(static_cast<uint32_t>(probed_w), static_cast<uint32_t>(probed_h)))
+    catch (const std::exception &e)
     {
-        current_w = probed_w;
-        current_h = probed_h;
-        m_encoder->request_IDR();
-        return true;
+        VIDEO_ERROR_PRINT("EncMgr: encoder rebuild failed: %s", e.what());
+        return false;
     }
-
-    VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", probed_w, probed_h);
-    return rebuild_encoder(current_w, current_h);
 }
 
-bool EncMgr::wait_before_reconnect(int &retry_count)
+bool EncMgr::handle_source_change(int &width, int &height)
+{
+    int new_w = 0, new_h = 0;
+    if (!V4L2Source::probe_format(m_cfg.v4l2_dev, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, new_w, new_h) || new_w <= 0 ||
+        new_h <= 0)
+    {
+        VIDEO_ERROR_PRINT("EncMgr: probe_format failed after source change");
+        return true; // non-fatal — next open_source will retry
+    }
+
+    if (new_w == width && new_h == height)
+        return true; // spurious event, no actual change
+
+    VIDEO_INFO_PRINT("EncMgr: resolution change %dx%d -> %dx%d", width, height, new_w, new_h);
+
+    if (m_encoder->set_resolution(static_cast<uint32_t>(new_w), static_cast<uint32_t>(new_h)))
+    {
+        m_encoder->request_IDR();
+    }
+    else
+    {
+        VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", new_w, new_h);
+        if (!rebuild_encoder(new_w, new_h))
+        {
+            return false;
+        }
+    }
+
+    width = new_w;
+    height = new_h;
+    return true;
+}
+
+bool EncMgr::wait_reconnect(int &retry_count)
 {
     if (!m_running.load())
         return false;
@@ -274,81 +230,135 @@ bool EncMgr::wait_before_reconnect(int &retry_count)
         return false;
     }
 
-    VIDEO_INFO_PRINT("EncMgr: waiting %d ms before reconnect (attempt %d/%s)",
-                     m_cfg.reconnect_delay_ms, retry_count,
+    VIDEO_INFO_PRINT("EncMgr: waiting %d ms before reconnect (attempt %d/%s)", m_cfg.reconnect_delay_ms, retry_count,
                      max >= 0 ? std::to_string(max).c_str() : "inf");
 
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(m_cfg.reconnect_delay_ms);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(m_cfg.reconnect_delay_ms);
     while (m_running.load() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     return m_running.load();
 }
 
-// ---------------------------------------------------------------------------
-// Main loop thread
-// ---------------------------------------------------------------------------
-void EncMgr::loop_thread_func()
+EncMgr::State EncMgr::on_opening(int width, int height, int &retry_count)
 {
-    int current_w = static_cast<int>(m_cfg.enc.width);
-    int current_h = static_cast<int>(m_cfg.enc.height);
-    int retry_count = 0;
+    if (!m_running.load())
+        return State::Stopping;
+
+    if (!open_source(width, height))
+    {
+        VIDEO_ERROR_PRINT("EncMgr: open_source failed (attempt %d)", retry_count + 1);
+        return State::Reconnecting;
+    }
+
+    retry_count = 0;
+    return State::Streaming;
+}
+
+EncMgr::State EncMgr::on_streaming()
+{
+    bool source_changed = false;
 
     while (m_running.load())
     {
-        std::shared_ptr<V4L2Source> src;
-        if (!build_pipeline(src, current_w, current_h))
+        const DQResult result = m_source->dqueue();
+        switch (result.s)
         {
-            VIDEO_ERROR_PRINT("EncMgr: pipeline build failed (attempt %d)", retry_count + 1);
-        }
-
-        if (src)
-        {
-            retry_count = 0;
-
-            // Capture shared_ptr by value so the SDK release callback keeps V4L2Source
-            // alive until the last in-flight callback completes, even after src is
-            // stopped and reset below (prevents use-after-free on the SDK thread).
-            m_encoder->set_release_callback([src](AL_TBuffer const *buf) {
-                if (!src->queue(buf))
-                    VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
-            });
-
-            const LoopExitReason reason = run_capture_loop(*src);
-            shutdown_pipeline(src);
-
-            if (!m_running.load() || reason == LoopExitReason::Stopped)
-                break;
-
-            // Detect encoder fault and rebuild before the next capture session.
-            if (!m_encoder->is_running())
+        case DQStatus::OK:
+            if (!m_encoder->submit_source_buffer(result.p))
             {
-                VIDEO_ERROR_PRINT("EncMgr: encoder faulted, rebuilding at %dx%d", current_w, current_h);
-                if (!rebuild_encoder(current_w, current_h))
-                    break;
-                VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
+                VIDEO_ERROR_PRINT("EncMgr: submit_source_buffer failed");
+                goto done;
             }
-
-            if (reason == LoopExitReason::SourceChanged)
-            {
-                if (!try_apply_resolution_change(current_w, current_h))
-                    break;
-                retry_count = 0;
-                continue; // source change: reconnect immediately without delay
-            }
-        }
-
-        if (!wait_before_reconnect(retry_count))
             break;
+        case DQStatus::Timeout:
+            break;
+        case DQStatus::SourceChanged:
+            source_changed = true;
+            goto done;
+        case DQStatus::Error:
+            VIDEO_ERROR_PRINT("EncMgr: V4L2 device error");
+            goto done;
+        }
+    }
+done:
+    close_source();
+
+    if (!m_running.load())
+        return State::Stopping;
+    if (!m_encoder->is_running())
+        return State::EncoderFault; // fatal SDK error during session
+    if (source_changed)
+        return State::SourceChanged;
+    return State::Reconnecting; // device error or submit failure; encoder still healthy
+}
+
+EncMgr::State EncMgr::on_source_changed(int &width, int &height, int &retry_count)
+{
+    if (!m_running.load())
+        return State::Stopping;
+
+    if (!handle_source_change(width, height))
+        return State::Stopping;
+
+    retry_count = 0;
+    return State::Opening; // reconnect immediately, no delay
+}
+
+EncMgr::State EncMgr::on_encoder_fault(int width, int height)
+{
+    if (!m_running.load())
+        return State::Stopping;
+
+    VIDEO_ERROR_PRINT("EncMgr: encoder faulted, rebuilding at %dx%d", width, height);
+    if (!rebuild_encoder(width, height))
+        return State::Stopping;
+
+    VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
+    return State::Opening; // reconnect immediately, no delay
+}
+
+EncMgr::State EncMgr::on_reconnecting(int &retry_count)
+{
+    return wait_reconnect(retry_count) ? State::Opening : State::Stopping;
+}
+
+void EncMgr::loop_thread_func()
+{
+    int width = static_cast<int>(m_cfg.enc.width);
+    int height = static_cast<int>(m_cfg.enc.height);
+    int retry_count = 0;
+    State state = State::Opening;
+
+    while (state != State::Stopping)
+    {
+        switch (state)
+        {
+        case State::Opening:
+            state = on_opening(width, height, retry_count);
+            break;
+        case State::Streaming:
+            state = on_streaming();
+            break;
+        case State::SourceChanged:
+            state = on_source_changed(width, height, retry_count);
+            break;
+        case State::EncoderFault:
+            state = on_encoder_fault(width, height);
+            break;
+        case State::Reconnecting:
+            state = on_reconnecting(retry_count);
+            break;
+        case State::Stopping:
+            break;
+        }
     }
 
     m_running.store(false);
 
-    // flush() may block up to 5 s; call outside the lock so external callers
-    // are not stalled. m_encoder is still exclusively owned by the loop thread
-    // here (run_capture_loop has already returned).
-    // Guard against null m_encoder (fatal rebuild_encoder failure).
+    // Final EOS flush. m_source is already null (close_source was called in on_streaming,
+    // or open_source never succeeded). flush() may block up to 5 s; call outside the
+    // lock so external callers are not stalled.
     if (m_encoder)
     {
         if (!m_encoder->flush())

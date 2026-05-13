@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -14,7 +15,7 @@
  */
 struct EncMgrConfig
 {
-    EncoderConfig enc;             ///< Encoder parameters (width/height = actual capture resolution)
+    EncoderConfig enc;             ///< Encoder parameters (width/height = initial capture resolution)
     std::string v4l2_dev;          ///< V4L2 capture device path, e.g. "/dev/video0"
     std::string sync_dev;          ///< Xilinx sync device path (empty = disabled)
     int reconnect_delay_ms = 2000; ///< Delay between reconnection attempts in milliseconds
@@ -24,42 +25,44 @@ struct EncMgrConfig
 /**
  * @brief EncMgr is the top-level encoding manager.
  *
- * It owns both the V4L2 capture source and the hardware encoder, coordinates their
- * lifecycle, and handles:
- *   - Source signal loss and reconnection (with configurable retry limit and delay)
- *   - Source resolution changes (V4L2_EVENT_SOURCE_CHANGE): old V4L2Source is
- *     destroyed, encoder is reconfigured via set_resolution(), and a new V4L2Source
- *     is constructed at the new resolution
- *   - Encoder errors: flush + restart on the next reconnect cycle
+ * Owns both the V4L2 capture source (m_source) and the hardware encoder (m_encoder),
+ * and coordinates their lifecycle via an explicit state machine:
  *
- * The encoder (RTEncoderV4L2) is created once and lives for the entire EncMgr
- * lifetime; only V4L2Source is torn down and rebuilt on each reconnect or
- * resolution change. RTEncoderBase::init_settings() always programs the hardware
- * channel at kMaxWidth × kMaxHeight, so dynamic set_resolution() is safe.
+ *   Opening:
+ *     open_source ok          -> Streaming
+ *     open_source fail        -> Reconnecting
+ *     stop()                  -> Stopping
+ *   Streaming:
+ *     dqueue/submit loop active
+ *     stop() / normal exit    -> Stopping
+ *     V4L2 device error       -> Reconnecting
+ *     encoder fault           -> EncoderFault
+ *     V4L2_EVENT_SOURCE_CHANGE -> SourceChanged
+ *   SourceChanged:
+ *     set_resolution() ok     -> Opening  (no delay)
+ *     set_resolution() fail   -> rebuild_encoder() -> Opening  (no delay)
+ *     rebuild_encoder() fail  -> Stopping
+ *     stop()                  -> Stopping
+ *   EncoderFault:
+ *     rebuild_encoder() ok    -> Opening  (no delay)
+ *     rebuild_encoder() fail  -> Stopping
+ *     stop()                  -> Stopping
+ *   Reconnecting:
+ *     wait_reconnect() ok     -> Opening
+ *     max retries exceeded    -> Stopping
+ *     stop()                  -> Stopping
+ *   Stopping:
+ *     terminal state; flush encoder EOS, destroy encoder, exit loop thread
  *
- * All state is fully internal. The public interface is minimal:
- *   - start() / stop()
- *   - Dynamic encoder control: set_bitrate(), set_framerate(), request_IDR(), fps()
+ * The encoder is created once in start() and kept alive across reconnect cycles;
+ * only m_source is torn down and rebuilt each time. m_encoder is flushed (EOS) once
+ * at final stop, not between sessions, so the encode session remains continuous.
  *
  * Threading model:
- *   - start() spawns a single loop thread that drives the entire encode pipeline.
- *   - stop() signals the thread and blocks until it exits (including encoder flush).
- *   - All dynamic control methods (set_bitrate etc.) are thread-safe: they acquire
- *     m_enc_mutex before touching m_encoder, which also synchronizes with the loop
- *     thread's final flush+reset sequence.
- *
- * Typical usage:
- * @code
- *   EncMgrConfig cfg;
- *   cfg.enc.width = 1920; cfg.enc.height = 1080;
- *   cfg.v4l2_dev = "/dev/video0";
- *   cfg.enc.target_bitrate = 8'000'000;
- *
- *   EncMgr mgr(cfg, [](const uint8_t *data, size_t sz){ write_to_output(data, sz); });
- *   mgr.start();
- *   // ... application runs ...
- *   mgr.stop();
- * @endcode
+ *   - start() spawns one loop thread that drives the entire pipeline.
+ *   - stop() signals the thread and joins it (blocking until encoder EOS drains).
+ *   - set_bitrate / set_framerate / request_IDR / fps are thread-safe: they acquire
+ *     m_enc_mutex, which also synchronises with the loop thread's final encoder reset.
  */
 class EncMgr
 {
@@ -68,15 +71,13 @@ class EncMgr
 
     /**
      * @brief Construct an EncMgr. Does not start encoding; call start().
-     * @param cfg    Configuration for encoder and capture device.
+     * @param cfg       Configuration for encoder and capture device.
      * @param output_cb Callback invoked on the encoder SDK thread for each encoded AU.
      * @throw std::invalid_argument if cfg.v4l2_dev is empty or output_cb is null.
      */
     explicit EncMgr(EncMgrConfig cfg, EncodedFrameCallback output_cb);
 
-    /**
-     * @brief Destructor. Calls stop() if still running.
-     */
+    /** @brief Destructor. Calls stop() if still running. */
     ~EncMgr();
 
     EncMgr(const EncMgr &) = delete;
@@ -85,25 +86,17 @@ class EncMgr
     EncMgr &operator=(EncMgr &&) = delete;
 
     /**
-     * @brief Start the encode pipeline.
-     *
-     * Creates the RTEncoderV4L2 instance, then spawns the internal loop thread
-     * which opens the V4L2 device, imports DMA buffers, and begins streaming.
-     *
-     * Non-blocking: returns immediately after the thread is launched.
-     *
+     * @brief Start the encode pipeline (non-blocking).
      * @return true on success, false if already running or encoder creation fails.
      */
     bool start();
 
     /**
-     * @brief Stop the encode pipeline.
+     * @brief Stop the encode pipeline (blocking).
      *
-     * Signals the loop thread to exit, waits for it to complete (including the
-     * encoder EOS flush), then destroys the encoder.
-     *
-     * Blocking: maximum wait ≈ V4L2 dequeue timeout (1 s) + encoder flush timeout (5 s).
-     * Safe to call from any thread, including after a previous stop().
+     * Signals the loop thread, waits for it to exit (V4L2 dequeue timeout ≤ 1 s,
+     * encoder EOS flush ≤ 5 s), then destroys the encoder.
+     * Safe to call from any thread or after a previous stop().
      */
     void stop();
 
@@ -111,7 +104,7 @@ class EncMgr
      * @brief Dynamically update the target (and optionally peak) bitrate.
      * @param target Target bitrate in bps. Must be > 0.
      * @param max    VBR peak bitrate in bps. 0 = same as target (CBR).
-     * @return true on success, false if encoder is not running or SDK rejects the value.
+     * @return true on success, false if encoder is not available or SDK rejects the value.
      */
     bool set_bitrate(uint32_t target, uint32_t max = 0);
 
@@ -119,47 +112,58 @@ class EncMgr
      * @brief Dynamically update the encode frame rate.
      * @param fps Frame rate numerator. Must be > 0.
      * @param clk Frame rate denominator. Must be > 0.
-     * @return true on success, false if encoder is not running or SDK rejects the value.
+     * @return true on success, false if encoder is not available or SDK rejects the value.
      */
     bool set_framerate(uint32_t fps, uint32_t clk = 1000);
 
-    /**
-     * @brief Force the encoder to insert an IDR frame at the next opportunity.
-     */
+    /** @brief Force the encoder to insert an IDR frame at the next opportunity. */
     void request_IDR();
 
     /**
-     * @brief Return the latest exponential-moving-average throughput statistics.
+     * @brief Return the latest EMA throughput statistics.
      * @return {fps, bitrate_bps}. Values are 0.0 until at least 100 frames have been encoded.
      */
     std::pair<double, double> fps() const;
 
   private:
-    enum class LoopExitReason
+    // ---------------------------------------------------------------------------
+    // Pipeline state machine
+    // ---------------------------------------------------------------------------
+    enum class State
     {
-        Stopped,
-        SourceChanged,
-        DeviceError
+        Opening,       ///< Trying to open V4L2Source
+        Streaming,     ///< Actively capturing and submitting frames to encoder
+        SourceChanged, ///< V4L2_EVENT_SOURCE_CHANGE received; resolve new resolution
+        EncoderFault,  ///< Encoder stopped unexpectedly; rebuild before next open
+        Reconnecting,  ///< Waiting reconnect_delay_ms before next open attempt
+        Stopping,      ///< Terminal: exit loop thread
     };
 
-    void loop_thread_func();
-    bool build_pipeline(std::shared_ptr<V4L2Source> &out_src, int width, int height);
-    LoopExitReason run_capture_loop(V4L2Source &src);
-    void shutdown_pipeline(std::shared_ptr<V4L2Source> &src);
-    bool try_apply_resolution_change(int &current_w, int &current_h);
-    bool wait_before_reconnect(int &retry_count);
-    // Flush, destroy, and recreate m_encoder at the given resolution.
-    // Returns false (and leaves m_encoder null) on unrecoverable failure.
+    // Each handler executes one state and returns the next state.
+    State on_opening(int width, int height, int &retry_count);
+    State on_streaming();
+    State on_source_changed(int &width, int &height, int &retry_count);
+    State on_encoder_fault(int width, int height);
+    State on_reconnecting(int &retry_count);
+
+    // Pipeline primitives used by the state handlers.
+    bool open_source(int width, int height);
+    void close_source();
     bool rebuild_encoder(int width, int height);
+    bool handle_source_change(int &width, int &height);
+    bool wait_reconnect(int &retry_count);
+
+    void loop_thread_func();
 
     EncMgrConfig m_cfg;
     EncodedFrameCallback m_output_cb;
 
-    std::unique_ptr<RTEncoderV4L2> m_encoder;
-    std::thread m_loop_thread;
+    std::unique_ptr<RTEncoderV4L2> m_encoder; ///< Created in start(), destroyed on loop exit
+    std::shared_ptr<V4L2Source> m_source;     ///< Opened/closed each capture session
 
+    std::thread m_loop_thread;
     std::atomic<bool> m_running{false};
-    mutable std::mutex m_enc_mutex; ///< Protects m_encoder pointer from concurrent access
+    mutable std::mutex m_enc_mutex; ///< Protects m_encoder for external callers
 };
 
 #endif // ENC_MGR_H
