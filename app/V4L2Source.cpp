@@ -529,63 +529,82 @@ bool V4L2Source::queue(AL_TBuffer const *buffer)
     return true;
 }
 
-V4L2Source::DequeueResult V4L2Source::dqueue()
+DQStatus V4L2Source::handle_pollpri_event(int revents)
 {
-    if (!can_dequeue(m_state.load()))
+    if (!(revents & POLLPRI))
     {
-        VIDEO_ERROR_PRINT("Cannot dequeue in state=%s", state_to_cstr(m_state.load()));
-        return {DequeueStatus::Error, nullptr};
+        return DQStatus::OK;
+    }
+
+    bool resolution_changed = false;
+    v4l2_event event{};
+    while (ioctl_retry(m_fd, VIDIOC_DQEVENT, &event) == 0)
+    {
+        if (event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION))
+        {
+            resolution_changed = true;
+        }
+    }
+
+    if (resolution_changed)
+    {
+        VIDEO_INFO_PRINT("V4L2 source resolution change event received");
+        return DQStatus::SourceChanged;
+    }
+
+    if (!(revents & POLLIN))
+    {
+        return DQStatus::Timeout;
+    }
+
+    return DQStatus::OK;
+}
+
+DQResult V4L2Source::handle_timeout(const char *reason)
+{
+    ++m_consecutive_timeout_count;
+    if (m_consecutive_timeout_count >= m_timeout_error_threshold)
+    {
+        VIDEO_ERROR_PRINT("V4L2 dequeue %s %d times consecutively", reason, m_consecutive_timeout_count);
+        enter_error_state();
+        return {DQStatus::Error, nullptr};
+    }
+    return {DQStatus::Timeout, nullptr};
+}
+
+DQResult V4L2Source::dqueue()
+{
+    const State state = m_state.load();
+    if (!can_dequeue(state))
+    {
+        VIDEO_ERROR_PRINT("Cannot dequeue in state=%s", state_to_cstr(state));
+        return {DQStatus::Error, nullptr};
     }
 
     const int revents = wait_readable(m_fd, V4L2_DQ_TIMEOUT_MS);
 
     if (revents == 0)
     {
-        ++m_consecutive_timeout_count;
-        if (m_consecutive_timeout_count >= m_timeout_error_threshold)
-        {
-            VIDEO_ERROR_PRINT("V4L2 dequeue timed out %d times consecutively", m_consecutive_timeout_count);
-            enter_error_state();
-            return {DequeueStatus::Error, nullptr};
-        }
-        return {DequeueStatus::Timeout, nullptr};
+        return handle_timeout("timed out");
     }
 
     if (revents < 0)
     {
         enter_error_state();
-        return {DequeueStatus::Error, nullptr};
+        return {DQStatus::Error, nullptr};
     }
 
     if (revents & (POLLERR | POLLHUP | POLLNVAL))
     {
         VIDEO_ERROR_PRINT("poll reported device error: revents=0x%x", revents);
         enter_error_state();
-        return {DequeueStatus::Error, nullptr};
+        return {DQStatus::Error, nullptr};
     }
 
-    if (revents & POLLPRI)
+    const DQStatus event_status = handle_pollpri_event(revents);
+    if (event_status == DQStatus::SourceChanged || event_status == DQStatus::Timeout)
     {
-        // Drain the V4L2 event queue
-        bool resolution_changed = false;
-        v4l2_event event{};
-        while (ioctl_retry(m_fd, VIDIOC_DQEVENT, &event) == 0)
-        {
-            if (event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION))
-            {
-                resolution_changed = true;
-            }
-        }
-
-        if (resolution_changed)
-        {
-            VIDEO_INFO_PRINT("V4L2 source resolution change event received");
-            return {DequeueStatus::SourceChanged, nullptr};
-        }
-
-        // Non-resolution event; if POLLIN is also set, fall through to DQBUF
-        if (!(revents & POLLIN))
-            return {DequeueStatus::Timeout, nullptr};
+        return {event_status, nullptr};
     }
 
     // POLLIN path: dequeue a frame
@@ -603,19 +622,12 @@ V4L2Source::DequeueResult V4L2Source::dqueue()
     {
         if (errno == EAGAIN)
         {
-            ++m_consecutive_timeout_count;
-            if (m_consecutive_timeout_count >= m_timeout_error_threshold)
-            {
-                VIDEO_ERROR_PRINT("V4L2 dequeue EAGAIN %d times consecutively", m_consecutive_timeout_count);
-                enter_error_state();
-                return {DequeueStatus::Error, nullptr};
-            }
-            return {DequeueStatus::Timeout, nullptr};
+            return handle_timeout("EAGAIN");
         }
 
         VIDEO_ERROR_PRINT("Failed to dequeue buffer: %s", std::strerror(errno));
         enter_error_state();
-        return {DequeueStatus::Error, nullptr};
+        return {DQStatus::Error, nullptr};
     }
 
     m_consecutive_timeout_count = 0;
@@ -624,10 +636,10 @@ V4L2Source::DequeueResult V4L2Source::dqueue()
     {
         VIDEO_ERROR_PRINT("Driver returned invalid dequeued index: %u", buf.index);
         enter_error_state();
-        return {DequeueStatus::Error, nullptr};
+        return {DQStatus::Error, nullptr};
     }
 
-    return {DequeueStatus::Frame, m_buffers[buf.index].sync_desc.buffer};
+    return {DQStatus::OK, m_buffers[buf.index].sync_desc.buffer};
 }
 
 bool V4L2Source::probe_format(const std::string &dev, int buf_type, int &width, int &height)

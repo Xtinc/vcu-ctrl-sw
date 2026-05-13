@@ -135,11 +135,19 @@ class EncMgr
     std::pair<double, double> fps() const;
 
   private:
-    enum class LoopExitReason { Stopped, SourceChanged, DeviceError };
+    enum class LoopExitReason
+    {
+        Stopped,
+        SourceChanged,
+        DeviceError
+    };
 
     void loop_thread_func();
     bool build_pipeline(std::shared_ptr<V4L2Source> &out_src, int width, int height);
     LoopExitReason run_capture_loop(V4L2Source &src);
+    void shutdown_pipeline(std::shared_ptr<V4L2Source> &src);
+    bool try_apply_resolution_change(int &current_w, int &current_h);
+    bool wait_before_reconnect(int &retry_count);
     // Flush, destroy, and recreate m_encoder at the given resolution.
     // Returns false (and leaves m_encoder null) on unrecoverable failure.
     bool rebuild_encoder(int width, int height);

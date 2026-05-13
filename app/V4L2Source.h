@@ -12,6 +12,20 @@
 
 class XilinxSyncIP;
 
+enum class DQStatus
+{
+    OK,
+    Timeout,
+    SourceChanged,
+    Error
+};
+
+struct DQResult
+{
+    DQStatus s;
+    AL_TBuffer *p;
+};
+
 /**
  * @brief V4L2Source encapsulates a V4L2 video capture device using external DMA buffer import (DMABUF).
  *
@@ -123,30 +137,13 @@ class V4L2Source
     bool queue(AL_TBuffer const *buffer);
 
     /**
-     * @brief Status returned by dqueue().
-     *
-     *   Frame:         A frame was dequeued; buffer is valid.
-     *   Timeout:       No frame ready within the timeout; caller should retry.
-     *   SourceChanged: V4L2_EVENT_SOURCE_CHANGE (resolution) received; caller
-     *                  should stop, probe the new format, and rebuild the pipeline.
-     *   Error:         Unrecoverable device error; destroy and rebuild.
-     */
-    enum class DequeueStatus { Frame, Timeout, SourceChanged, Error };
-
-    struct DequeueResult
-    {
-        DequeueStatus status;
-        AL_TBuffer *buffer; ///< Non-null only when status == Frame
-    };
-
-    /**
      * @brief Dequeue one filled frame buffer from V4L2.
      *
      * Blocks up to an internal timeout waiting for a frame or a V4L2 event.
      *
-     * @return DequeueResult describing the outcome.
+     * @return DQStatus describing the outcome.
      */
-    DequeueResult dqueue();
+    DQResult dqueue();
 
     /**
      * @brief Probe the current V4L2 format of a device without altering its state.
@@ -175,6 +172,8 @@ class V4L2Source
     bool qbuf_idx(unsigned int idx);
     void stop_requeue_worker();
     void requeue_worker_loop();
+    DQStatus handle_pollpri_event(int revents);
+    DQResult handle_timeout(const char *reason);
 
     int m_fd;
     const size_t m_buffer_cnt;

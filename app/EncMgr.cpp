@@ -202,25 +202,88 @@ EncMgr::LoopExitReason EncMgr::run_capture_loop(V4L2Source &src)
 {
     while (m_running.load(std::memory_order_relaxed))
     {
-        auto result = src.dqueue();
-        switch (result.status)
+        const DQResult result = src.dqueue();
+        switch (result.s)
         {
-        case V4L2Source::DequeueStatus::Frame:
-            if (!m_encoder->submit_source_buffer(result.buffer))
+        case DQStatus::OK:
+            if (!m_encoder->submit_source_buffer(result.p))
             {
                 VIDEO_ERROR_PRINT("EncMgr: submit_source_buffer failed");
                 return LoopExitReason::DeviceError;
             }
             break;
-        case V4L2Source::DequeueStatus::Timeout:
+        case DQStatus::Timeout:
             break;
-        case V4L2Source::DequeueStatus::SourceChanged:
+        case DQStatus::SourceChanged:
             return LoopExitReason::SourceChanged;
-        case V4L2Source::DequeueStatus::Error:
+        case DQStatus::Error:
             return LoopExitReason::DeviceError;
         }
     }
     return LoopExitReason::Stopped;
+}
+
+void EncMgr::shutdown_pipeline(std::shared_ptr<V4L2Source> &src)
+{
+    if (!m_encoder)
+        return;
+
+    m_encoder->set_release_callback(nullptr);
+    if (src)
+    {
+        src->stop();
+        src.reset();
+    }
+}
+
+bool EncMgr::try_apply_resolution_change(int &current_w, int &current_h)
+{
+    int probed_w = 0;
+    int probed_h = 0;
+    const int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+
+    if (!V4L2Source::probe_format(m_cfg.v4l2_dev, buf_type, probed_w, probed_h) ||
+        probed_w <= 0 || probed_h <= 0 ||
+        (probed_w == current_w && probed_h == current_h))
+    {
+        return true;
+    }
+
+    VIDEO_INFO_PRINT("EncMgr: resolution change %dx%d -> %dx%d", current_w, current_h, probed_w, probed_h);
+    if (m_encoder->set_resolution(static_cast<uint32_t>(probed_w), static_cast<uint32_t>(probed_h)))
+    {
+        current_w = probed_w;
+        current_h = probed_h;
+        m_encoder->request_IDR();
+        return true;
+    }
+
+    VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", probed_w, probed_h);
+    return rebuild_encoder(current_w, current_h);
+}
+
+bool EncMgr::wait_before_reconnect(int &retry_count)
+{
+    if (!m_running.load())
+        return false;
+
+    const int max = m_cfg.max_reconnect_tries;
+    if (max >= 0 && ++retry_count > max)
+    {
+        VIDEO_ERROR_PRINT("EncMgr: max reconnect attempts (%d) reached, stopping", max);
+        return false;
+    }
+
+    VIDEO_INFO_PRINT("EncMgr: waiting %d ms before reconnect (attempt %d/%s)",
+                     m_cfg.reconnect_delay_ms, retry_count,
+                     max >= 0 ? std::to_string(max).c_str() : "inf");
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(m_cfg.reconnect_delay_ms);
+    while (m_running.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    return m_running.load();
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +302,8 @@ void EncMgr::loop_thread_func()
         {
             VIDEO_ERROR_PRINT("EncMgr: pipeline build failed (attempt %d)", retry_count + 1);
         }
-        else
+
+        if (src)
         {
             retry_count = 0;
 
@@ -251,15 +315,8 @@ void EncMgr::loop_thread_func()
                     VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
             });
 
-            LoopExitReason reason = run_capture_loop(*src);
-
-            // Clear the release callback: drops the shared_ptr stored in m_release_cb.
-            // If the SDK thread already copied the lambda, it holds its own shared_ptr
-            // keeping V4L2Source alive until that callback returns — no dangling pointer.
-            m_encoder->set_release_callback(nullptr);
-
-            src->stop();
-            src.reset();
+            const LoopExitReason reason = run_capture_loop(*src);
+            shutdown_pipeline(src);
 
             if (!m_running.load() || reason == LoopExitReason::Stopped)
                 break;
@@ -275,53 +332,15 @@ void EncMgr::loop_thread_func()
 
             if (reason == LoopExitReason::SourceChanged)
             {
-                int probed_w = 0, probed_h = 0;
-                const int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                if (V4L2Source::probe_format(m_cfg.v4l2_dev, buf_type, probed_w, probed_h) &&
-                    probed_w > 0 && probed_h > 0 &&
-                    (probed_w != current_w || probed_h != current_h))
-                {
-                    VIDEO_INFO_PRINT("EncMgr: resolution change %dx%d -> %dx%d",
-                                     current_w, current_h, probed_w, probed_h);
-                    if (m_encoder->set_resolution(static_cast<uint32_t>(probed_w),
-                                                  static_cast<uint32_t>(probed_h)))
-                    {
-                        current_w = probed_w;
-                        current_h = probed_h;
-                        m_encoder->request_IDR();
-                    }
-                    else
-                    {
-                        VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder",
-                                          probed_w, probed_h);
-                        if (!rebuild_encoder(current_w, current_h))
-                            break;
-                    }
-                }
+                if (!try_apply_resolution_change(current_w, current_h))
+                    break;
                 retry_count = 0;
                 continue; // source change: reconnect immediately without delay
             }
         }
 
-        if (!m_running.load())
+        if (!wait_before_reconnect(retry_count))
             break;
-
-        const int max = m_cfg.max_reconnect_tries;
-        if (max >= 0 && ++retry_count > max)
-        {
-            VIDEO_ERROR_PRINT("EncMgr: max reconnect attempts (%d) reached, stopping", max);
-            break;
-        }
-
-        VIDEO_INFO_PRINT("EncMgr: waiting %d ms before reconnect (attempt %d/%s)",
-                         m_cfg.reconnect_delay_ms, retry_count,
-                         max >= 0 ? std::to_string(max).c_str() : "inf");
-
-        // Interruptible sleep: wake up early if stop() is called
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(m_cfg.reconnect_delay_ms);
-        while (m_running.load() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     m_running.store(false);
