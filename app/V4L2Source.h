@@ -132,6 +132,31 @@ class V4L2Source
      */
     AL_TBuffer *dqueue();
 
+    /**
+     * @brief Return true if the source has entered a non-recoverable error state.
+     *
+     * When has_error() returns true, dqueue() will continue to return nullptr and
+     * no further operations are meaningful. The caller should destroy and rebuild.
+     *
+     * @return true if in ERROR or STOPPED state after an internal error.
+     */
+    bool has_error() const;
+
+    /**
+     * @brief Probe the current V4L2 format of a device without altering its state.
+     *
+     * Opens the device read-only, issues VIDIOC_G_FMT, and closes it immediately.
+     * Intended for use before constructing a new V4L2Source instance to detect
+     * whether the source resolution has changed.
+     *
+     * @param dev       Device node path.
+     * @param buf_type  V4L2 buffer type (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE or _CAPTURE).
+     * @param[out] width  Current capture width, or 0 on failure.
+     * @param[out] height Current capture height, or 0 on failure.
+     * @return true if the format was successfully queried.
+     */
+    static bool probe_format(const std::string &dev, int buf_type, int &width, int &height);
+
   private:
     static const char *state_to_cstr(State state);
     static bool can_import(State state);

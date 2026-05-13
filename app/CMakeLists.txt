@@ -10,6 +10,8 @@ set(APP_COMMON_SRC
 add_executable(vcu_enc
     ${APP_COMMON_SRC}
     DMAFd.h
+    EncMgr.cpp
+    EncMgr.h
     main_enc.cpp
     RTEncoder.cpp
     RTEncoder.h

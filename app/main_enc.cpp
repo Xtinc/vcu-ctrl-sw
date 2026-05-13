@@ -1,3 +1,4 @@
+#include "EncMgr.h"
 #include "RTEncoder.h"
 #include "V4L2Source.h"
 #include "YUVFileIO.h"
@@ -17,7 +18,6 @@ extern "C"
 
 namespace
 {
-static constexpr unsigned int kV4L2FrameCount = 1000;
 static constexpr unsigned int kStatLogInterval = 50;
 
 struct FileEncodeCmd
@@ -258,78 +258,36 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
 int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, EncoderConfig &cfg)
 {
     unsigned int totalEncodedUnits = 0;
-    bool encode_ok = true;
-    std::atomic<bool> requeue_failed{false};
-    std::unique_ptr<RTEncoderV4L2> encoder;
+
+    EncMgrConfig mgr_cfg;
+    mgr_cfg.enc = cfg;
+    mgr_cfg.v4l2_dev = v4l2_dev;
+    mgr_cfg.sync_dev = cfg.low_delay_mode ? "/dev/xlnxsync0" : "";
+    mgr_cfg.reconnect_delay_ms = 2000;
+    mgr_cfg.max_reconnect_tries = -1; // run until interrupted
+
     try
     {
-        encoder = std::make_unique<RTEncoderV4L2>(cfg, [&](const uint8_t *pData, size_t size) {
+        EncMgr mgr(mgr_cfg, [&](const uint8_t *pData, size_t size) {
             VIDEO_INFO_PRINT("[%6u] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
         });
 
-        V4L2Source v4l2src(v4l2_dev, cfg.width, cfg.height, STR2FOURCC("NV12"), cfg.num_src_bufs, true,
-                           cfg.low_delay_mode ? "/dev/xlnxsync0" : "");
-        encoder->set_release_callback([&v4l2src, &requeue_failed](AL_TBuffer const *buffer) {
-            if (!v4l2src.queue(buffer))
-            {
-                if (!requeue_failed.exchange(true))
-                {
-                    VIDEO_ERROR_PRINT("Failed to requeue buffer back to V4L2 device");
-                }
-            }
-        });
-        if (!v4l2src.import_fds(encoder->acquire_dma_buffers(cfg.num_src_bufs)))
+        if (!mgr.start())
         {
-            VIDEO_ERROR_PRINT("Failed to import dma fds to V4L2 device");
+            VIDEO_ERROR_PRINT("EncMgr start failed");
             return EXIT_FAILURE;
         }
 
-        if (!v4l2src.start())
-        {
-            VIDEO_ERROR_PRINT("Failed to start V4L2 device: %s", v4l2_dev.c_str());
-            return EXIT_FAILURE;
-        }
+        // Block until user interrupts (Ctrl-C / SIGTERM handled externally) or
+        // the manager stops on its own after exhausting reconnect attempts.
+        // For demonstration purposes we join by waiting on stop() which will
+        // block until the loop thread exits naturally.
+        mgr.stop();
 
-        const unsigned int frameCount = kV4L2FrameCount;
-        for (unsigned int i = 0; i < frameCount; ++i)
-        {
-            if (requeue_failed.load())
-            {
-                VIDEO_ERROR_PRINT("Stopping encode loop due to V4L2 requeue failure");
-                encode_ok = false;
-                break;
-            }
-
-            AL_TBuffer *srcBuf = v4l2src.dqueue();
-            if (!srcBuf)
-            {
-                VIDEO_ERROR_PRINT("Failed to dequeue buffer at frame %u", i);
-                encode_ok = false;
-                break;
-            }
-            if (!encoder->submit_source_buffer(srcBuf))
-            {
-                VIDEO_ERROR_PRINT("Failed to submit dma fd at frame %u", i);
-                encode_ok = false;
-                break;
-            }
-
-            if (i % kStatLogInterval == 0)
-            {
-                auto p = encoder->fps();
-                VIDEO_INFO_PRINT("FPS: %.2f, BitRate:%.2f kbps", p.first, p.second / 1000.0);
-            }
-        }
-
-        if (!encoder->flush())
-        {
-            VIDEO_ERROR_PRINT("Encoder flush timed out; output may be incomplete");
-        }
-        v4l2src.stop();
         VIDEO_INFO_PRINT("V4L2 encoding done. Total encoded units: %u", totalEncodedUnits);
-        return encode_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+        return EXIT_SUCCESS;
     }
     catch (const std::exception &e)
     {

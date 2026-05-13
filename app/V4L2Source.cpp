@@ -600,6 +600,48 @@ AL_TBuffer *V4L2Source::dqueue()
     return m_buffers[buf.index].sync_desc.buffer;
 }
 
+bool V4L2Source::has_error() const
+{
+    const State s = m_state.load();
+    return s == State::ERROR || s == State::STOPPED;
+}
+
+bool V4L2Source::probe_format(const std::string &dev, int buf_type, int &width, int &height)
+{
+    width = 0;
+    height = 0;
+
+    const int fd = ::open(dev.c_str(), O_RDWR | O_NONBLOCK);
+    if (fd < 0)
+    {
+        VIDEO_ERROR_PRINT("probe_format: cannot open %s: %s", dev.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    v4l2_format fmt{};
+    fmt.type = buf_type;
+    const bool ok = (ioctl_retry(fd, VIDIOC_G_FMT, &fmt) == 0);
+    ::close(fd);
+
+    if (!ok)
+    {
+        VIDEO_ERROR_PRINT("probe_format: VIDIOC_G_FMT failed: %s", std::strerror(errno));
+        return false;
+    }
+
+    if (V4L2_TYPE_IS_MULTIPLANAR(buf_type))
+    {
+        width  = static_cast<int>(fmt.fmt.pix_mp.width);
+        height = static_cast<int>(fmt.fmt.pix_mp.height);
+    }
+    else
+    {
+        width  = static_cast<int>(fmt.fmt.pix.width);
+        height = static_cast<int>(fmt.fmt.pix.height);
+    }
+    return true;
+}
+
 bool V4L2Source::qbuf_idx(unsigned int idx)
 {
     if (idx >= m_buffers.size())
