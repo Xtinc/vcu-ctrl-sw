@@ -89,7 +89,8 @@ static int ioctl_retry(int fd, unsigned long request, void *arg)
     return ret;
 }
 
-static bool wait_readable(int fd, int timeout_ms)
+// Returns pfd.revents on success, 0 on timeout, -1 on poll() error.
+static int wait_readable(int fd, int timeout_ms)
 {
     pollfd pfd{};
     pfd.fd = fd;
@@ -102,24 +103,15 @@ static bool wait_readable(int fd, int timeout_ms)
     } while (ret < 0 && errno == EINTR);
 
     if (ret == 0)
-    {
-        errno = ETIMEDOUT;
-        return false;
-    }
+        return 0; // timeout
 
     if (ret < 0)
     {
-        VIDEO_ERROR_PRINT("poll failed before dequeue: %s", std::strerror(errno));
-        return false;
+        VIDEO_ERROR_PRINT("poll failed: %s", std::strerror(errno));
+        return -1;
     }
 
-    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-    {
-        VIDEO_ERROR_PRINT("poll reported device error before dequeue: revents=0x%x", pfd.revents);
-        return false;
-    }
-
-    return true;
+    return pfd.revents;
 }
 
 static bool set_xilinx_low_latency_mode(int fd, bool enable)
@@ -308,7 +300,8 @@ bool V4L2Source::import_fds(DMAFdArray &&fds)
 
     if (fds.size() != m_buffer_cnt)
     {
-        VIDEO_ERROR_PRINT("Number of provided buffers (%zu) does not match buffer count (%zu)", fds.size(), m_buffer_cnt);
+        VIDEO_ERROR_PRINT("Number of provided buffers (%zu) does not match buffer count (%zu)", fds.size(),
+                          m_buffer_cnt);
         return false;
     }
 
@@ -429,6 +422,14 @@ bool V4L2Source::start()
         VIDEO_INFO_PRINT("Start Xilinx DMA synchronization");
     }
 
+    {
+        v4l2_event_subscription sub{};
+        sub.type = V4L2_EVENT_SOURCE_CHANGE;
+        if (ioctl_retry(m_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
+            VIDEO_INFO_PRINT("VIDIOC_SUBSCRIBE_EVENT not supported, source-change detection disabled: %s",
+                             std::strerror(errno));
+    }
+
     stop_requeue_worker();
     m_state.store(State::STREAMING);
     try
@@ -528,30 +529,66 @@ bool V4L2Source::queue(AL_TBuffer const *buffer)
     return true;
 }
 
-AL_TBuffer *V4L2Source::dqueue()
+V4L2Source::DequeueResult V4L2Source::dqueue()
 {
     if (!can_dequeue(m_state.load()))
     {
         VIDEO_ERROR_PRINT("Cannot dequeue in state=%s", state_to_cstr(m_state.load()));
-        return nullptr;
+        return {DequeueStatus::Error, nullptr};
     }
 
-    if (!wait_readable(m_fd, V4L2_DQ_TIMEOUT_MS))
+    const int revents = wait_readable(m_fd, V4L2_DQ_TIMEOUT_MS);
+
+    if (revents == 0)
     {
-        if (errno == ETIMEDOUT)
+        ++m_consecutive_timeout_count;
+        if (m_consecutive_timeout_count >= m_timeout_error_threshold)
         {
-            ++m_consecutive_timeout_count;
-            if (m_consecutive_timeout_count >= m_timeout_error_threshold)
-            {
-                VIDEO_ERROR_PRINT("V4L2 dequeue timed out %d times consecutively", m_consecutive_timeout_count);
-                enter_error_state();
-            }
-            return nullptr;
+            VIDEO_ERROR_PRINT("V4L2 dequeue timed out %d times consecutively", m_consecutive_timeout_count);
+            enter_error_state();
+            return {DequeueStatus::Error, nullptr};
         }
-        enter_error_state();
-        return nullptr;
+        return {DequeueStatus::Timeout, nullptr};
     }
 
+    if (revents < 0)
+    {
+        enter_error_state();
+        return {DequeueStatus::Error, nullptr};
+    }
+
+    if (revents & (POLLERR | POLLHUP | POLLNVAL))
+    {
+        VIDEO_ERROR_PRINT("poll reported device error: revents=0x%x", revents);
+        enter_error_state();
+        return {DequeueStatus::Error, nullptr};
+    }
+
+    if (revents & POLLPRI)
+    {
+        // Drain the V4L2 event queue
+        bool resolution_changed = false;
+        v4l2_event event{};
+        while (ioctl_retry(m_fd, VIDIOC_DQEVENT, &event) == 0)
+        {
+            if (event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION))
+            {
+                resolution_changed = true;
+            }
+        }
+
+        if (resolution_changed)
+        {
+            VIDEO_INFO_PRINT("V4L2 source resolution change event received");
+            return {DequeueStatus::SourceChanged, nullptr};
+        }
+
+        // Non-resolution event; if POLLIN is also set, fall through to DQBUF
+        if (!(revents & POLLIN))
+            return {DequeueStatus::Timeout, nullptr};
+    }
+
+    // POLLIN path: dequeue a frame
     v4l2_buffer buf{};
     v4l2_plane plane[1]{};
     buf.type = m_buf_type;
@@ -571,21 +608,14 @@ AL_TBuffer *V4L2Source::dqueue()
             {
                 VIDEO_ERROR_PRINT("V4L2 dequeue EAGAIN %d times consecutively", m_consecutive_timeout_count);
                 enter_error_state();
+                return {DequeueStatus::Error, nullptr};
             }
-            return nullptr;
+            return {DequeueStatus::Timeout, nullptr};
         }
 
-        if (errno == EPIPE || errno == EINVAL)
-        {
-            enter_error_state();
-        }
-
-        if (errno != EAGAIN)
-        {
-            VIDEO_ERROR_PRINT("Failed to dequeue buffer: %s", std::strerror(errno));
-        }
+        VIDEO_ERROR_PRINT("Failed to dequeue buffer: %s", std::strerror(errno));
         enter_error_state();
-        return nullptr;
+        return {DequeueStatus::Error, nullptr};
     }
 
     m_consecutive_timeout_count = 0;
@@ -594,16 +624,10 @@ AL_TBuffer *V4L2Source::dqueue()
     {
         VIDEO_ERROR_PRINT("Driver returned invalid dequeued index: %u", buf.index);
         enter_error_state();
-        return nullptr;
+        return {DequeueStatus::Error, nullptr};
     }
 
-    return m_buffers[buf.index].sync_desc.buffer;
-}
-
-bool V4L2Source::has_error() const
-{
-    const State s = m_state.load();
-    return s == State::ERROR || s == State::STOPPED;
+    return {DequeueStatus::Frame, m_buffers[buf.index].sync_desc.buffer};
 }
 
 bool V4L2Source::probe_format(const std::string &dev, int buf_type, int &width, int &height)
@@ -631,12 +655,12 @@ bool V4L2Source::probe_format(const std::string &dev, int buf_type, int &width, 
 
     if (V4L2_TYPE_IS_MULTIPLANAR(buf_type))
     {
-        width  = static_cast<int>(fmt.fmt.pix_mp.width);
+        width = static_cast<int>(fmt.fmt.pix_mp.width);
         height = static_cast<int>(fmt.fmt.pix_mp.height);
     }
     else
     {
-        width  = static_cast<int>(fmt.fmt.pix.width);
+        width = static_cast<int>(fmt.fmt.pix.width);
         height = static_cast<int>(fmt.fmt.pix.height);
     }
     return true;

@@ -123,24 +123,30 @@ class V4L2Source
     bool queue(AL_TBuffer const *buffer);
 
     /**
-     * @brief Dequeue one filled frame buffer from V4L2.
+     * @brief Status returned by dqueue().
      *
-     * This call waits up to an internal timeout for frame readiness. On success it returns
-     * the imported AL_TBuffer* identity associated with the dequeued slot.
-     *
-     * @return Non-null AL_TBuffer* on success, nullptr on timeout/error/invalid state
+     *   Frame:         A frame was dequeued; buffer is valid.
+     *   Timeout:       No frame ready within the timeout; caller should retry.
+     *   SourceChanged: V4L2_EVENT_SOURCE_CHANGE (resolution) received; caller
+     *                  should stop, probe the new format, and rebuild the pipeline.
+     *   Error:         Unrecoverable device error; destroy and rebuild.
      */
-    AL_TBuffer *dqueue();
+    enum class DequeueStatus { Frame, Timeout, SourceChanged, Error };
+
+    struct DequeueResult
+    {
+        DequeueStatus status;
+        AL_TBuffer *buffer; ///< Non-null only when status == Frame
+    };
 
     /**
-     * @brief Return true if the source has entered a non-recoverable error state.
+     * @brief Dequeue one filled frame buffer from V4L2.
      *
-     * When has_error() returns true, dqueue() will continue to return nullptr and
-     * no further operations are meaningful. The caller should destroy and rebuild.
+     * Blocks up to an internal timeout waiting for a frame or a V4L2 event.
      *
-     * @return true if in ERROR or STOPPED state after an internal error.
+     * @return DequeueResult describing the outcome.
      */
-    bool has_error() const;
+    DequeueResult dqueue();
 
     /**
      * @brief Probe the current V4L2 format of a device without altering its state.

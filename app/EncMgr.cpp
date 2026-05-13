@@ -191,34 +191,36 @@ bool EncMgr::build_pipeline(std::shared_ptr<V4L2Source> &out_src, int width, int
 }
 
 // ---------------------------------------------------------------------------
-// Inner capture loop — uses V4L2Source::dqueue() with its built-in poll.
+// Inner capture loop
 //
-// Exits when:
-//   - m_running becomes false          (normal stop)
-//   - src.has_error()                  (device error or disconnect detected
-//                                       internally by V4L2Source)
-//   - encoder submit fails
+// Returns:
+//   Stopped       - m_running became false (normal stop)
+//   SourceChanged - V4L2_EVENT_SOURCE_CHANGE (resolution) received
+//   DeviceError   - device error or encoder submit failure
 // ---------------------------------------------------------------------------
-void EncMgr::run_capture_loop(V4L2Source &src)
+EncMgr::LoopExitReason EncMgr::run_capture_loop(V4L2Source &src)
 {
     while (m_running.load(std::memory_order_relaxed))
     {
-        if (src.has_error())
+        auto result = src.dqueue();
+        switch (result.status)
         {
-            VIDEO_ERROR_PRINT("EncMgr: V4L2Source entered error state, stopping capture loop");
+        case V4L2Source::DequeueStatus::Frame:
+            if (!m_encoder->submit_source_buffer(result.buffer))
+            {
+                VIDEO_ERROR_PRINT("EncMgr: submit_source_buffer failed");
+                return LoopExitReason::DeviceError;
+            }
             break;
-        }
-
-        AL_TBuffer *buf = src.dqueue(); // blocks up to 1 s internally
-        if (!buf)
-            continue; // timeout or transient nullptr — re-check flags
-
-        if (!m_encoder->submit_source_buffer(buf))
-        {
-            VIDEO_ERROR_PRINT("EncMgr: submit_source_buffer failed");
+        case V4L2Source::DequeueStatus::Timeout:
             break;
+        case V4L2Source::DequeueStatus::SourceChanged:
+            return LoopExitReason::SourceChanged;
+        case V4L2Source::DequeueStatus::Error:
+            return LoopExitReason::DeviceError;
         }
     }
+    return LoopExitReason::Stopped;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,71 +238,71 @@ void EncMgr::loop_thread_func()
         if (!build_pipeline(src, current_w, current_h))
         {
             VIDEO_ERROR_PRINT("EncMgr: pipeline build failed (attempt %d)", retry_count + 1);
-            goto recover;
         }
-
-        retry_count = 0;
-
-        // Capture shared_ptr by value so the SDK release callback keeps V4L2Source
-        // alive until the last in-flight callback completes, even after src is
-        // stopped and reset below (prevents use-after-free on the SDK thread).
-        m_encoder->set_release_callback([src](AL_TBuffer const *buf) {
-            if (!src->queue(buf))
-                VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
-        });
-
-        run_capture_loop(*src);
-
-        // Clear the release callback: drops the shared_ptr stored in m_release_cb.
-        // If the SDK thread already copied the lambda, it holds its own shared_ptr
-        // keeping V4L2Source alive until that callback returns — no dangling pointer.
-        m_encoder->set_release_callback(nullptr);
-
-        src->stop();
-        src.reset(); // releases our shared_ptr; V4L2Source destroyed once SDK is done too
-
-        if (!m_running.load())
-            break;
-
-        // Detect encoder fault (submit_source_buffer calls signal_done on SDK error).
-        // Rebuild before attempting the next capture session.
-        if (!m_encoder->is_running())
+        else
         {
-            VIDEO_ERROR_PRINT("EncMgr: encoder faulted, rebuilding at %dx%d", current_w, current_h);
-            if (!rebuild_encoder(current_w, current_h))
+            retry_count = 0;
+
+            // Capture shared_ptr by value so the SDK release callback keeps V4L2Source
+            // alive until the last in-flight callback completes, even after src is
+            // stopped and reset below (prevents use-after-free on the SDK thread).
+            m_encoder->set_release_callback([src](AL_TBuffer const *buf) {
+                if (!src->queue(buf))
+                    VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
+            });
+
+            LoopExitReason reason = run_capture_loop(*src);
+
+            // Clear the release callback: drops the shared_ptr stored in m_release_cb.
+            // If the SDK thread already copied the lambda, it holds its own shared_ptr
+            // keeping V4L2Source alive until that callback returns — no dangling pointer.
+            m_encoder->set_release_callback(nullptr);
+
+            src->stop();
+            src.reset();
+
+            if (!m_running.load() || reason == LoopExitReason::Stopped)
                 break;
-            VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
-        }
 
-        // Probe the device's current format to detect resolution changes.
-        // This is done after destroying the old V4L2Source so the fd is free.
-        {
-            int probed_w = 0, probed_h = 0;
-            const int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-            if (V4L2Source::probe_format(m_cfg.v4l2_dev, buf_type, probed_w, probed_h) &&
-                probed_w > 0 && probed_h > 0 &&
-                (probed_w != current_w || probed_h != current_h))
+            // Detect encoder fault and rebuild before the next capture session.
+            if (!m_encoder->is_running())
             {
-                VIDEO_INFO_PRINT("EncMgr: resolution change detected %dx%d -> %dx%d",
-                                 current_w, current_h, probed_w, probed_h);
-                if (m_encoder->set_resolution(static_cast<uint32_t>(probed_w),
-                                              static_cast<uint32_t>(probed_h)))
+                VIDEO_ERROR_PRINT("EncMgr: encoder faulted, rebuilding at %dx%d", current_w, current_h);
+                if (!rebuild_encoder(current_w, current_h))
+                    break;
+                VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
+            }
+
+            if (reason == LoopExitReason::SourceChanged)
+            {
+                int probed_w = 0, probed_h = 0;
+                const int buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                if (V4L2Source::probe_format(m_cfg.v4l2_dev, buf_type, probed_w, probed_h) &&
+                    probed_w > 0 && probed_h > 0 &&
+                    (probed_w != current_w || probed_h != current_h))
                 {
-                    current_w = probed_w;
-                    current_h = probed_h;
-                    m_encoder->request_IDR();
+                    VIDEO_INFO_PRINT("EncMgr: resolution change %dx%d -> %dx%d",
+                                     current_w, current_h, probed_w, probed_h);
+                    if (m_encoder->set_resolution(static_cast<uint32_t>(probed_w),
+                                                  static_cast<uint32_t>(probed_h)))
+                    {
+                        current_w = probed_w;
+                        current_h = probed_h;
+                        m_encoder->request_IDR();
+                    }
+                    else
+                    {
+                        VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder",
+                                          probed_w, probed_h);
+                        if (!rebuild_encoder(current_w, current_h))
+                            break;
+                    }
                 }
-                else
-                {
-                    VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder at old resolution",
-                                      probed_w, probed_h);
-                    if (!rebuild_encoder(current_w, current_h))
-                        break;
-                }
+                retry_count = 0;
+                continue; // source change: reconnect immediately without delay
             }
         }
 
-    recover:
         if (!m_running.load())
             break;
 
