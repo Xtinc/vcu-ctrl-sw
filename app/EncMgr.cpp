@@ -121,10 +121,6 @@ std::pair<double, double> EncMgr::fps() const
     return m_encoder->fps();
 }
 
-// ---------------------------------------------------------------------------
-// Pipeline helpers (called only from the loop thread)
-// ---------------------------------------------------------------------------
-
 bool EncMgr::open_source(int width, int height)
 {
     const size_t num_bufs = m_cfg.enc.num_src_bufs;
