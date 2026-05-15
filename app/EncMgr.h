@@ -4,12 +4,6 @@
 #include "RTEncoder.h"
 #include "V4L2Source.h"
 
-#include <atomic>
-#include <memory>
-#include <mutex>
-#include <thread>
-#include <utility>
-
 /**
  * @brief EncMgrConfig holds all configuration needed to create an EncMgr instance.
  */
@@ -61,21 +55,22 @@ struct EncMgrConfig
  * Threading model:
  *   - start() spawns one loop thread that drives the entire pipeline.
  *   - stop() signals the thread and joins it (blocking until encoder EOS drains).
- *   - set_bitrate / set_framerate / request_IDR / fps are thread-safe: they acquire
- *     m_enc_mutex, which also synchronises with the loop thread's final encoder reset.
+ *   - set_bitrate / set_framerate / request_IDR / fps are only accepted while the
+ *     pipeline is running; they acquire m_enc_mutex, which also synchronises with
+ *     the loop thread's final encoder reset.
+ *
+ * Encoded output is currently wired to a local placeholder callback. A future
+ * network sender will be connected here once that class exists.
  */
 class EncMgr
 {
   public:
-    using EncodedFrameCallback = RTEncoderBase::EncodedFrameCallback;
-
     /**
      * @brief Construct an EncMgr. Does not start encoding; call start().
      * @param cfg       Configuration for encoder and capture device.
-     * @param output_cb Callback invoked on the encoder SDK thread for each encoded AU.
-     * @throw std::invalid_argument if cfg.v4l2_dev is empty or output_cb is null.
+     * @throw std::invalid_argument if cfg.v4l2_dev is empty.
      */
-    explicit EncMgr(EncMgrConfig cfg, EncodedFrameCallback output_cb);
+    explicit EncMgr(EncMgrConfig cfg);
 
     /** @brief Destructor. Calls stop() if still running. */
     ~EncMgr();
@@ -101,7 +96,9 @@ class EncMgr
     void stop();
 
     /**
-     * @brief Dynamically update the target (and optionally peak) bitrate.
+    * @brief Dynamically update the target (and optionally peak) bitrate.
+    *
+    * Only valid while the pipeline is running.
      * @param target Target bitrate in bps. Must be > 0.
      * @param max    VBR peak bitrate in bps. 0 = same as target (CBR).
      * @return true on success, false if encoder is not available or SDK rejects the value.
@@ -110,17 +107,21 @@ class EncMgr
 
     /**
      * @brief Dynamically update the encode frame rate.
+    *
+    * Only valid while the pipeline is running.
      * @param fps Frame rate numerator. Must be > 0.
      * @param clk Frame rate denominator. Must be > 0.
      * @return true on success, false if encoder is not available or SDK rejects the value.
      */
     bool set_framerate(uint32_t fps, uint32_t clk = 1000);
 
-    /** @brief Force the encoder to insert an IDR frame at the next opportunity. */
+      /** @brief Force the encoder to insert an IDR frame at the next opportunity while running. */
     void request_IDR();
 
     /**
      * @brief Return the latest EMA throughput statistics.
+    *
+    * Returns {0.0, 0.0} while the pipeline is stopped.
      * @return {fps, bitrate_bps}. Values are 0.0 until at least 100 frames have been encoded.
      */
     std::pair<double, double> fps() const;
@@ -156,7 +157,6 @@ class EncMgr
     void loop_thread_func();
 
     EncMgrConfig m_cfg;
-    EncodedFrameCallback m_output_cb;
 
     std::unique_ptr<RTEncoderV4L2> m_encoder; ///< Created in start(), destroyed on loop exit
     std::shared_ptr<V4L2Source> m_source;     ///< Opened/closed each capture session

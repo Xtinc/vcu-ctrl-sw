@@ -33,7 +33,7 @@ void print_usage(const char *app)
     VIDEO_ERROR_PRINT("Usage: %s <mode> <cmd.txt|v4l2_dev> <output.265>", app);
     VIDEO_ERROR_PRINT("  mode: file | v4l2");
     VIDEO_ERROR_PRINT("  file: %s file <cmd.txt> <output.265>", app);
-    VIDEO_ERROR_PRINT("  v4l2: %s v4l2 <video_device> <output.265>", app);
+    VIDEO_ERROR_PRINT("  v4l2: %s v4l2 <video_device> <output.265>  (reserved)", app);
 }
 
 EncoderConfig make_default_config()
@@ -255,10 +255,8 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
     }
 }
 
-int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, EncoderConfig &cfg)
+int encode_v4l2_mode(const std::string &v4l2_dev, EncoderConfig &cfg)
 {
-    unsigned int totalEncodedUnits = 0;
-
     EncMgrConfig mgr_cfg;
     mgr_cfg.enc = cfg;
     mgr_cfg.v4l2_dev = v4l2_dev;
@@ -268,11 +266,7 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
 
     try
     {
-        EncMgr mgr(mgr_cfg, [&](const uint8_t *pData, size_t size) {
-            VIDEO_INFO_PRINT("[%6u] size: %6zu bytes", totalEncodedUnits, size);
-            outFile.write(reinterpret_cast<const char *>(pData), size);
-            ++totalEncodedUnits;
-        });
+        EncMgr mgr(mgr_cfg);
 
         if (!mgr.start())
         {
@@ -285,8 +279,7 @@ int encode_v4l2_mode(const std::string &v4l2_dev, std::ofstream &outFile, Encode
         // For demonstration purposes we join by waiting on stop() which will
         // block until the loop thread exits naturally.
         mgr.stop();
-
-        VIDEO_INFO_PRINT("V4L2 encoding done. Total encoded units: %u", totalEncodedUnits);
+    VIDEO_INFO_PRINT("V4L2 encoding done");
         return EXIT_SUCCESS;
     }
     catch (const std::exception &e)
@@ -315,22 +308,22 @@ int main(int argc, char *argv[])
 
     EncoderConfig cfg = make_default_config();
 
-    std::ofstream outFile(argv[3], std::ios::binary);
-    if (!outFile)
-    {
-        VIDEO_ERROR_PRINT("Cannot open output file: %s", argv[3]);
-        return EXIT_FAILURE;
-    }
-
     if (mode == "file")
     {
+        std::ofstream outFile(argv[3], std::ios::binary);
+        if (!outFile)
+        {
+            VIDEO_ERROR_PRINT("Cannot open output file: %s", argv[3]);
+            return EXIT_FAILURE;
+        }
+
         return encode_file_mode(argv[2], outFile, cfg);
     }
     else if (mode == "v4l2")
     {
         cfg.width = 3840;
         cfg.height = 2160;
-        return encode_v4l2_mode(argv[2], outFile, cfg);
+        return encode_v4l2_mode(argv[2], cfg);
     }
 
     return EXIT_FAILURE;

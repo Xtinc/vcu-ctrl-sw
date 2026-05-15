@@ -5,21 +5,24 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
-#include <chrono>
-#include <stdexcept>
-#include <thread>
+namespace
+{
+RTEncoderBase::EncodedFrameCallback make_noop_output_callback()
+{
+    return [](const uint8_t *, size_t) {
+        // TODO: forward encoded frames to the future network sender.
+    };
+}
+} // namespace
 
 // ---------------------------------------------------------------------------
 // EncMgr — public interface
 // ---------------------------------------------------------------------------
 
-EncMgr::EncMgr(EncMgrConfig cfg, EncodedFrameCallback output_cb)
-    : m_cfg(std::move(cfg)), m_output_cb(std::move(output_cb))
+EncMgr::EncMgr(EncMgrConfig cfg) : m_cfg(std::move(cfg))
 {
     if (m_cfg.v4l2_dev.empty())
         throw std::invalid_argument("EncMgr: v4l2_dev must not be empty");
-    if (!m_output_cb)
-        throw std::invalid_argument("EncMgr: output_cb must not be null");
 }
 
 EncMgr::~EncMgr()
@@ -37,7 +40,7 @@ bool EncMgr::start()
 
     try
     {
-        m_encoder = std::make_unique<RTEncoderV4L2>(m_cfg.enc, m_output_cb);
+        m_encoder = std::make_unique<RTEncoderV4L2>(m_cfg.enc, make_noop_output_callback());
     }
     catch (const std::exception &e)
     {
@@ -54,16 +57,25 @@ void EncMgr::stop()
 {
     m_running.store(false);
     if (m_loop_thread.joinable())
+    {
         m_loop_thread.join();
+    }
 }
 
 bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
 {
+    if (!m_running.load())
+        return false;
+
     std::lock_guard<std::mutex> lock(m_enc_mutex);
-    if (!m_encoder)
+    if (!m_running.load() || !m_encoder)
+    {
         return false;
+    }
     if (!m_encoder->set_bitrate(target, max))
+    {
         return false;
+    }
     m_cfg.enc.target_bitrate = target;
     m_cfg.enc.max_bitrate = (max > 0) ? max : target;
     return true;
@@ -71,11 +83,18 @@ bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
 
 bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
 {
+    if (!m_running.load())
+        return false;
+
     std::lock_guard<std::mutex> lock(m_enc_mutex);
-    if (!m_encoder)
+    if (!m_running.load() || !m_encoder)
+    {
         return false;
+    }
     if (!m_encoder->set_framerate(fps, clk))
+    {
         return false;
+    }
     m_cfg.enc.framerate = static_cast<uint16_t>(fps);
     m_cfg.enc.clk_ratio = static_cast<uint16_t>(clk);
     return true;
@@ -83,15 +102,21 @@ bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
 
 void EncMgr::request_IDR()
 {
+    if (!m_running.load())
+        return;
+
     std::lock_guard<std::mutex> lock(m_enc_mutex);
-    if (m_encoder)
+    if (m_running.load() && m_encoder)
         m_encoder->request_IDR();
 }
 
 std::pair<double, double> EncMgr::fps() const
 {
+    if (!m_running.load())
+        return {0.0, 0.0};
+
     std::lock_guard<std::mutex> lock(m_enc_mutex);
-    if (!m_encoder)
+    if (!m_running.load() || !m_encoder)
         return {0.0, 0.0};
     return m_encoder->fps();
 }
@@ -175,7 +200,7 @@ bool EncMgr::rebuild_encoder(int width, int height)
     m_encoder.reset(); // release hardware resource before constructing new instance
     try
     {
-        m_encoder = std::make_unique<RTEncoderV4L2>(enc_cfg, m_output_cb);
+        m_encoder = std::make_unique<RTEncoderV4L2>(enc_cfg, make_noop_output_callback());
         return true;
     }
     catch (const std::exception &e)
