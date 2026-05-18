@@ -59,6 +59,7 @@ add_subdirectory(lib_common_enc)
 add_subdirectory(lib_common_dec)
 add_subdirectory(lib_parsing)
 add_subdirectory(lib_sync_ip)
+add_subdirectory(lib_network)
 
 # ---------- Batch 2: app-facing deliverables ----------
 # User app layer + final SDK libraries consumed by applications.
@@ -68,6 +69,7 @@ add_subdirectory(lib_encode)
 add_subdirectory(lib_decode)
 add_subdirectory(lib_app)
 add_subdirectory(app)
+add_subdirectory(tests)
 
 
 find_package(PkgConfig QUIET)

@@ -213,12 +213,12 @@ int Rtos_DriverPoll(void *drv, Rtos_PollCtx *ctx)
 
 Rtos_AtomicInt Rtos_AtomicIncrement(Rtos_AtomicInt *iVal)
 {
-    return InterlockedIncrement(iVal);
+    return InterlockedIncrement((volatile LONG *)iVal);
 }
 
 Rtos_AtomicInt Rtos_AtomicDecrement(Rtos_AtomicInt *iVal)
 {
-    return InterlockedDecrement(iVal);
+    return InterlockedDecrement((volatile LONG *)iVal);
 }
 
 #elif LINUX_OS_ENVIRONMENT
