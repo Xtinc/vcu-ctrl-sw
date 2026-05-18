@@ -22,27 +22,27 @@ ClockEntry::ClockEntry() : m_cancelled(false)
 {
 }
 
-ClockEntry::Result ClockEntry::wait_until(ClockTP target)
+int ClockEntry::wait_until(ClockTP target)
 {
     auto diff = duration_cast<ns>(target - steady_clock::now()).count();
 
     if (diff <= 0)
     {
-        return (diff == 0) ? Result::OK : Result::EARLY;
+        return (diff == 0) ? 0 : 1;
     }
 
     while (true)
     {
         if (m_cancelled.load(std::memory_order_acquire))
         {
-            return Result::CANCELLED;
+            return -1;
         }
 
         diff = duration_cast<ns>(target - steady_clock::now()).count();
 
         if (diff <= MIN_WAIT_NS)
         {
-            return Result::OK;
+            return 0;
         }
 
         if (diff <= SHORT_NS)
@@ -57,13 +57,13 @@ ClockEntry::Result ClockEntry::wait_until(ClockTP target)
                 int ret = ::clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &end, nullptr);
                 if (ret == 0)
                 {
-                    return Result::OK;
+                    return 0;
                 }
                 if (ret == EINTR)
                 {
-                    if (cancelled_.load(std::memory_order_acquire))
+                    if (m_cancelled.load(std::memory_order_acquire))
                     {
-                        return Result::CANCELLED;
+                        return -1;
                     }
                     continue;
                 }
@@ -73,10 +73,10 @@ ClockEntry::Result ClockEntry::wait_until(ClockTP target)
             std::this_thread::sleep_until(target);
             if (m_cancelled.load(std::memory_order_acquire))
             {
-                return Result::CANCELLED;
+                return -1;
             }
 #endif
-            return Result::OK;
+            return 0;
         }
 
         // For diff in (SHORT_NS, MEDIUM_NS): sleep until SHORT_NS before the target
@@ -86,7 +86,7 @@ ClockEntry::Result ClockEntry::wait_until(ClockTP target)
         std::unique_lock<std::mutex> lk(m_mutex);
         if (m_cancelled.load(std::memory_order_acquire))
         {
-            return Result::CANCELLED;
+            return -1;
         }
 
         m_cond.wait_until(lk, deadline);
@@ -95,13 +95,13 @@ ClockEntry::Result ClockEntry::wait_until(ClockTP target)
 
         if (c)
         {
-            return Result::CANCELLED;
+            return -1;
         }
 
         diff = duration_cast<ns>(target - steady_clock::now()).count();
         if (diff <= MIN_WAIT_NS)
         {
-            return Result::OK;
+            return 0;
         }
     }
 }

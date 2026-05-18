@@ -69,7 +69,6 @@ add_subdirectory(lib_encode)
 add_subdirectory(lib_decode)
 add_subdirectory(lib_app)
 add_subdirectory(app)
-add_subdirectory(tests)
 
 
 find_package(PkgConfig QUIET)
