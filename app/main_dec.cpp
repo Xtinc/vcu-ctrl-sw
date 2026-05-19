@@ -1,17 +1,19 @@
 /**
  * @file main_dec.cpp
- * @brief Decode a compressed bitstream (HEVC or AVC) and write 10 seconds of
- *        decoded YUV frames to an output file using the RTDecoder pipeline.
+ * @brief Decode a compressed bitstream (HEVC or AVC) and display decoded
+ *        frames on screen via DRM/KMS zero-copy pipeline using RTDecoder +
+ *        DRMDisplay.
  *
  * Usage:
- *   vcu_dec <input.hevc|avc> <output.yuv> [hevc|avc]
+ *   vcu_dec <input.hevc|avc> [hevc|avc] [chunk|slice] [--drm <device>]
  *
  *   codec argument defaults to "hevc" when omitted.
+ *   --drm device defaults to /dev/dri/card0 when omitted.
  */
 
+#include "DRMDisplay.h"
 #include "RTDecoder.h"
 #include "SliceFeeder.h"
-#include "YUVFileIO.h"
 
 extern "C"
 {
@@ -22,7 +24,6 @@ extern "C"
 
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -37,8 +38,15 @@ enum class FeedMode
     Slice,
 };
 
-static bool parse_codec_or_mode(std::string const &token, AL_ECodec &codec, FeedMode &feed_mode)
+static bool parse_codec_or_mode(std::string const &token, AL_ECodec &codec, FeedMode &feed_mode,
+                                std::string &drm_device, int &i, int argc, char *argv[])
 {
+    if (token == "--drm")
+    {
+        if (i + 1 < argc)
+            drm_device = argv[++i];
+        return true;
+    }
     if (token == "avc" || token == "h264")
     {
         codec = AL_CODEC_AVC;
@@ -91,41 +99,37 @@ static bool feed_stream_by_chunk(std::ifstream &input_file, RTDecoder &decoder)
 // ---------------------------------------------------------------------------
 static void print_usage(const char *app)
 {
-    VIDEO_ERROR_PRINT("Usage: %s <input.hevc|avc> <output.yuv> [hevc|avc] [chunk|slice]", app);
-    VIDEO_ERROR_PRINT("  Reads the compressed bitstream, decodes it, and writes 10 s of YUV.");
+    VIDEO_ERROR_PRINT("Usage: %s <input.hevc|avc> [hevc|avc] [chunk|slice] [--drm <device>]", app);
+    VIDEO_ERROR_PRINT("  Reads the compressed bitstream and displays decoded frames on screen.");
     VIDEO_ERROR_PRINT("  codec argument: hevc (default), h265, avc, or h264");
     VIDEO_ERROR_PRINT("  input mode    : chunk (default) or slice (Annex-B NAL based)");
+    VIDEO_ERROR_PRINT("  --drm device  : DRM device node (default: /dev/dri/card0)");
 }
 
 // ---------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
     message_init();
-    if (argc < 3)
+    if (argc < 2)
     {
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
 
     const std::string input_path = argv[1];
-    const std::string output_path = argv[2];
 
-    // ---- Codec / input mode selection ------------------------------------
+    // ---- Codec / input mode / DRM device selection -----------------------
     AL_ECodec codec = AL_CODEC_HEVC;
     FeedMode feed_mode = FeedMode::Chunk;
+    std::string drm_device = "/dev/dri/card0";
 
-    if (argc > 5)
-    {
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    for (int i = 3; i < argc; ++i)
+    for (int i = 2; i < argc; ++i)
     {
         const std::string token = argv[i];
-        if (!parse_codec_or_mode(token, codec, feed_mode))
+        if (!parse_codec_or_mode(token, codec, feed_mode, drm_device, i, argc, argv))
         {
-            VIDEO_ERROR_PRINT("Unknown argument '%s'. Use codec (hevc/avc) and mode (chunk/slice).", token.c_str());
+            VIDEO_ERROR_PRINT("Unknown argument '%s'.", token.c_str());
+            print_usage(argv[0]);
             return EXIT_FAILURE;
         }
     }
@@ -138,48 +142,49 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    // ---- Shared state accessed from both the main thread and the SDK
-    //      callback thread (protected by writer_mutex where needed).
-    std::mutex writer_mutex;
-    std::unique_ptr<YuvFileIO> yuv_writer;
-    uint32_t frames_written = 0;
-
     // ---- Build decoder config ---------------------------------------------
     DecoderConfig cfg;
     cfg.codec = codec;
     cfg.input_buffer_size = kChunkSize;
     cfg.low_delay_mode = (feed_mode == FeedMode::Slice);
 
-    // ---- Create decoder and callback --------------------------------------
-    RTDecoder decoder(cfg, [&](AL_TBuffer *pFrame, AL_TInfoDecode const &info) {
-        std::lock_guard<std::mutex> lock(writer_mutex);
-        if (!yuv_writer)
-        {
-            TFourCC fourcc = AL_PixMapBuffer_GetFourCC(pFrame);
-            int width = info.tDim.iWidth;
-            int height = info.tDim.iHeight;
+    // ---- Create display and decoder ---------------------------------------
+    // display is declared before decoder so that, on explicit stop(), the
+    // release callback (which calls decoder.return_display_frame) fires while
+    // decoder is still alive. Both objects are explicitly drained in order:
+    //   1. decoder.flush()  — waits for all frames delivered to callback
+    //   2. display->stop()  — drains display thread, releases held frame via callback
+    std::unique_ptr<DRMDisplay> display;
+    uint32_t frames_shown = 0;
 
-            yuv_writer = std::make_unique<YuvFileIO>(output_path, YuvFileIO::Mode::Write, width, height, fourcc);
-            if (!yuv_writer->open())
+    RTDecoder decoder(cfg, [&](AL_TBuffer *pFrame, AL_TInfoDecode const &info) {
+        if (!display)
+        {
+            // Lazily create DRMDisplay on the first decoded frame so we know
+            // a valid frame format is available.
+            DRMDisplayConfig drm_cfg;
+            drm_cfg.drm_device = drm_device;
+            drm_cfg.enable_vsync = true;
+            try
             {
-                VIDEO_ERROR_PRINT("Failed to open output file: %s", output_path.c_str());
+                display = std::make_unique<DRMDisplay>(drm_cfg, [&decoder](AL_TBuffer *f) {
+                    decoder.return_display_frame(f);
+                });
+                VIDEO_INFO_PRINT("DRMDisplay opened on %s  (%dx%d)", drm_device.c_str(), info.tDim.iWidth,
+                                 info.tDim.iHeight);
+            }
+            catch (const std::exception &ex)
+            {
+                VIDEO_ERROR_PRINT("DRMDisplay init failed: %s — dropping frame", ex.what());
+                decoder.return_display_frame(pFrame);
                 return;
             }
-
-            VIDEO_INFO_PRINT("Stream: %dx%d  FourCC=0x%08X  -> %s", width, height, static_cast<unsigned>(fourcc),
-                             output_path.c_str());
         }
 
-        if (!yuv_writer->write_frame(pFrame))
-        {
-            VIDEO_ERROR_PRINT("Failed to write frame %u", frames_written);
-            return;
-        }
+        display->show(pFrame, info);
 
-        if (++frames_written % 100 == 0)
-        {
-            VIDEO_INFO_PRINT("Written %u frames", frames_written);
-        }
+        if (++frames_shown % 100 == 0)
+            VIDEO_INFO_PRINT("Displayed %u frames", frames_shown);
     });
 
     // ---- Feed bitstream ---------------------------------------------------
@@ -210,17 +215,17 @@ int main(int argc, char *argv[])
         }
     }
 
-    // ---- Drain and tear down ----------------------------------------------
+    // ---- Drain decoder first, then stop display ---------------------------
+    // Order matters: flush() waits for all decoded frames to be delivered to
+    // the callback (and thus submitted to DRMDisplay). Only after that do we
+    // stop DRMDisplay so it can release the last held frame back to the decoder
+    // before AL_Decoder_Destroy tears down the buffer pool.
     if (!decoder.flush())
-    {
         VIDEO_ERROR_PRINT("Decoder flush timed out; output may be incomplete");
-    }
 
-    if (yuv_writer)
-    {
-        yuv_writer->close();
-    }
+    if (display)
+        display->stop();
 
-    VIDEO_INFO_PRINT("Done. Total frames written: %u", frames_written);
+    VIDEO_INFO_PRINT("Done. Total frames displayed: %u", frames_shown);
     return EXIT_SUCCESS;
 }

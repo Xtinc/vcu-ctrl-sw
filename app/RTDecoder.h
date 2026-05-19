@@ -33,11 +33,6 @@ struct DecoderConfig
     std::string dec_dev_path = "/dev/allegroDecodeIP"; ///< Device file path of the VCU decode IP.
     bool low_delay_mode = false;                       ///< Enable low-latency profile (split input + VCL unit decode).
     uint32_t flush_timeout_ms = 5000;                  ///< Timeout in milliseconds while waiting for decoder EOS.
-    bool manual_frame_return = false;                  ///< If true, the DecodedFrameCallback is responsible for calling
-                                                       ///< RTDecoder::return_display_frame() when done with the frame.
-                                                       ///< RTDecoder will NOT call AL_Decoder_PutDisplayPicture automatically.
-                                                       ///< Use this for zero-copy DRM display to prevent decoder from
-                                                       ///< reusing a buffer still being scanned out by the display.
 };
 
 /**
@@ -178,7 +173,6 @@ class RTDecoder
     /**
      * @brief Return a frame to the decoder's display picture pool.
      *
-     * Only meaningful when DecoderConfig::manual_frame_return is @c true.
      * Must be called exactly once per frame delivered to the DecodedFrameCallback;
      * calling it is what allows the decoder to reuse the underlying DMA buffer.
      *

@@ -328,13 +328,10 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         m_sei_measurer->on_frame_displayed(pFrame);
     }
 
-    // When manual_frame_return is requested, give the callback an extra reference
-    // so it can hold the buffer beyond this function's scope and call
-    // return_display_frame() itself (e.g. zero-copy DRM display).
-    if (m_cfg.manual_frame_return)
-    {
-        AL_Buffer_Ref(pFrame);
-    }
+    // Give the callback an extra reference so it can hold the buffer beyond
+    // this function's scope. The caller MUST call return_display_frame() when
+    // done with the frame to return it to the decoder's display picture pool.
+    AL_Buffer_Ref(pFrame);
 
     try
     {
@@ -342,30 +339,12 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
     }
     catch (...)
     {
-        if (m_cfg.manual_frame_return)
-        {
-            AL_Buffer_Unref(pFrame); // roll back the extra ref on exception path
-        }
+        AL_Buffer_Unref(pFrame); // roll back the extra ref on exception path
         signal_error(AL_ERROR);
         return;
     }
 
     update_fps();
-
-    if (!m_cfg.manual_frame_return)
-    {
-        // Default: return the buffer to the decoder immediately after the callback.
-        auto s = m_state.load(std::memory_order_relaxed);
-        if (s == State::Running || s == State::Flushing)
-        {
-            if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
-            {
-                VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed for main frame");
-                signal_error(AL_ERROR);
-            }
-        }
-    }
-    // else: caller will call return_display_frame() when display is done.
 }
 
 void RTDecoder::on_sdk_error(AL_ERR eError)
@@ -504,7 +483,7 @@ void RTDecoder::return_display_frame(AL_TBuffer *pFrame)
         }
     }
 
-    // Drop the extra reference taken in on_sdk_display when manual_frame_return is on.
+    // Drop the extra reference taken in on_sdk_display.
     AL_Buffer_Unref(pFrame);
 }
 

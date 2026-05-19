@@ -7,167 +7,153 @@ extern "C"
 #include "lib_decode/lib_decode.h"
 }
 
+#include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 
 /**
  * @brief Configuration parameters for DRMDisplay.
  */
 struct DRMDisplayConfig
 {
-    std::string drm_device   = "/dev/dri/card0"; ///< DRM device node path.
-    int connector_id         = -1;               ///< KMS connector ID (-1 = auto-detect first connected).
-    int crtc_id              = -1;               ///< KMS CRTC ID (-1 = auto-detect from connector).
-    int plane_id             = -1;               ///< KMS plane ID (-1 = auto-detect overlay or primary plane).
-    bool enable_vsync        = false;            ///< Block in show() until page-flip completes.
-    bool force_mode_set      = false;            ///< Force drmModeSetCrtc even if a mode is already active.
+    std::string drm_device = "/dev/dri/card0"; ///< DRM device node path.
+    int connector_id = -1;                     ///< KMS connector ID (-1 = auto-detect first connected).
+    int crtc_id = -1;                          ///< KMS CRTC ID (-1 = auto-detect from connector).
+    int plane_id = -1;                         ///< KMS plane ID (-1 = auto-detect overlay or primary plane).
+    bool enable_vsync = true;                  ///< Wait for page-flip event before releasing frame.
+    bool force_mode_set = false;               ///< Force drmModeSetCrtc even if a mode is already active.
 };
 
 /**
  * @brief Zero-copy DRM/KMS display for Xilinx ZYNQ VCU decoded frames.
  *
- * DRMDisplay presents decoded AL_TBuffer frames directly onto a DRM overlay
- * (or primary) plane via PRIME DMA-buf import — no CPU copy is required.
+ * Accepts decoded frames from RTDecoder via show() and presents them on screen
+ * using DRM PRIME DMA-buf import (zero CPU copy).  Each unique AL_TBuffer* is
+ * imported once and cached; subsequent frames reuse the cached framebuffer.
  *
- * ### Buffer lifecycle (double-buffer scheme)
- *
- * To prevent the decoder from overwriting a frame that is still being
- * scanned out by the display controller, DRMDisplay holds a reference to the
- * currently displayed frame and only releases it when the *next* frame
- * replaces it:
- *
- *  1. show() is called with a new frame + a @p on_frame_return callback.
- *  2. The frame's DMA-buf fd is imported with drmPrimeFDToHandle.
- *  3. A DRM framebuffer object is created with drmModeAddFB2.
- *  4. The plane is updated with drmModeSetPlane.
- *  5. The *previous* frame's fb is destroyed (drmModeRmFB) and its GEM
- *     handles are closed; then its @p on_frame_return callback is invoked,
- *     which typically calls RTDecoder::return_display_frame().
- *  6. The new frame + fb info is stored for the next iteration.
- *
- * This scheme requires that DecoderConfig::manual_frame_return is @c true in
- * the companion RTDecoder so that the decoder does not reclaim the buffer
- * before DRMDisplay releases it.
- *
- * ### Supported pixel formats
- * | Allegro FourCC | DRM format     | Description                     |
- * |----------------|----------------|---------------------------------|
- * | NV12           | DRM_FORMAT_NV12| 8-bit YUV 4:2:0 semi-planar     |
- * | XV15           | DRM_FORMAT_XV15| 10-bit YUV 4:2:0 (Xilinx packed)|
- * | NV16           | DRM_FORMAT_NV16| 8-bit YUV 4:2:2 semi-planar     |
- * | XV20           | DRM_FORMAT_XV20| 10-bit YUV 4:2:2 (Xilinx packed)|
- *
- * ### Typical usage
- * @code
- *   DRMDisplayConfig disp_cfg;
- *   disp_cfg.drm_device = "/dev/dri/card0";
- *   DRMDisplay display(disp_cfg);
- *
- *   DecoderConfig dec_cfg;
- *   dec_cfg.manual_frame_return = true;   // required!
- *   dec_cfg.low_delay_mode       = true;
- *
- *   RTDecoder decoder(dec_cfg,
- *       [&display, &decoder](AL_TBuffer* frame, const AL_TInfoDecode& info) {
- *           display.show(frame, info, [&decoder, frame] {
- *               decoder.return_display_frame(frame);
- *           });
- *       });
- * @endcode
+ * Atomic modesetting is used when available; falls back to drmModeSetPlane.
+ * enable_vsync=true waits for the page-flip event (atomic) or drmWaitVBlank
+ * (legacy) before releasing the previous frame.
  *
  * @note Non-copyable, non-movable.
- * @throws std::runtime_error  If DRM device cannot be opened or no suitable
- *                             connector/CRTC/plane is found.
+ * @note The DecodedFrameCallback must call RTDecoder::return_display_frame() when done.
+ * @throws std::runtime_error  On DRM device open or resource enumeration failure.
  */
 class DRMDisplay
 {
   public:
     /**
-     * @brief Callback invoked when the display is finished with a frame.
-     *
-     * Typically wraps RTDecoder::return_display_frame() to return the DMA
-     * buffer back to the decoder's rec pool.
+     * @brief Callback invoked when the display is done with a frame.
+     * Typically wraps RTDecoder::return_display_frame().
      */
-    using FrameReturnCallback = std::function<void()>;
+    using FrameReleaseCallback = std::function<void(AL_TBuffer *)>;
 
-    /**
-     * @brief Construct and initialise the DRM display pipeline.
-     *
-     * Opens the DRM device, enumerates connectors/CRTCs/planes, optionally
-     * sets the display mode, and prepares for zero-copy frame presentation.
-     *
-     * @param cfg  Display configuration.
-     * @throws std::runtime_error  On DRM open / resource enumeration failure.
-     */
-    explicit DRMDisplay(const DRMDisplayConfig &cfg);
+    /** Construct and start the DRM display pipeline.
+     *  @throws std::invalid_argument if release_cb is null.
+     *  @throws std::runtime_error on DRM open/enumeration failure. */
+    explicit DRMDisplay(const DRMDisplayConfig &cfg, FrameReleaseCallback release_cb);
 
-    /**
-     * @brief Release the currently held frame (if any) and close the DRM device.
-     */
+    /** Drain the display thread and release the last held frame via FrameReleaseCallback.
+     *  If not called, the destructor skips the callback. Idempotent. */
     ~DRMDisplay();
 
-    DRMDisplay(const DRMDisplay &)            = delete;
+    DRMDisplay(const DRMDisplay &) = delete;
     DRMDisplay &operator=(const DRMDisplay &) = delete;
-    DRMDisplay(DRMDisplay &&)                 = delete;
-    DRMDisplay &operator=(DRMDisplay &&)      = delete;
+    DRMDisplay(DRMDisplay &&) = delete;
+    DRMDisplay &operator=(DRMDisplay &&) = delete;
 
-    /**
-     * @brief Present a decoded frame on the DRM plane (zero-copy).
-     *
-     * Must be called from a single thread (typically the decoder callback
-     * thread). Blocks briefly to import the DMA-buf and call drmModeSetPlane;
-     * if @c enable_vsync is set it also waits for the page-flip event.
-     *
-     * The @p on_frame_return callback is stored and invoked the *next* time
-     * show() is called (i.e. when the current frame is superseded) or when
-     * release_current() / destructor is called.
-     *
-     * @param frame            Decoded picture buffer.  Must carry
-     *                         AL_TPixMapMetaData.  Must not be null.
-     * @param info             Frame display metadata (dimensions, crop, etc.).
-     * @param on_frame_return  Called when this frame can be returned to the
-     *                         decoder.  Must not be null.
-     * @return @c true on success; @c false if the DRM import or plane update
-     *         failed (the previous frame is still displayed).
-     */
-    bool show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturnCallback on_frame_return);
+    /** Drain the display thread and release the last held frame via FrameReleaseCallback.
+     *  Must be called while the decoder is still alive. Idempotent. */
+    void stop();
 
-    /**
-     * @brief Release the currently displayed frame immediately.
-     *
-     * Calls the frame's on_frame_return callback and tears down the associated
-     * DRM framebuffer.  Safe to call even if no frame is held.
-     */
-    void release_current();
+    /** Submit a decoded frame for display (call from RTDecoder::DecodedFrameCallback). */
+    void show(AL_TBuffer *frame, const AL_TInfoDecode &info);
 
   private:
-    // Internal representation of a frame held by the display.
-    struct HeldFrame
+    // Internal frame representations
+    struct PendingFrame
     {
-        AL_TBuffer       *buf         = nullptr;
-        uint32_t          fb_id       = 0;
-        uint32_t          gem_handles[4] = {};
-        int               num_gem     = 0;
-        FrameReturnCallback on_return;
+        AL_TBuffer *buf = nullptr;
+        uint32_t w = 0;
+        uint32_t h = 0;
     };
 
-    void     init_drm();
-    void     close_drm();
-    void     free_held_frame(HeldFrame &f);
-    bool     do_set_plane(uint32_t fb_id, uint32_t w, uint32_t h);
-    bool     wait_for_flip();
+    struct Frame
+    {
+        AL_TBuffer *buf = nullptr;
+        uint32_t fb_id = 0;
+    };
 
+    /// Cached DRM framebuffer (fb_id + GEM handles) for a decoder buffer.
+    struct CachedFB
+    {
+        uint32_t fb_id = 0;
+        std::array<uint32_t, 4> gem_handles{0, 0, 0, 0};
+        int num_gem = 0;
+    };
+
+    static constexpr size_t MAX_PENDING_FRAMES = 2; ///< Bounded queue depth.
+
+    // DRM plane property IDs for atomic modesetting
+    struct PlaneProps
+    {
+        uint32_t fb_id = 0;
+        uint32_t crtc_id = 0;
+        uint32_t crtc_x = 0;
+        uint32_t crtc_y = 0;
+        uint32_t crtc_w = 0;
+        uint32_t crtc_h = 0;
+        uint32_t src_x = 0;
+        uint32_t src_y = 0;
+        uint32_t src_w = 0;
+        uint32_t src_h = 0;
+    };
+
+    // Private helpers
+    void init_drm();
+    void close_drm();
+    void do_stop(bool call_release);
+    void submit_frame(PendingFrame pf);
+    void display_thread_fn();
+    void free_frame(Frame &f, bool call_release);
+    void wait_flip_event(bool &flip_done);
+    void wait_vblank();
+    bool create_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &out_fb_id);
+
+    // DRM state (written once in init_drm, then read-only)
     DRMDisplayConfig m_cfg;
+    FrameReleaseCallback m_release_cb;
 
-    int      m_drm_fd   {-1};
-    uint32_t m_conn_id  {0};
-    uint32_t m_crtc_id  {0};
-    uint32_t m_plane_id {0};
-    int      m_pipe     {0};         ///< Pipe index (0-based) for vblank requests.
-    bool     m_first_frame {true};   ///< True until first frame is shown (triggers mode-set).
+    int m_drm_fd{-1};
+    uint32_t m_conn_id{0};
+    uint32_t m_crtc_id{0};
+    uint32_t m_plane_id{0};
+    int m_pipe{0};
+    bool m_first_frame{true};
+    bool m_atomic{false};
+    PlaneProps m_plane_props{};
 
-    HeldFrame m_held; ///< Frame currently displayed (held until next frame).
+    // Framebuffer cache: decoder buffer pointer → imported DRM framebuffer
+    std::map<AL_TBuffer *, CachedFB> m_fb_cache;
+    std::mutex m_cache_mutex;
+
+    // Display thread synchronisation
+    Frame m_held; ///< Frame currently on screen (display thread only).
+
+    std::queue<PendingFrame> m_pending_queue;
+    std::mutex m_mutex;
+    std::condition_variable m_cv_display;  ///< Wakes display thread on new frame or stop.
+    std::condition_variable m_cv_producer; ///< Wakes show() when queue has space.
+
+    std::atomic<bool> m_stopped{false};
+    std::thread m_thread;
 };
 
 #endif // DRM_DISPLAY_H
