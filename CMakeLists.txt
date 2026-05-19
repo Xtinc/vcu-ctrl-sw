@@ -71,20 +71,5 @@ add_subdirectory(lib_app)
 add_subdirectory(app)
 
 
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(LIBDRM REQUIRED libdrm)
-endif()
-
-if(LIBDRM_FOUND)
-    add_executable(drm_dmafd_swap_example
-        example/drm_dmafd_swap_example.cpp
-    )
-    target_include_directories(drm_dmafd_swap_example PRIVATE ${LIBDRM_INCLUDE_DIRS})
-    target_link_directories(drm_dmafd_swap_example PRIVATE ${LIBDRM_LIBRARY_DIRS})
-    target_link_libraries(drm_dmafd_swap_example PRIVATE ${LIBDRM_LIBRARIES})
-    target_compile_options(drm_dmafd_swap_example PRIVATE ${LIBDRM_CFLAGS_OTHER})
-else()
-    message(STATUS "libdrm not found, skip drm_dmafd_swap_example target")
-endif()
-
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBDRM REQUIRED libdrm)

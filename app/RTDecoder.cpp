@@ -464,6 +464,19 @@ void RTDecoder::signal_done()
     m_eos_cv.notify_all();
 }
 
+void RTDecoder::signal_error(AL_ERR err)
+{
+    if (AL_IS_ERROR_CODE(err))
+    {
+        VIDEO_ERROR_PRINT("Decoder error: %s", AL_Codec_ErrorToString(err));
+        signal_done(); // Done state covers both clean EOS and fatal error
+    }
+    else if (AL_IS_WARNING_CODE(err))
+    {
+        VIDEO_DEBUG_PRINT("Decoder warning: %s", AL_Codec_ErrorToString(err));
+    }
+}
+
 void RTDecoder::return_display_frame(AL_TBuffer *pFrame)
 {
     if (!pFrame)

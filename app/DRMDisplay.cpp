@@ -23,9 +23,9 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
+#include "libdrm/drm_fourcc.h"
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include <drm_fourcc.h>
 
 #include <cerrno>
 #include <cstring>
@@ -59,12 +59,18 @@ uint32_t allegro_to_drm_fourcc(uint32_t al_fourcc)
     // byte order as DRM fourcc codes.
     switch (al_fourcc)
     {
-    case FOURCC(NV12): return DRM_FORMAT_NV12;
-    case FOURCC(XV15): return DRM_FORMAT_XV15; // 10-bit 4:2:0, Xilinx packed
-    case FOURCC(NV16): return DRM_FORMAT_NV16;
-    case FOURCC(XV20): return DRM_FORMAT_XV20; // 10-bit 4:2:2, Xilinx packed
-    case FOURCC(NV24): return DRM_FORMAT_NV24;
-    default:           return 0;
+    case FOURCC(NV12):
+        return DRM_FORMAT_NV12;
+    case FOURCC(XV15):
+        return DRM_FORMAT_XV15; // 10-bit 4:2:0, Xilinx packed
+    case FOURCC(NV16):
+        return DRM_FORMAT_NV16;
+    case FOURCC(XV20):
+        return DRM_FORMAT_XV20; // 10-bit 4:2:2, Xilinx packed
+    case FOURCC(NV24):
+        return DRM_FORMAT_NV24;
+    default:
+        return 0;
     }
 }
 
@@ -172,8 +178,7 @@ struct FlipPending
     bool done;
 };
 
-static void page_flip_handler(int /*fd*/, unsigned int /*seq*/, unsigned int /*sec*/,
-                               unsigned int /*usec*/, void *data)
+static void page_flip_handler(int /*fd*/, unsigned int /*seq*/, unsigned int /*sec*/, unsigned int /*usec*/, void *data)
 {
     static_cast<FlipPending *>(data)->done = true;
 }
@@ -203,8 +208,7 @@ void DRMDisplay::init_drm()
     m_drm_fd = ::open(m_cfg.drm_device.c_str(), O_RDWR | O_CLOEXEC);
     if (m_drm_fd < 0)
     {
-        throw std::runtime_error("DRMDisplay: cannot open DRM device '" + m_cfg.drm_device +
-                                 "': " + ::strerror(errno));
+        throw std::runtime_error("DRMDisplay: cannot open DRM device '" + m_cfg.drm_device + "': " + ::strerror(errno));
     }
 
     // Require PRIME import support.
@@ -238,8 +242,7 @@ void DRMDisplay::init_drm()
             drmModeFreeResources(res);
             drmClose(m_drm_fd);
             m_drm_fd = -1;
-            throw std::runtime_error("DRMDisplay: connector " + std::to_string(m_cfg.connector_id) +
-                                     " not found");
+            throw std::runtime_error("DRMDisplay: connector " + std::to_string(m_cfg.connector_id) + " not found");
         }
     }
     else
@@ -326,8 +329,8 @@ void DRMDisplay::init_drm()
     m_plane_id = plane->plane_id;
     drmModeFreePlane(plane);
 
-    VIDEO_DEBUG_PRINT("DRMDisplay: fd=%d connector=%u crtc=%u plane=%u pipe=%d",
-                      m_drm_fd, m_conn_id, m_crtc_id, m_plane_id, m_pipe);
+    VIDEO_DEBUG_PRINT("DRMDisplay: fd=%d connector=%u crtc=%u plane=%u pipe=%d", m_drm_fd, m_conn_id, m_crtc_id,
+                      m_plane_id, m_pipe);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +341,11 @@ void DRMDisplay::close_drm()
         ::close(m_drm_fd);
         m_drm_fd = -1;
     }
+}
+
+uint32_t DRMDisplay::allegro_fourcc_to_drm(uint32_t al_fourcc) const
+{
+    return ::allegro_to_drm_fourcc(al_fourcc);
 }
 
 // ---------------------------------------------------------------------------
@@ -376,8 +384,7 @@ void DRMDisplay::release_current()
 // ---------------------------------------------------------------------------
 bool DRMDisplay::do_set_plane(uint32_t fb_id, uint32_t w, uint32_t h)
 {
-    int ret = drmModeSetPlane(m_drm_fd, m_plane_id, m_crtc_id, fb_id, 0,
-                              0, 0, w, h,            // dst: x,y,w,h  (display area)
+    int ret = drmModeSetPlane(m_drm_fd, m_plane_id, m_crtc_id, fb_id, 0, 0, 0, w, h, // dst: x,y,w,h  (display area)
                               0, 0, w << 16, h << 16 // src: x,y,w,h  (fixed-point 16.16)
     );
     if (ret)
@@ -392,8 +399,7 @@ bool DRMDisplay::do_set_plane(uint32_t fb_id, uint32_t w, uint32_t h)
 bool DRMDisplay::wait_for_flip()
 {
     FlipPending pending{false};
-    int ret = drmModePageFlip(m_drm_fd, m_crtc_id, m_held.fb_id,
-                               DRM_MODE_PAGE_FLIP_EVENT, &pending);
+    int ret = drmModePageFlip(m_drm_fd, m_crtc_id, m_held.fb_id, DRM_MODE_PAGE_FLIP_EVENT, &pending);
     if (ret)
     {
         VIDEO_DEBUG_PRINT("DRMDisplay: drmModePageFlip not available (%d), skipping vsync", ret);
@@ -401,7 +407,7 @@ bool DRMDisplay::wait_for_flip()
     }
 
     drmEventContext evctx{};
-    evctx.version           = DRM_EVENT_CONTEXT_VERSION;
+    evctx.version = DRM_EVENT_CONTEXT_VERSION;
     evctx.page_flip_handler = page_flip_handler;
 
     while (!pending.done)
@@ -430,8 +436,7 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
     // -----------------------------------------------------------------------
     // 1. Extract plane layout from the PixMap metadata.
     // -----------------------------------------------------------------------
-    auto *pixmap_meta = reinterpret_cast<AL_TPixMapMetaData *>(
-        AL_Buffer_GetMetaData(frame, AL_META_TYPE_PIXMAP));
+    auto *pixmap_meta = reinterpret_cast<AL_TPixMapMetaData *>(AL_Buffer_GetMetaData(frame, AL_META_TYPE_PIXMAP));
     if (!pixmap_meta)
     {
         VIDEO_ERROR_PRINT("DRMDisplay::show: AL_TBuffer has no AL_TPixMapMetaData");
@@ -453,9 +458,9 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
     // For semi-planar formats the SDK packs Y + UV into a single DMA chunk
     // (chunk index 0 for both), so we only ever need one DMA-buf fd.
     static const AL_EPlaneId kSemiPlanarIds[2] = {AL_PLANE_Y, AL_PLANE_UV};
-    static const AL_EPlaneId kYUVPlanarIds[3]  = {AL_PLANE_Y, AL_PLANE_U, AL_PLANE_V};
-    const AL_EPlaneId        *plane_ids         = kSemiPlanarIds;
-    int                       num_planes        = 2;
+    static const AL_EPlaneId kYUVPlanarIds[3] = {AL_PLANE_Y, AL_PLANE_U, AL_PLANE_V};
+    const AL_EPlaneId *plane_ids = kSemiPlanarIds;
+    int num_planes = 2;
 
     if (AL_GetChromaMode(pixmap_meta->tFourCC) == AL_CHROMA_MONO)
     {
@@ -469,10 +474,10 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
     // hBufs[0] holds the DMA-buf for the entire frame.  For formats where
     // Y and UV share one buffer, both planes reference chunk index 0.
     uint32_t bo_handles[4] = {};
-    uint32_t pitches[4]    = {};
-    uint32_t offsets[4]    = {};
+    uint32_t pitches[4] = {};
+    uint32_t offsets[4] = {};
     uint32_t gem_handles[4] = {};
-    int      num_gem        = 0;
+    int num_gem = 0;
 
     // Track which chunk indices we have already imported (avoid duplicates).
     int imported_chunk[4] = {-1, -1, -1, -1};
@@ -498,11 +503,10 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
         {
             // New chunk: get the DMA-buf fd and import it.
             auto *linux_alloc = reinterpret_cast<AL_TLinuxDmaAllocator *>(frame->pAllocator);
-            int   dma_fd      = AL_LinuxDmaAllocator_GetFd(linux_alloc, frame->hBufs[pl.iChunkIdx]);
+            int dma_fd = AL_LinuxDmaAllocator_GetFd(linux_alloc, frame->hBufs[pl.iChunkIdx]);
             if (dma_fd < 0)
             {
-                VIDEO_ERROR_PRINT("DRMDisplay::show: failed to get DMA-buf fd for chunk %d",
-                                  pl.iChunkIdx);
+                VIDEO_ERROR_PRINT("DRMDisplay::show: failed to get DMA-buf fd for chunk %d", pl.iChunkIdx);
                 // Close any GEM handles opened so far.
                 for (int k = 0; k < num_gem; ++k)
                 {
@@ -526,7 +530,7 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
                 return false;
             }
 
-            gi                   = num_gem;
+            gi = num_gem;
             gem_handles[num_gem] = gem;
             imported_chunk[num_gem] = pl.iChunkIdx;
             ++num_gem;
@@ -562,8 +566,7 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
         if (crtc && crtc->mode_valid && !m_cfg.force_mode_set)
         {
             // Re-use existing mode; just bind the new fb to the CRTC once.
-            int err = drmModeSetCrtc(m_drm_fd, m_crtc_id, fb_id,
-                                      0, 0, &m_conn_id, 1, &crtc->mode);
+            int err = drmModeSetCrtc(m_drm_fd, m_crtc_id, fb_id, 0, 0, &m_conn_id, 1, &crtc->mode);
             if (err)
                 VIDEO_DEBUG_PRINT("DRMDisplay: drmModeSetCrtc: %s (non-fatal)", ::strerror(errno));
         }
@@ -592,11 +595,11 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
     //    Order matters: release AFTER SetPlane so the display never goes dark.
     // -----------------------------------------------------------------------
     HeldFrame new_frame{};
-    new_frame.buf   = frame;
+    new_frame.buf = frame;
     new_frame.fb_id = fb_id;
     for (int k = 0; k < num_gem; ++k)
         new_frame.gem_handles[k] = gem_handles[k];
-    new_frame.num_gem  = num_gem;
+    new_frame.num_gem = num_gem;
     new_frame.on_return = std::move(on_frame_return);
 
     // Release the frame that was displayed until now.
@@ -610,10 +613,4 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
         wait_for_flip();
 
     return true;
-}
-
-// ---------------------------------------------------------------------------
-uint32_t DRMDisplay::allegro_to_drm_fourcc(uint32_t al_fourcc) const
-{
-    return ::allegro_to_drm_fourcc(al_fourcc);
 }
