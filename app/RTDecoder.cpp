@@ -320,27 +320,44 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         m_sei_measurer->on_frame_displayed(pFrame);
     }
 
+    // When manual_frame_return is requested, give the callback an extra reference
+    // so it can hold the buffer beyond this function's scope and call
+    // return_display_frame() itself (e.g. zero-copy DRM display).
+    if (m_cfg.manual_frame_return)
+    {
+        AL_Buffer_Ref(pFrame);
+    }
+
     try
     {
         m_callback(pFrame, *pInfo);
     }
     catch (...)
     {
+        if (m_cfg.manual_frame_return)
+        {
+            AL_Buffer_Unref(pFrame); // roll back the extra ref on exception path
+        }
         signal_error(AL_ERROR);
         return;
     }
 
     update_fps();
 
-    auto s = m_state.load(std::memory_order_relaxed);
-    if (s == State::Running || s == State::Flushing)
+    if (!m_cfg.manual_frame_return)
     {
-        if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
+        // Default: return the buffer to the decoder immediately after the callback.
+        auto s = m_state.load(std::memory_order_relaxed);
+        if (s == State::Running || s == State::Flushing)
         {
-            VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed for main frame");
-            signal_error(AL_ERROR);
+            if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
+            {
+                VIDEO_ERROR_PRINT("RTDecoder: PutDisplayPicture failed for main frame");
+                signal_error(AL_ERROR);
+            }
         }
     }
+    // else: caller will call return_display_frame() when display is done.
 }
 
 void RTDecoder::on_sdk_error(AL_ERR eError)
@@ -447,17 +464,27 @@ void RTDecoder::signal_done()
     m_eos_cv.notify_all();
 }
 
-void RTDecoder::signal_error(AL_ERR err)
+void RTDecoder::return_display_frame(AL_TBuffer *pFrame)
 {
-    if (AL_IS_ERROR_CODE(err))
+    if (!pFrame)
     {
-        VIDEO_ERROR_PRINT("Decoder error: %s", AL_Codec_ErrorToString(err));
-        signal_done(); // Done state covers both clean EOS and fatal error
+        return;
     }
-    else if (AL_IS_WARNING_CODE(err))
+
+    // Return the buffer to the decoder's display picture pool.
+    // Only do this if the decoder is still operational; suppress the call
+    // (and just Unref) once we are in the Stopping state.
+    auto s = m_state.load(std::memory_order_relaxed);
+    if (s == State::Running || s == State::Flushing || s == State::Done)
     {
-        VIDEO_DEBUG_PRINT("Decoder warning: %s", AL_Codec_ErrorToString(err));
+        if (!AL_Decoder_PutDisplayPicture(m_hDec, pFrame))
+        {
+            VIDEO_ERROR_PRINT("RTDecoder::return_display_frame: PutDisplayPicture failed");
+        }
     }
+
+    // Drop the extra reference taken in on_sdk_display when manual_frame_return is on.
+    AL_Buffer_Unref(pFrame);
 }
 
 double RTDecoder::fps() const

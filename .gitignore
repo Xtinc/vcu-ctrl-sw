@@ -4,3 +4,4 @@ cmake-build
 *.json
 .vs
 exe_encoder
+vcu-omx-il
