@@ -11,6 +11,7 @@ struct EncMgrConfig
 {
     EncoderConfig enc;             ///< Encoder parameters (width/height = initial capture resolution)
     std::string v4l2_dev;          ///< V4L2 capture device path, e.g. "/dev/video0"
+    std::string v4l2_subdev;       ///< Optional V4L2 sub-device for source change events (e.g. "/dev/v4l-subdev0")·
     std::string sync_dev;          ///< Xilinx sync device path (empty = disabled)
     int reconnect_delay_ms = 2000; ///< Delay between reconnection attempts in milliseconds
     int max_reconnect_tries = -1;  ///< Max consecutive reconnect attempts (-1 = unlimited)
@@ -96,9 +97,9 @@ class EncMgr
     void stop();
 
     /**
-    * @brief Dynamically update the target (and optionally peak) bitrate.
-    *
-    * Only valid while the pipeline is running.
+     * @brief Dynamically update the target (and optionally peak) bitrate.
+     *
+     * Only valid while the pipeline is running.
      * @param target Target bitrate in bps. Must be > 0.
      * @param max    VBR peak bitrate in bps. 0 = same as target (CBR).
      * @return true on success, false if encoder is not available or SDK rejects the value.
@@ -107,21 +108,21 @@ class EncMgr
 
     /**
      * @brief Dynamically update the encode frame rate.
-    *
-    * Only valid while the pipeline is running.
+     *
+     * Only valid while the pipeline is running.
      * @param fps Frame rate numerator. Must be > 0.
      * @param clk Frame rate denominator. Must be > 0.
      * @return true on success, false if encoder is not available or SDK rejects the value.
      */
     bool set_framerate(uint32_t fps, uint32_t clk = 1000);
 
-      /** @brief Force the encoder to insert an IDR frame at the next opportunity while running. */
+    /** @brief Force the encoder to insert an IDR frame at the next opportunity while running. */
     void request_IDR();
 
     /**
      * @brief Return the latest EMA throughput statistics.
-    *
-    * Returns {0.0, 0.0} while the pipeline is stopped.
+     *
+     * Returns {0.0, 0.0} while the pipeline is stopped.
      * @return {fps, bitrate_bps}. Values are 0.0 until at least 100 frames have been encoded.
      */
     std::pair<double, double> fps() const;

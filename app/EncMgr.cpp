@@ -128,7 +128,8 @@ bool EncMgr::open_source(int width, int height)
     std::shared_ptr<V4L2Source> src;
     try
     {
-        src = std::make_shared<V4L2Source>(m_cfg.v4l2_dev, width, height, m_encoder->src_fourCC(), num_bufs,
+        src = std::make_shared<V4L2Source>(m_cfg.v4l2_dev, m_cfg.v4l2_subdev, width, height, m_encoder->src_fourCC(),
+                                           num_bufs,
                                            /*multiple_planes=*/true, m_cfg.sync_dev);
     }
     catch (const std::exception &e)
