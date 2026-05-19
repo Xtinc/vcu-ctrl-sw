@@ -90,6 +90,7 @@ class V4L2Source
     /**
      * @brief Construct a V4L2Source object, open the device, and configure format.
      * @param dev Device node path, e.g. "/dev/video0"
+     * @param sub_dev Subdevice node path, e.g. "/dev/v4l-subdev0"
      * @param req_width Requested width
      * @param req_height Requested height
      * @param req_fourcc Requested pixel format (FOURCC)
@@ -98,8 +99,8 @@ class V4L2Source
      * @param sync_dev_path Xilinx sync device path. If empty or open fails, Xilinx sync is disabled (default: "")
      * @throw std::exception Throws on initialization failure
      */
-    V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, size_t buf_cnt,
-               bool multiple_planes = true, const std::string &sync_dev_path = "");
+    V4L2Source(const std::string &dev, const std::string &sub_dev, int req_width, int req_height, TFourCC req_fourcc,
+               size_t buf_cnt, bool multiple_planes = true, const std::string &sync_dev_path = "");
     ~V4L2Source();
     V4L2Source(const V4L2Source &) = delete;
     V4L2Source &operator=(const V4L2Source &) = delete;
@@ -176,6 +177,7 @@ class V4L2Source
     DQResult handle_timeout(const char *reason);
 
     int m_fd;
+    int m_sub_fd;
     const size_t m_buffer_cnt;
     const int m_buf_type;
     uint32_t m_plane_size;

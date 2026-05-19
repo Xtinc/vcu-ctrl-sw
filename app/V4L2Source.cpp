@@ -89,29 +89,43 @@ static int ioctl_retry(int fd, unsigned long request, void *arg)
     return ret;
 }
 
-// Returns pfd.revents on success, 0 on timeout, -1 on poll() error.
-static int wait_readable(int fd, int timeout_ms)
+struct PollRevents
 {
-    pollfd pfd{};
-    pfd.fd = fd;
-    pfd.events = POLLIN | POLLPRI;
+    int main_fd; // revents for the V4L2 capture fd (POLLIN / errors)
+    int sub_fd;  // revents for the V4L2 sub-device fd (POLLPRI / events)
+};
+
+// Poll both the capture fd and (optionally) the sub-device fd.
+// Returns {0,0} on timeout, {-1,0} on poll() error.
+static PollRevents wait_readable(int fd, int sub_fd, int timeout_ms)
+{
+    int nfds = 1;
+    pollfd pfds[2]{};
+    pfds[0].fd = fd;
+    pfds[0].events = POLLIN | POLLPRI;
+    if (sub_fd >= 0)
+    {
+        pfds[1].fd = sub_fd;
+        pfds[1].events = POLLPRI;
+        nfds = 2;
+    }
 
     int ret = -1;
     do
     {
-        ret = poll(&pfd, 1, timeout_ms);
+        ret = poll(pfds, nfds, timeout_ms);
     } while (ret < 0 && errno == EINTR);
 
     if (ret == 0)
-        return 0; // timeout
+        return {0, 0}; // timeout
 
     if (ret < 0)
     {
         VIDEO_ERROR_PRINT("poll failed: %s", std::strerror(errno));
-        return -1;
+        return {-1, 0};
     }
 
-    return pfd.revents;
+    return {(int)pfds[0].revents, (nfds > 1) ? (int)pfds[1].revents : 0};
 }
 
 static bool set_xilinx_low_latency_mode(int fd, bool enable)
@@ -165,8 +179,8 @@ static void dump_v4l2_format(const v4l2_format &fmt)
     }
 }
 
-V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TFourCC req_fourcc, size_t buf_cnt,
-                       bool multiple_planes, const std::string &sync_dev_path)
+V4L2Source::V4L2Source(const std::string &dev, const std::string &sub_dev, int req_width, int req_height,
+                       TFourCC req_fourcc, size_t buf_cnt, bool multiple_planes, const std::string &sync_dev_path)
     : m_fd(-1), m_buffer_cnt(buf_cnt),
       m_buf_type(multiple_planes ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE), m_plane_size(0),
       m_state(State::INIT), m_consecutive_timeout_count(0), m_timeout_error_threshold(MAX_TIMEOUT_THRESHOLD),
@@ -188,6 +202,12 @@ V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TF
     if (m_fd < 0)
     {
         throw std::runtime_error("Failed to open V4L2 device: " + dev + " - " + std::strerror(errno));
+    }
+
+    m_sub_fd = ::open(sub_dev.c_str(), O_RDWR | O_NONBLOCK);
+    if (m_sub_fd < 0)
+    {
+        throw std::runtime_error("Failed to open V4L2 subdevice: " + sub_dev + " - " + std::strerror(errno));
     }
 
     // Initialize Xilinx sync IP if sync_dev_path is provided
@@ -261,6 +281,8 @@ V4L2Source::V4L2Source(const std::string &dev, int req_width, int req_height, TF
     }
     catch (...)
     {
+        ::close(m_sub_fd);
+        m_sub_fd = -1;
         ::close(m_fd);
         m_fd = -1;
         throw;
@@ -271,6 +293,8 @@ V4L2Source::~V4L2Source()
 {
     (void)stop();
     m_buffers.clear();
+    ::close(m_sub_fd);
+    m_sub_fd = -1;
     ::close(m_fd);
     m_fd = -1;
     m_state.store(State::CLOSED);
@@ -425,7 +449,8 @@ bool V4L2Source::start()
     {
         v4l2_event_subscription sub{};
         sub.type = V4L2_EVENT_SOURCE_CHANGE;
-        if (ioctl_retry(m_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
+        int sub_target = (m_sub_fd >= 0) ? m_sub_fd : m_fd;
+        if (ioctl_retry(sub_target, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
             VIDEO_INFO_PRINT("VIDIOC_SUBSCRIBE_EVENT not supported, source-change detection disabled: %s",
                              std::strerror(errno));
     }
@@ -538,7 +563,7 @@ DQStatus V4L2Source::handle_pollpri_event(int revents)
 
     bool resolution_changed = false;
     v4l2_event event{};
-    while (ioctl_retry(m_fd, VIDIOC_DQEVENT, &event) == 0)
+    while (ioctl_retry(m_sub_fd, VIDIOC_DQEVENT, &event) == 0)
     {
         if (event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION))
         {
@@ -581,27 +606,27 @@ DQResult V4L2Source::dqueue()
         return {DQStatus::Error, nullptr};
     }
 
-    const int revents = wait_readable(m_fd, V4L2_DQ_TIMEOUT_MS);
+    const PollRevents poll_result = wait_readable(m_fd, m_sub_fd, V4L2_DQ_TIMEOUT_MS);
 
-    if (revents == 0)
+    if (poll_result.main_fd == 0 && poll_result.sub_fd == 0)
     {
         return handle_timeout("timed out");
     }
 
-    if (revents < 0)
+    if (poll_result.main_fd < 0)
     {
         enter_error_state();
         return {DQStatus::Error, nullptr};
     }
 
-    if (revents & (POLLERR | POLLHUP | POLLNVAL))
+    if (poll_result.main_fd & (POLLERR | POLLHUP | POLLNVAL))
     {
-        VIDEO_ERROR_PRINT("poll reported device error: revents=0x%x", revents);
+        VIDEO_ERROR_PRINT("poll reported device error: revents=0x%x", poll_result.main_fd);
         enter_error_state();
         return {DQStatus::Error, nullptr};
     }
 
-    const DQStatus event_status = handle_pollpri_event(revents);
+    const DQStatus event_status = handle_pollpri_event(poll_result.sub_fd);
     if (event_status == DQStatus::SourceChanged || event_status == DQStatus::Timeout)
     {
         return {event_status, nullptr};
