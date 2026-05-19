@@ -189,8 +189,9 @@ DRMDisplay::~DRMDisplay()
     // Clean up cached framebuffers while m_drm_fd is still open.
     {
         std::lock_guard<std::mutex> lk(m_cache_mutex);
-        for (auto &[buf, cached] : m_fb_cache)
+        for (auto it = m_fb_cache.begin(); it != m_fb_cache.end(); ++it)
         {
+            CachedFB &cached = it->second;
             if (cached.fb_id)
                 drmModeRmFB(m_drm_fd, cached.fb_id);
             for (int k = 0; k < cached.num_gem; ++k)
@@ -362,9 +363,10 @@ void DRMDisplay::wait_vblank()
     vbl.request.type = DRM_VBLANK_RELATIVE;
     vbl.request.sequence = 1;
     if (m_pipe == 1)
-        vbl.request.type |= DRM_VBLANK_SECONDARY;
+        vbl.request.type = static_cast<drmVBlankSeqType>(vbl.request.type | DRM_VBLANK_SECONDARY);
     else if (m_pipe > 1)
-        vbl.request.type |= static_cast<uint32_t>(m_pipe) << DRM_VBLANK_HIGH_CRTC_SHIFT;
+        vbl.request.type = static_cast<drmVBlankSeqType>(vbl.request.type |
+                           (static_cast<uint32_t>(m_pipe) << DRM_VBLANK_HIGH_CRTC_SHIFT));
     if (drmWaitVBlank(m_drm_fd, &vbl) != 0)
         VIDEO_DEBUG_PRINT("DRMDisplay: drmWaitVBlank: %s", ::strerror(errno));
 }
