@@ -154,7 +154,6 @@ class DRMDisplay
 
     void     init_drm();
     void     close_drm();
-    uint32_t allegro_fourcc_to_drm(uint32_t al_fourcc) const;
     void     free_held_frame(HeldFrame &f);
     bool     do_set_plane(uint32_t fb_id, uint32_t w, uint32_t h);
     bool     wait_for_flip();

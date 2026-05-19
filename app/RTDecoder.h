@@ -10,7 +10,11 @@ extern "C"
 #include "MemMgr.h"
 #include <atomic>
 #include <chrono>
-#include <unordered_map>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 
 class LatencyMeasurer;
 

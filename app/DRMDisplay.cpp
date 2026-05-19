@@ -216,7 +216,7 @@ void DRMDisplay::init_drm()
     drmGetCap(m_drm_fd, DRM_CAP_PRIME, &prime_caps);
     if (!(prime_caps & DRM_PRIME_CAP_IMPORT))
     {
-        drmClose(m_drm_fd);
+        ::close(m_drm_fd);
         m_drm_fd = -1;
         throw std::runtime_error("DRMDisplay: DRM driver does not support PRIME import");
     }
@@ -227,7 +227,7 @@ void DRMDisplay::init_drm()
     auto *res = drmModeGetResources(m_drm_fd);
     if (!res)
     {
-        drmClose(m_drm_fd);
+        ::close(m_drm_fd);
         m_drm_fd = -1;
         throw std::runtime_error("DRMDisplay: drmModeGetResources failed");
     }
@@ -240,7 +240,7 @@ void DRMDisplay::init_drm()
         if (!conn)
         {
             drmModeFreeResources(res);
-            drmClose(m_drm_fd);
+            ::close(m_drm_fd);
             m_drm_fd = -1;
             throw std::runtime_error("DRMDisplay: connector " + std::to_string(m_cfg.connector_id) + " not found");
         }
@@ -251,7 +251,7 @@ void DRMDisplay::init_drm()
         if (!conn)
         {
             drmModeFreeResources(res);
-            drmClose(m_drm_fd);
+            ::close(m_drm_fd);
             m_drm_fd = -1;
             throw std::runtime_error("DRMDisplay: no connected connector found");
         }
@@ -279,7 +279,7 @@ void DRMDisplay::init_drm()
     {
         drmModeFreeConnector(conn);
         drmModeFreeResources(res);
-        drmClose(m_drm_fd);
+        ::close(m_drm_fd);
         m_drm_fd = -1;
         throw std::runtime_error("DRMDisplay: cannot find CRTC for connector");
     }
@@ -299,7 +299,7 @@ void DRMDisplay::init_drm()
     {
         drmModeFreeConnector(conn);
         drmModeFreeResources(res);
-        drmClose(m_drm_fd);
+        ::close(m_drm_fd);
         m_drm_fd = -1;
         throw std::runtime_error("DRMDisplay: drmModeGetPlaneResources failed");
     }
@@ -322,7 +322,7 @@ void DRMDisplay::init_drm()
 
     if (!plane)
     {
-        drmClose(m_drm_fd);
+        ::close(m_drm_fd);
         m_drm_fd = -1;
         throw std::runtime_error("DRMDisplay: cannot find a suitable plane for the CRTC");
     }
@@ -343,12 +343,6 @@ void DRMDisplay::close_drm()
     }
 }
 
-uint32_t DRMDisplay::allegro_fourcc_to_drm(uint32_t al_fourcc) const
-{
-    return ::allegro_to_drm_fourcc(al_fourcc);
-}
-
-// ---------------------------------------------------------------------------
 void DRMDisplay::free_held_frame(HeldFrame &f)
 {
     if (f.fb_id)
@@ -458,7 +452,6 @@ bool DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info, FrameReturn
     // For semi-planar formats the SDK packs Y + UV into a single DMA chunk
     // (chunk index 0 for both), so we only ever need one DMA-buf fd.
     static const AL_EPlaneId kSemiPlanarIds[2] = {AL_PLANE_Y, AL_PLANE_UV};
-    static const AL_EPlaneId kYUVPlanarIds[3] = {AL_PLANE_Y, AL_PLANE_U, AL_PLANE_V};
     const AL_EPlaneId *plane_ids = kSemiPlanarIds;
     int num_planes = 2;
 

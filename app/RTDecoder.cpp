@@ -287,8 +287,16 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         return;
     }
 
+    if (!pFrame && pInfo)
+    {
+        VIDEO_ERROR_PRINT("RTDecoder: inconsistent display callback (null frame with info)");
+        signal_error(AL_ERROR);
+        return;
+    }
+
     if (pFrame && !pInfo)
     {
+        VIDEO_ERROR_PRINT("RTDecoder: inconsistent display callback (frame without info)");
         return;
     }
 
