@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <string.h> // strerrno, strlen, strcpy
 #include <errno.h>
-#include "lib_rtos/lib_rtos.h" // static_assert
+#include <assert.h> // static_assert
 
 #include "allegro_ioctl_mcu_dec.h"
 #include "lib_common/List.h"

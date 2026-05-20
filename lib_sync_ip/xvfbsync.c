@@ -274,9 +274,9 @@ static void xvfbsync_syncip_parse_chan_status(struct xlnxsync_stat *status, Chan
                           status->err.ldiff, status->err.cdiff);
     }
 
-    VIDEO_DEBUG_PRINT("Application: prod_wdog: %d, prod_sync: %d, cons_wdog: %d, cons_sync: %d, ldiff: %d, cdiff: %d",
-                      channel_status->err.prod_wdg, channel_status->err.prod_sync, channel_status->err.cons_wdg,
-                      channel_status->err.cons_sync, channel_status->err.ldiff, channel_status->err.cdiff);
+    // VIDEO_DEBUG_PRINT("Application: prod_wdog: %d, prod_sync: %d, cons_wdog: %d, cons_sync: %d, ldiff: %d, cdiff: %d",
+    //                   channel_status->err.prod_wdg, channel_status->err.prod_sync, channel_status->err.cons_wdg,
+    //                   channel_status->err.cons_sync, channel_status->err.ldiff, channel_status->err.cdiff);
 
     pthread_mutex_unlock(&(channel_status->mutex));
 }
@@ -434,7 +434,7 @@ int xvfbsync_syncip_chan_populate(SyncIp *syncip, SyncChannel *sync_channel, u32
         return ret;
     }
 
-    VIDEO_DEBUG_PRINT("[fd: %d] mode: %s, max channel number: %d, active channel %d", fd,
+    VIDEO_INFO_PRINT("[fd: %d] mode: %s, max channel number: %d, active channel %d", fd,
                       config.encode ? "encode" : "decode", config.max_channels, config.active_channels);
 
     syncip->max_channels = config.max_channels;
@@ -661,7 +661,7 @@ static struct xlnxsync_chan_config set_enc_framebuffer_config(XLNXLLBuf *buf, u3
                                                   : buf->t_dim.i_width * get_pixel_size(buf->t_fourcc);
     /*FIXME: This assumes producer is configured to 2 samples per clock */
     src_row_size = ROUND_UP_16(src_row_size);
-    VIDEO_DEBUG_PRINT("Row size in bytes : %d", src_row_size);
+    // VIDEO_DEBUG_PRINT("Row size in bytes : %d", src_row_size);
     config.dma_fd = buf->dma_fd;
 
     config.luma_start_offset[XLNXSYNC_PROD] = buf->t_planes[PLANE_Y].i_offset;
@@ -815,7 +815,7 @@ static int xvfbsync_sync_chan_disable(SyncChannel *sync_chan)
 
     sync_chan->quit = true;
     sync_chan->enabled = false;
-    VIDEO_DEBUG_PRINT("Disable channel %d", sync_chan->id);
+    // VIDEO_DEBUG_PRINT("Disable channel %d", sync_chan->id);
 
 err:
     return ret;
@@ -874,7 +874,7 @@ int xvfbsync_dec_sync_chan_enable(DecSyncChannel *dec_sync_chan)
     int ret = 0;
 
     ret = xvfbsync_syncip_enable_channel(dec_sync_chan->sync_channel.sync);
-    VIDEO_DEBUG_PRINT("Decoder: Enable channel %d", dec_sync_chan->sync_channel.id);
+    // VIDEO_DEBUG_PRINT("Decoder: Enable channel %d", dec_sync_chan->sync_channel.id);
 
     dec_sync_chan->sync_channel.enabled = true;
     return ret;
@@ -929,9 +929,7 @@ static int xvfbsync_enc_sync_chan_add_buffer_(EncSyncChannel *enc_sync_chan, XLN
 
             ret = xvfbsync_syncip_add_buffer(enc_sync_chan->sync_channel->sync, &config);
 
-            if (!ret)
-                VIDEO_DEBUG_PRINT("Encoder: Pushed buffer in sync ip");
-            else
+            if (ret)
                 VIDEO_ERROR_PRINT("Encoder: skipping buf and not programming sync ip");
 
             if (buf)
@@ -980,7 +978,7 @@ int xvfbsync_enc_sync_chan_enable(EncSyncChannel *enc_sync_chan)
         return ret;
     }
 
-    VIDEO_DEBUG_PRINT("Encoder: Enable channel %d", enc_sync_chan->sync_channel->id);
+    // VIDEO_DEBUG_PRINT("Encoder: Enable channel %d", enc_sync_chan->sync_channel->id);
     enc_sync_chan->sync_channel->enabled = true;
     ret = xvfbsync_enc_sync_chan_add_buffer_(enc_sync_chan, NULL, num_fb_to_enable);
 
@@ -1051,7 +1049,7 @@ int xvfbsync_syncip_reset_err_status(EncSyncChannel *enc_sync_chan, ChannelErrIn
 
     ret = xvfbsync_syncip_clear_chan_err(enc_sync_chan->sync_channel->sync, &clr);
     if (!ret)
-        VIDEO_DEBUG_PRINT("Encoder: Failed to clear channel error");
+        VIDEO_ERROR_PRINT("Encoder: Failed to clear channel error");
 
     return ret;
 }

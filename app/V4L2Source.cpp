@@ -489,12 +489,11 @@ bool V4L2Source::stop()
         return true;
     }
 
-    // Stop requeue worker first before any state change
+    m_state.store(State::STOPPED);
     stop_requeue_worker();
 
     if (m_fd < 0)
     {
-        m_state.store(State::STOPPED);
         return true;
     }
 
@@ -523,9 +522,7 @@ bool V4L2Source::stop()
         std::lock_guard<std::mutex> lock(m_requeue_mutex);
         m_requeue_pending.clear();
     }
-    
-    // Set STOPPED state only after all cleanup succeeds
-    m_state.store(State::STOPPED);
+
     return true;
 }
 
