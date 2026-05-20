@@ -66,8 +66,7 @@ int main(int argc, char *argv[])
     mgr_cfg.enc = make_default_config();
     mgr_cfg.v4l2_dev = argv[1];
     mgr_cfg.sync_dev = mgr_cfg.enc.low_delay_mode ? "/dev/xlnxsync0" : "";
-    mgr_cfg.reconnect_delay_ms = 2000;
-    mgr_cfg.max_reconnect_tries = -1; // run until interrupted
+    mgr_cfg.source_check_interval_ms = 2000;
 
     try
     {
