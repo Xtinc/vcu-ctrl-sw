@@ -130,6 +130,10 @@ class V4L2Source
      * The API is asynchronous: it only enqueues an index into an internal pending queue.
      * Actual VIDIOC_QBUF is executed by an internal worker thread.
      *
+     * @note Thread safety: This method IS thread-safe. Multiple threads can call
+     *       queue() concurrently. The internal worker thread serializes actual QBUF
+     *       operations.
+     *
      * @param buffer Buffer identity pointer returned by dqueue().
      * @return true if accepted for requeue, false on invalid state/input or lookup failure
      */
@@ -140,7 +144,11 @@ class V4L2Source
      *
      * Blocks up to an internal timeout waiting for a frame or a V4L2 event.
      *
-    * @return DQResult containing dequeue status and buffer pointer.
+     * @note Thread safety: This method is NOT thread-safe. It should be called
+     *       by a single consumer thread only. Concurrent calls from multiple
+     *       threads will result in undefined behavior.
+     *
+     * @return DQResult containing dequeue status and buffer pointer.
      */
     DQResult dqueue();
 

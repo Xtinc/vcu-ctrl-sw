@@ -378,6 +378,10 @@ bool V4L2Source::import_fds(DMAFdArray &&fds)
 
         if (!qbuf_idx(i))
         {
+            VIDEO_ERROR_PRINT("qbuf_idx(%zu) failed during import_fds, releasing V4L2 buffers", i);
+            // Clean up V4L2 resources since some buffers were already queued
+            (void)release_v4l2_buffers(m_fd, m_buf_type);
+            m_buffers.clear();
             enter_error_state();
             return false;
         }
@@ -455,7 +459,6 @@ bool V4L2Source::start()
     }
 
     stop_requeue_worker();
-    m_state.store(State::STREAMING);
     try
     {
         m_requeue_thread = std::thread(&V4L2Source::requeue_worker_loop, this);
@@ -465,6 +468,9 @@ bool V4L2Source::start()
         VIDEO_ERROR_PRINT("Failed to start requeue worker: %s", e.what());
         goto error_cleanup;
     }
+    
+    // Set STREAMING state only after all resources (including worker thread) are ready
+    m_state.store(State::STREAMING);
     m_consecutive_timeout_count = 0;
     return true;
 
@@ -483,7 +489,7 @@ bool V4L2Source::stop()
         return true;
     }
 
-    m_state.store(State::STOPPED);
+    // Stop requeue worker first before any state change
     stop_requeue_worker();
 
     if (m_fd < 0)
@@ -517,6 +523,8 @@ bool V4L2Source::stop()
         std::lock_guard<std::mutex> lock(m_requeue_mutex);
         m_requeue_pending.clear();
     }
+    
+    // Set STOPPED state only after all cleanup succeeds
     m_state.store(State::STOPPED);
     return true;
 }
@@ -742,13 +750,18 @@ bool V4L2Source::qbuf_idx(unsigned int idx)
 
 void V4L2Source::stop_requeue_worker()
 {
+    // Notify worker thread to exit (predicate will fail when state != STREAMING)
     m_requeue_cv.notify_all();
 
+    // Wait for worker thread to complete
+    // IMPORTANT: Must join before acquiring m_requeue_mutex to avoid deadlock
+    // (worker thread may be holding the mutex when checking the exit condition)
     if (m_requeue_thread.joinable())
     {
         m_requeue_thread.join();
     }
 
+    // Clear pending queue after thread has exited
     std::lock_guard<std::mutex> lock(m_requeue_mutex);
     m_requeue_pending.clear();
 }

@@ -46,7 +46,17 @@ bool EncMgr::start()
         return false;
     }
 
-    m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
+    try
+    {
+        m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
+    }
+    catch (const std::exception &e)
+    {
+        VIDEO_ERROR_PRINT("EncMgr: failed to create loop thread: %s", e.what());
+        m_running.store(false);
+        m_encoder.reset();
+        return false;
+    }
     return true;
 }
 
