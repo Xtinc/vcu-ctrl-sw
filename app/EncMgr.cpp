@@ -23,6 +23,8 @@ EncMgr::EncMgr(EncMgrConfig cfg) : m_cfg(std::move(cfg))
 {
     if (m_cfg.v4l2_dev.empty())
         throw std::invalid_argument("EncMgr: v4l2_dev must not be empty");
+    if (m_cfg.v4l2_subdev.empty())
+        throw std::invalid_argument("EncMgr: v4l2_subdev must not be empty (USB cameras not supported)");
 }
 
 EncMgr::~EncMgr()
@@ -56,6 +58,10 @@ bool EncMgr::start()
 void EncMgr::stop()
 {
     m_running.store(false);
+
+    // Wake up WaitingSource state if blocked
+    m_wait_cv.notify_all();
+
     if (m_loop_thread.joinable())
     {
         m_loop_thread.join();
@@ -165,8 +171,12 @@ bool EncMgr::open_source(int width, int height)
     std::weak_ptr<V4L2Source> weak_src = m_source;
     m_encoder->set_release_callback([weak_src](AL_TBuffer const *buf) {
         if (auto src = weak_src.lock())
+        {
             if (!src->queue(buf))
+            {
                 VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
+            }
+        }
     });
 
     return true;
@@ -207,13 +217,33 @@ bool EncMgr::rebuild_encoder(int width, int height)
     }
 }
 
+bool EncMgr::query_source_resolution(int &width, int &height) const
+{
+    // Require sub-device (HDMI/SDI/CSI capture cards). USB cameras not supported.
+    if (m_cfg.v4l2_subdev.empty())
+    {
+        VIDEO_ERROR_PRINT("EncMgr: v4l2_subdev must be configured (USB cameras not supported)");
+        return false;
+    }
+
+    if (V4L2Source::probe_subdev_format(m_cfg.v4l2_subdev, 0, width, height))
+    {
+        VIDEO_INFO_PRINT("EncMgr: source resolution %dx%d", width, height);
+        return true;
+    }
+
+    // Sub-device exists but no active source
+    VIDEO_INFO_PRINT("EncMgr: no active source on %s", m_cfg.v4l2_subdev.c_str());
+    return false;
+}
+
 bool EncMgr::handle_source_change(int &width, int &height)
 {
-    int new_w = 0, new_h = 0;
-    if (!V4L2Source::probe_format(m_cfg.v4l2_dev, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, new_w, new_h) || new_w <= 0 ||
-        new_h <= 0)
+    auto new_w = width;
+    auto new_h = height;
+    if (!query_source_resolution(new_w, new_h))
     {
-        VIDEO_ERROR_PRINT("EncMgr: probe_format failed after source change");
+        VIDEO_ERROR_PRINT("EncMgr: query_source_resolution failed after source change");
         return true; // non-fatal — next open_source will retry
     }
 
@@ -240,40 +270,52 @@ bool EncMgr::handle_source_change(int &width, int &height)
     return true;
 }
 
-bool EncMgr::wait_reconnect(int &retry_count)
+EncMgr::State EncMgr::on_opening(int &width, int &height)
 {
     if (!m_running.load())
-        return false;
-
-    const int max = m_cfg.max_reconnect_tries;
-    if (max >= 0 && ++retry_count > max)
     {
-        VIDEO_ERROR_PRINT("EncMgr: max reconnect attempts (%d) reached, stopping", max);
-        return false;
+        return State::Stopping;
     }
 
-    VIDEO_INFO_PRINT("EncMgr: waiting %d ms before reconnect (attempt %d/%s)", m_cfg.reconnect_delay_ms, retry_count,
-                     max >= 0 ? std::to_string(max).c_str() : "inf");
+    // Query actual source resolution from sub-device
+    auto detected_w = width;
+    auto detected_h = height;
+    if (!query_source_resolution(detected_w, detected_h))
+    {
+        // No source detected - wait for source to appear
+        VIDEO_INFO_PRINT("EncMgr: no source detected, entering WaitingSource state");
+        return State::WaitingSource;
+    }
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(m_cfg.reconnect_delay_ms);
-    while (m_running.load() && std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Adjust encoder if resolution changed
+    if (detected_w != width || detected_h != height)
+    {
+        VIDEO_INFO_PRINT("EncMgr: resolution changed %dx%d -> %dx%d", width, height, detected_w, detected_h);
 
-    return m_running.load();
-}
+        if (!m_encoder->set_resolution(static_cast<uint32_t>(detected_w), static_cast<uint32_t>(detected_h)))
+        {
+            VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", detected_w, detected_h);
+            if (!rebuild_encoder(detected_w, detected_h))
+            {
+                VIDEO_ERROR_PRINT("EncMgr: rebuild_encoder failed");
+                return State::WaitingSource; // Wait for user to fix
+            }
+        }
+        else
+        {
+            m_encoder->request_IDR();
+        }
 
-EncMgr::State EncMgr::on_opening(int width, int height, int &retry_count)
-{
-    if (!m_running.load())
-        return State::Stopping;
+        width = detected_w;
+        height = detected_h;
+    }
 
     if (!open_source(width, height))
     {
-        VIDEO_ERROR_PRINT("EncMgr: open_source failed (attempt %d)", retry_count + 1);
-        return State::Reconnecting;
+        VIDEO_ERROR_PRINT("EncMgr: open_source failed, waiting for source");
+        return State::WaitingSource; // Wait for user to replug
     }
 
-    retry_count = 0;
     return State::Streaming;
 }
 
@@ -312,10 +354,10 @@ done:
         return State::EncoderFault; // fatal SDK error during session
     if (source_changed)
         return State::SourceChanged;
-    return State::Reconnecting; // device error or submit failure; encoder still healthy
+    return State::WaitingSource; // device error or submit failure; wait for recovery
 }
 
-EncMgr::State EncMgr::on_source_changed(int &width, int &height, int &retry_count)
+EncMgr::State EncMgr::on_source_changed(int &width, int &height)
 {
     if (!m_running.load())
         return State::Stopping;
@@ -323,7 +365,6 @@ EncMgr::State EncMgr::on_source_changed(int &width, int &height, int &retry_coun
     if (!handle_source_change(width, height))
         return State::Stopping;
 
-    retry_count = 0;
     return State::Opening; // reconnect immediately, no delay
 }
 
@@ -340,16 +381,38 @@ EncMgr::State EncMgr::on_encoder_fault(int width, int height)
     return State::Opening; // reconnect immediately, no delay
 }
 
-EncMgr::State EncMgr::on_reconnecting(int &retry_count)
+EncMgr::State EncMgr::on_waiting_source()
 {
-    return wait_reconnect(retry_count) ? State::Opening : State::Stopping;
+    if (!m_running.load())
+        return State::Stopping;
+
+    VIDEO_INFO_PRINT("EncMgr: waiting for source on %s", m_cfg.v4l2_subdev.c_str());
+
+    // Wait on condition variable with timeout (check for source periodically)
+    // No retry limit - wait indefinitely until source appears or stop() is called
+    std::unique_lock<std::mutex> lock(m_wait_mutex);
+    m_wait_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.source_check_interval_ms),
+                       [this] { return !m_running.load(); });
+
+    if (!m_running.load())
+        return State::Stopping;
+
+    // Check if source appeared
+    int w = 0, h = 0;
+    if (query_source_resolution(w, h))
+    {
+        VIDEO_INFO_PRINT("EncMgr: source detected, returning to Opening");
+        return State::Opening;
+    }
+
+    // No source yet, continue waiting
+    return State::WaitingSource;
 }
 
 void EncMgr::loop_thread_func()
 {
     int width = static_cast<int>(m_cfg.enc.width);
     int height = static_cast<int>(m_cfg.enc.height);
-    int retry_count = 0;
     State state = State::Opening;
 
     while (state != State::Stopping)
@@ -357,19 +420,19 @@ void EncMgr::loop_thread_func()
         switch (state)
         {
         case State::Opening:
-            state = on_opening(width, height, retry_count);
+            state = on_opening(width, height);
             break;
         case State::Streaming:
             state = on_streaming();
             break;
         case State::SourceChanged:
-            state = on_source_changed(width, height, retry_count);
+            state = on_source_changed(width, height);
             break;
         case State::EncoderFault:
             state = on_encoder_fault(width, height);
             break;
-        case State::Reconnecting:
-            state = on_reconnecting(retry_count);
+        case State::WaitingSource:
+            state = on_waiting_source();
             break;
         case State::Stopping:
             break;

@@ -147,19 +147,18 @@ class V4L2Source
     DQResult dqueue();
 
     /**
-     * @brief Probe the current V4L2 format of a device without altering its state.
+     * @brief Query the active source format from a V4L2 sub-device.
      *
-     * Opens the device read-only, issues VIDIOC_G_FMT, and closes it immediately.
-     * Intended for use before constructing a new V4L2Source instance to detect
-     * whether the source resolution has changed.
+     * This checks if a video source is connected and active, and returns its resolution.
+     * Useful for dynamic sources like HDMI/SDI inputs where the resolution is not fixed.
      *
-     * @param dev       Device node path.
-     * @param buf_type  V4L2 buffer type (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE or _CAPTURE).
-     * @param[out] width  Current capture width, or 0 on failure.
-     * @param[out] height Current capture height, or 0 on failure.
-     * @return true if the format was successfully queried.
+     * @param subdev    Sub-device path (e.g., "/dev/v4l-subdev0").
+     * @param pad       Source pad number (usually 0).
+     * @param[out] width  Source width in pixels, or 0 on failure.
+     * @param[out] height Source height in pixels, or 0 on failure.
+     * @return true if a source is active and format was retrieved, false otherwise.
      */
-    static bool probe_format(const std::string &dev, int buf_type, int &width, int &height);
+    static bool probe_subdev_format(const std::string &subdev, int pad, int &width, int &height);
 
   private:
     static const char *state_to_cstr(State state);

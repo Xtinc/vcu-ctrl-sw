@@ -9,12 +9,11 @@
  */
 struct EncMgrConfig
 {
-    EncoderConfig enc;             ///< Encoder parameters (width/height = initial capture resolution)
-    std::string v4l2_dev;          ///< V4L2 capture device path, e.g. "/dev/video0"
-    std::string v4l2_subdev;       ///< Optional V4L2 sub-device for source change events (e.g. "/dev/v4l-subdev0")·
-    std::string sync_dev;          ///< Xilinx sync device path (empty = disabled)
-    int reconnect_delay_ms = 2000; ///< Delay between reconnection attempts in milliseconds
-    int max_reconnect_tries = -1;  ///< Max consecutive reconnect attempts (-1 = unlimited)
+    EncoderConfig enc;                   ///< Encoder parameters (width/height = initial capture resolution)
+    std::string v4l2_dev;                ///< V4L2 capture device path, e.g. "/dev/video0" (required)
+    std::string v4l2_subdev;             ///< V4L2 sub-device for source detection and events, e.g. "/dev/v4l-subdev0" (required)
+    std::string sync_dev;                ///< Xilinx sync device path (empty = disabled)
+    int source_check_interval_ms = 2000; ///< Interval for checking source presence in WaitingSource state
 };
 
 /**
@@ -24,34 +23,40 @@ struct EncMgrConfig
  * and coordinates their lifecycle via an explicit state machine:
  *
  *   Opening:
- *     open_source ok          -> Streaming
- *     open_source fail        -> Reconnecting
- *     stop()                  -> Stopping
+ *     query_source ok          -> Streaming
+ *     no source detected       -> WaitingSource
+ *     open_source fail         -> WaitingSource (wait for user to fix)
+ *     stop()                   -> Stopping
  *   Streaming:
  *     dqueue/submit loop active
- *     stop() / normal exit    -> Stopping
- *     V4L2 device error       -> Reconnecting
- *     encoder fault           -> EncoderFault
+ *     stop() / normal exit     -> Stopping
+ *     V4L2 device error        -> WaitingSource
+ *     encoder fault            -> EncoderFault
  *     V4L2_EVENT_SOURCE_CHANGE -> SourceChanged
  *   SourceChanged:
- *     set_resolution() ok     -> Opening  (no delay)
- *     set_resolution() fail   -> rebuild_encoder() -> Opening  (no delay)
- *     rebuild_encoder() fail  -> Stopping
- *     stop()                  -> Stopping
+ *     set_resolution() ok      -> Opening  (no delay)
+ *     set_resolution() fail    -> rebuild_encoder() -> Opening  (no delay)
+ *     rebuild_encoder() fail   -> Stopping
+ *     stop()                   -> Stopping
  *   EncoderFault:
- *     rebuild_encoder() ok    -> Opening  (no delay)
- *     rebuild_encoder() fail  -> Stopping
- *     stop()                  -> Stopping
- *   Reconnecting:
- *     wait_reconnect() ok     -> Opening
- *     max retries exceeded    -> Stopping
- *     stop()                  -> Stopping
+ *     rebuild_encoder() ok     -> Opening  (no delay)
+ *     rebuild_encoder() fail   -> Stopping
+ *     stop()                   -> Stopping
+ *   WaitingSource:
+ *     Wait on condition variable indefinitely, periodically check probe_subdev_format()
+ *     source detected          -> Opening  (no delay)
+ *     stop()                   -> Stopping
  *   Stopping:
  *     terminal state; flush encoder EOS, destroy encoder, exit loop thread
  *
- * The encoder is created once in start() and kept alive across reconnect cycles;
+ * The encoder is created once in start() and kept alive across state transitions;
  * only m_source is torn down and rebuilt each time. m_encoder is flushed (EOS) once
  * at final stop, not between sessions, so the encode session remains continuous.
+ *
+ * Requirements:
+ *   - v4l2_subdev must be configured (HDMI/SDI/CSI capture cards with sub-device)
+ *   - USB cameras without sub-devices are NOT supported
+ *   - V4L2_EVENT_SOURCE_CHANGE support for dynamic source detection
  *
  * Threading model:
  *   - start() spawns one loop thread that drives the entire pipeline.
@@ -137,23 +142,23 @@ class EncMgr
         Streaming,     ///< Actively capturing and submitting frames to encoder
         SourceChanged, ///< V4L2_EVENT_SOURCE_CHANGE received; resolve new resolution
         EncoderFault,  ///< Encoder stopped unexpectedly; rebuild before next open
-        Reconnecting,  ///< Waiting reconnect_delay_ms before next open attempt
+        WaitingSource, ///< No source detected; wait on condition variable with periodic check
         Stopping,      ///< Terminal: exit loop thread
     };
 
     // Each handler executes one state and returns the next state.
-    State on_opening(int width, int height, int &retry_count);
+    State on_opening(int &width, int &height);
     State on_streaming();
-    State on_source_changed(int &width, int &height, int &retry_count);
+    State on_source_changed(int &width, int &height);
     State on_encoder_fault(int width, int height);
-    State on_reconnecting(int &retry_count);
+    State on_waiting_source();
 
     // Pipeline primitives used by the state handlers.
     bool open_source(int width, int height);
     void close_source();
     bool rebuild_encoder(int width, int height);
     bool handle_source_change(int &width, int &height);
-    bool wait_reconnect(int &retry_count);
+    bool query_source_resolution(int &width, int &height) const;
 
     void loop_thread_func();
 
@@ -165,6 +170,9 @@ class EncMgr
     std::thread m_loop_thread;
     std::atomic<bool> m_running{false};
     mutable std::mutex m_enc_mutex; ///< Protects m_encoder for external callers
+
+    std::mutex m_wait_mutex;              ///< Protects m_wait_cv for WaitingSource state
+    std::condition_variable m_wait_cv;    ///< Condition variable for waiting on source detection
 };
 
 #endif // ENC_MGR_H

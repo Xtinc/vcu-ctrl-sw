@@ -10,6 +10,7 @@ extern "C"
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <linux/v4l2-subdev.h>
 #include <poll.h>
 #include <stdexcept>
 #include <sys/ioctl.h>
@@ -561,19 +562,22 @@ DQStatus V4L2Source::handle_pollpri_event(int revents)
         return DQStatus::OK;
     }
 
-    bool resolution_changed = false;
+    bool source_changed = false;
     v4l2_event event{};
     while (ioctl_retry(m_sub_fd, VIDIOC_DQEVENT, &event) == 0)
     {
-        if (event.type == V4L2_EVENT_SOURCE_CHANGE && (event.u.src_change.changes & V4L2_EVENT_SRC_CH_RESOLUTION))
+        if (event.type == V4L2_EVENT_SOURCE_CHANGE)
         {
-            resolution_changed = true;
+            // Received source change event - could be resolution change, signal loss, etc.
+            // Don't check changes field (not reliable across all drivers/kernels)
+            // Upper layer (EncMgr) will probe device to determine actual change
+            source_changed = true;
         }
     }
 
-    if (resolution_changed)
+    if (source_changed)
     {
-        VIDEO_INFO_PRINT("V4L2 source resolution change event received");
+        VIDEO_INFO_PRINT("V4L2 source change event received, will probe device status");
         return DQStatus::SourceChanged;
     }
 
@@ -667,39 +671,48 @@ DQResult V4L2Source::dqueue()
     return {DQStatus::OK, m_buffers[buf.index].sync_desc.buffer};
 }
 
-bool V4L2Source::probe_format(const std::string &dev, int buf_type, int &width, int &height)
+bool V4L2Source::probe_subdev_format(const std::string &subdev, int pad, int &width, int &height)
 {
     width = 0;
     height = 0;
 
-    const int fd = ::open(dev.c_str(), O_RDWR | O_NONBLOCK);
-    if (fd < 0)
+    if (subdev.empty())
     {
-        VIDEO_ERROR_PRINT("probe_format: cannot open %s: %s", dev.c_str(), std::strerror(errno));
+        VIDEO_ERROR_PRINT("probe_subdev_format: subdev path is empty");
         return false;
     }
 
-    v4l2_format fmt{};
-    fmt.type = buf_type;
-    const bool ok = (ioctl_retry(fd, VIDIOC_G_FMT, &fmt) == 0);
+    const int fd = ::open(subdev.c_str(), O_RDWR | O_NONBLOCK);
+    if (fd < 0)
+    {
+        VIDEO_ERROR_PRINT("probe_subdev_format: cannot open %s: %s", subdev.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    v4l2_subdev_format sub_fmt{};
+    sub_fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    sub_fmt.pad = pad;
+
+    const bool ok = (ioctl_retry(fd, VIDIOC_SUBDEV_G_FMT, &sub_fmt) == 0);
     ::close(fd);
 
     if (!ok)
     {
-        VIDEO_ERROR_PRINT("probe_format: VIDIOC_G_FMT failed: %s", std::strerror(errno));
+        VIDEO_INFO_PRINT("probe_subdev_format: no active source on %s (pad %d): %s", subdev.c_str(), pad,
+                         std::strerror(errno));
         return false;
     }
 
-    if (V4L2_TYPE_IS_MULTIPLANAR(buf_type))
+    width = static_cast<int>(sub_fmt.format.width);
+    height = static_cast<int>(sub_fmt.format.height);
+
+    if (width <= 0 || height <= 0)
     {
-        width = static_cast<int>(fmt.fmt.pix_mp.width);
-        height = static_cast<int>(fmt.fmt.pix_mp.height);
+        VIDEO_ERROR_PRINT("probe_subdev_format: invalid resolution %dx%d from %s", width, height, subdev.c_str());
+        return false;
     }
-    else
-    {
-        width = static_cast<int>(fmt.fmt.pix.width);
-        height = static_cast<int>(fmt.fmt.pix.height);
-    }
+
+    VIDEO_INFO_PRINT("probe_subdev_format: detected source %dx%d on %s", width, height, subdev.c_str());
     return true;
 }
 
