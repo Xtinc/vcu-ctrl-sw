@@ -1,54 +1,52 @@
 # Source layout: only three groups (common / encoder / decoder)
 set(APP_COMMON_SRC
-    ClockSync.cpp
-    LatencyStats.cpp
     MemMgr.cpp
-    YUVFileIO.cpp
 )
 
-set(APP_ENC_SRC
-    DMAFd.h
-    EncMgr.cpp
-    EncMgr.h
+set(APP_ENC_CORE_SRC
     RTEncoder.cpp
-    RTEncoder.h
-    V4L2Source.cpp
-    V4L2Source.h
     XilinxSyncIP.cpp
-    XilinxSyncIP.h
-    main_enc.cpp
+)
+
+set(APP_ENC_FILE_SRC
+    YUVFileIO.cpp
+    main_enc_file.cpp
+)
+
+set(APP_ENC_V4L2_SRC
+    EncMgr.cpp
+    V4L2Source.cpp
+    main_enc_v4l2.cpp
 )
 
 set(APP_DEC_SRC
     DRMDisplay.cpp
-    DRMDisplay.h
     RTDecoder.cpp
-    RTDecoder.h
     SliceFeeder.cpp
-    SliceFeeder.h
     main_dec.cpp
 )
 
-# Libraries shared by app executables
-set(APP_COMMON_LIBS
-    liballegro_encode_static
-    liballegro_decode_static
-    asio
-)
-
-# --- Encoder app ---
-add_executable(vcu_enc
+# --- Encoder file app ---
+add_executable(vcu_enc_file
     ${APP_COMMON_SRC}
-    ${APP_ENC_SRC}
+    ${APP_ENC_CORE_SRC}
+    ${APP_ENC_FILE_SRC}
 )
-target_link_libraries(vcu_enc PRIVATE ${APP_COMMON_LIBS})
+target_link_libraries(vcu_enc_file PRIVATE liballegro_encode_static)
+
+# --- Encoder v4l2 app ---
+add_executable(vcu_enc_v4l2
+    ${APP_COMMON_SRC}
+    ${APP_ENC_CORE_SRC}
+    ${APP_ENC_V4L2_SRC}
+)
+target_link_libraries(vcu_enc_v4l2 PRIVATE liballegro_encode_static)
 
 # --- Decoder app ---
 add_executable(vcu_dec
     ${APP_COMMON_SRC}
     ${APP_DEC_SRC}
 )
-target_link_libraries(vcu_dec PRIVATE ${APP_COMMON_LIBS})
+target_link_libraries(vcu_dec PRIVATE liballegro_decode_static ${LIBDRM_LIBRARIES})
 target_include_directories(vcu_dec PRIVATE ${LIBDRM_INCLUDE_DIRS})
-target_link_libraries(vcu_dec PRIVATE ${LIBDRM_LIBRARIES})
 

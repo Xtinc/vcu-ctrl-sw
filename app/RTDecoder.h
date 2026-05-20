@@ -16,8 +16,6 @@ extern "C"
 #include <mutex>
 #include <string>
 
-class LatencyMeasurer;
-
 /**
  * @brief Configuration parameters for RTDecoder.
  *
@@ -197,12 +195,10 @@ class RTDecoder
                                        AL_TCropInfo const *pCropInfo, void *pUserParam);
     static void sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam);
     static void sdk_error(AL_ERR eError, void *pUserParam);
-    static void sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam);
     AL_ERR on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                    AL_TCropInfo const *pCropInfo);
     void on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo);
     void on_sdk_error(AL_ERR eError);
-    void on_sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size);
 
     static AL_TDecOutputSettings derive_output_settings(AL_TStreamSettings const &stream_settings);
     void configure_rec_pool(AL_TPicFormat const &pic_format, AL_TDimension const &dim, int pitch_y);
@@ -228,7 +224,6 @@ class RTDecoder
 
     std::unique_ptr<GenericBufPool> m_src_buf_pool;
     std::unique_ptr<PixMapBufPool> m_rec_buf_pool;
-    std::unique_ptr<LatencyMeasurer> m_sei_measurer;
     
     mutable std::mutex m_fps_mutex;
     double m_fps;

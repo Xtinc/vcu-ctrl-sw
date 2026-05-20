@@ -37,7 +37,6 @@ struct EncoderConfig
     std::string enc_dev_path = "/dev/allegroIP";  // Encoder device node (e.g., "/dev/allegroIP")
     std::string dma_dev_path = "/dev/dmaproxy";   // DMAProxy device node (e.g., "/dev/dmaproxy")
     bool low_delay_mode = false;                  // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
-    bool enable_latency_measurement = false;      // Enable end-to-end latency measurement
 };
 
 enum class SourceMode
@@ -45,8 +44,6 @@ enum class SourceMode
     FILE,
     V4L2
 };
-
-class LatencyInjector;
 
 /**
  * @brief RTEncoderBase is a hardware-accelerated video encoder wrapper for the Allegro DVT VCU SDK.
@@ -211,7 +208,6 @@ class RTEncoderBase
 
     std::unique_ptr<PixMapBufPool> m_source_buf_pool;
     std::unique_ptr<GenericBufPool> m_stream_buf_pool;
-    std::unique_ptr<LatencyInjector> m_sei_injector;
 
     AL_TPicFormat m_pic_format;
     TFourCC m_src_fourcc;
