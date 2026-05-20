@@ -10,14 +10,9 @@ namespace
 RTEncoderBase::EncodedFrameCallback make_noop_output_callback()
 {
     return [](const uint8_t *, size_t) {
-        // TODO: forward encoded frames to the future network sender.
     };
 }
 } // namespace
-
-// ---------------------------------------------------------------------------
-// EncMgr — public interface
-// ---------------------------------------------------------------------------
 
 EncMgr::EncMgr(EncMgrConfig cfg) : m_cfg(std::move(cfg))
 {
@@ -58,8 +53,6 @@ bool EncMgr::start()
 void EncMgr::stop()
 {
     m_running.store(false);
-
-    // Wake up WaitingSource state if blocked
     m_wait_cv.notify_all();
 
     if (m_loop_thread.joinable())
@@ -165,9 +158,6 @@ bool EncMgr::open_source(int width, int height)
 
     m_source = std::move(src);
 
-    // Use a weak_ptr in the callback so the lambda never extends the lifetime of
-    // m_source. If close_source() has already reset m_source, lock() returns null
-    // and the requeue is silently skipped — no use-after-free is possible.
     std::weak_ptr<V4L2Source> weak_src = m_source;
     m_encoder->set_release_callback([weak_src](AL_TBuffer const *buf) {
         if (auto src = weak_src.lock())
@@ -187,11 +177,6 @@ void EncMgr::close_source()
     if (!m_source)
         return;
 
-    // Nullify the callback first so that any residual SDK callbacks after this
-    // point are no-ops (the weak_ptr in the old lambda will also expire once
-    // m_source is reset below, providing an additional safety net).
-    // m_encoder is always non-null here: close_source() is only called from
-    // on_streaming(), which requires a live encoder to have been reached.
     m_encoder->set_release_callback(nullptr);
 
     m_source->stop();
@@ -219,7 +204,6 @@ bool EncMgr::rebuild_encoder(int width, int height)
 
 bool EncMgr::query_source_resolution(int &width, int &height) const
 {
-    // Require sub-device (HDMI/SDI/CSI capture cards). USB cameras not supported.
     if (m_cfg.v4l2_subdev.empty())
     {
         VIDEO_ERROR_PRINT("EncMgr: v4l2_subdev must be configured (USB cameras not supported)");
@@ -232,7 +216,6 @@ bool EncMgr::query_source_resolution(int &width, int &height) const
         return true;
     }
 
-    // Sub-device exists but no active source
     VIDEO_INFO_PRINT("EncMgr: no active source on %s", m_cfg.v4l2_subdev.c_str());
     return false;
 }
@@ -282,12 +265,10 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
     auto detected_h = height;
     if (!query_source_resolution(detected_w, detected_h))
     {
-        // No source detected - wait for source to appear
         VIDEO_INFO_PRINT("EncMgr: no source detected, entering WaitingSource state");
         return State::WaitingSource;
     }
 
-    // Adjust encoder if resolution changed
     if (detected_w != width || detected_h != height)
     {
         VIDEO_INFO_PRINT("EncMgr: resolution changed %dx%d -> %dx%d", width, height, detected_w, detected_h);
@@ -298,7 +279,7 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
             if (!rebuild_encoder(detected_w, detected_h))
             {
                 VIDEO_ERROR_PRINT("EncMgr: rebuild_encoder failed");
-                return State::WaitingSource; // Wait for user to fix
+                return State::WaitingSource;
             }
         }
         else
@@ -313,7 +294,7 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
     if (!open_source(width, height))
     {
         VIDEO_ERROR_PRINT("EncMgr: open_source failed, waiting for source");
-        return State::WaitingSource; // Wait for user to replug
+        return State::WaitingSource;
     }
 
     return State::Streaming;
@@ -351,10 +332,10 @@ done:
     if (!m_running.load())
         return State::Stopping;
     if (!m_encoder->is_running())
-        return State::EncoderFault; // fatal SDK error during session
+        return State::EncoderFault;
     if (source_changed)
         return State::SourceChanged;
-    return State::WaitingSource; // device error or submit failure; wait for recovery
+    return State::WaitingSource;
 }
 
 EncMgr::State EncMgr::on_source_changed(int &width, int &height)
@@ -365,7 +346,7 @@ EncMgr::State EncMgr::on_source_changed(int &width, int &height)
     if (!handle_source_change(width, height))
         return State::Stopping;
 
-    return State::Opening; // reconnect immediately, no delay
+    return State::Opening;
 }
 
 EncMgr::State EncMgr::on_encoder_fault(int width, int height)
@@ -378,7 +359,7 @@ EncMgr::State EncMgr::on_encoder_fault(int width, int height)
         return State::Stopping;
 
     VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
-    return State::Opening; // reconnect immediately, no delay
+    return State::Opening;
 }
 
 EncMgr::State EncMgr::on_waiting_source()
@@ -388,8 +369,6 @@ EncMgr::State EncMgr::on_waiting_source()
 
     VIDEO_INFO_PRINT("EncMgr: waiting for source on %s", m_cfg.v4l2_subdev.c_str());
 
-    // Wait on condition variable with timeout (check for source periodically)
-    // No retry limit - wait indefinitely until source appears or stop() is called
     std::unique_lock<std::mutex> lock(m_wait_mutex);
     m_wait_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.source_check_interval_ms),
                        [this] { return !m_running.load(); });
@@ -397,7 +376,6 @@ EncMgr::State EncMgr::on_waiting_source()
     if (!m_running.load())
         return State::Stopping;
 
-    // Check if source appeared
     int w = 0, h = 0;
     if (query_source_resolution(w, h))
     {
@@ -405,7 +383,6 @@ EncMgr::State EncMgr::on_waiting_source()
         return State::Opening;
     }
 
-    // No source yet, continue waiting
     return State::WaitingSource;
 }
 
@@ -441,9 +418,6 @@ void EncMgr::loop_thread_func()
 
     m_running.store(false);
 
-    // Final EOS flush. m_source is already null (close_source was called in on_streaming,
-    // or open_source never succeeded). flush() may block up to 5 s; call outside the
-    // lock so external callers are not stalled.
     if (m_encoder)
     {
         if (!m_encoder->flush())

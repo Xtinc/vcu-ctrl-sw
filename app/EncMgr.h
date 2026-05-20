@@ -9,7 +9,7 @@
  */
 struct EncMgrConfig
 {
-    EncoderConfig enc;                   ///< Encoder parameters (width/height = initial capture resolution)
+  EncoderConfig enc;                   ///< Encoder parameters (width/height are initial fallback values)
     std::string v4l2_dev;                ///< V4L2 capture device path, e.g. "/dev/video0" (required)
     std::string v4l2_subdev;             ///< V4L2 sub-device for source detection and events, e.g. "/dev/v4l-subdev0" (required)
     std::string sync_dev;                ///< Xilinx sync device path (empty = disabled)
@@ -43,7 +43,7 @@ struct EncMgrConfig
  *     rebuild_encoder() fail   -> Stopping
  *     stop()                   -> Stopping
  *   WaitingSource:
- *     Wait on condition variable indefinitely, periodically check probe_subdev_format()
+ *     Wait on condition variable with timeout, periodically check probe_subdev_format()
  *     source detected          -> Opening  (no delay)
  *     stop()                   -> Stopping
  *   Stopping:
@@ -56,7 +56,7 @@ struct EncMgrConfig
  * Requirements:
  *   - v4l2_subdev must be configured (HDMI/SDI/CSI capture cards with sub-device)
  *   - USB cameras without sub-devices are NOT supported
- *   - V4L2_EVENT_SOURCE_CHANGE support for dynamic source detection
+ *   - Driver support for format probing and source-change events
  *
  * Threading model:
  *   - start() spawns one loop thread that drives the entire pipeline.
@@ -74,7 +74,7 @@ class EncMgr
     /**
      * @brief Construct an EncMgr. Does not start encoding; call start().
      * @param cfg       Configuration for encoder and capture device.
-     * @throw std::invalid_argument if cfg.v4l2_dev is empty.
+     * @throw std::invalid_argument if cfg.v4l2_dev or cfg.v4l2_subdev is empty.
      */
     explicit EncMgr(EncMgrConfig cfg);
 

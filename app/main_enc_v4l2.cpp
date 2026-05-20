@@ -28,7 +28,7 @@ bool block_process_signals(sigset_t &signal_set)
 
 void print_usage(const char *app)
 {
-    VIDEO_ERROR_PRINT("Usage: %s <video_device>", app);
+    VIDEO_ERROR_PRINT("Usage: %s <video_device> <v4l2_subdev>", app);
 }
 
 EncoderConfig make_default_config()
@@ -50,7 +50,7 @@ EncoderConfig make_default_config()
 int main(int argc, char *argv[])
 {
     message_init();
-    if (argc != 2)
+    if (argc != 3)
     {
         print_usage(argv[0]);
         return EXIT_FAILURE;
@@ -65,6 +65,7 @@ int main(int argc, char *argv[])
     EncMgrConfig mgr_cfg;
     mgr_cfg.enc = make_default_config();
     mgr_cfg.v4l2_dev = argv[1];
+    mgr_cfg.v4l2_subdev = argv[2];
     mgr_cfg.sync_dev = mgr_cfg.enc.low_delay_mode ? "/dev/xlnxsync0" : "";
     mgr_cfg.source_check_interval_ms = 2000;
 

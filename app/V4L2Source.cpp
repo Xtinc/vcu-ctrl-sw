@@ -92,12 +92,10 @@ static int ioctl_retry(int fd, unsigned long request, void *arg)
 
 struct PollRevents
 {
-    int main_fd; // revents for the V4L2 capture fd (POLLIN / errors)
-    int sub_fd;  // revents for the V4L2 sub-device fd (POLLPRI / events)
+    int main_fd;
+    int sub_fd;
 };
 
-// Poll both the capture fd and (optionally) the sub-device fd.
-// Returns {0,0} on timeout, {-1,0} on poll() error.
 static PollRevents wait_readable(int fd, int sub_fd, int timeout_ms)
 {
     int nfds = 1;
@@ -118,7 +116,7 @@ static PollRevents wait_readable(int fd, int sub_fd, int timeout_ms)
     } while (ret < 0 && errno == EINTR);
 
     if (ret == 0)
-        return {0, 0}; // timeout
+        return {0, 0};
 
     if (ret < 0)
     {
@@ -182,10 +180,9 @@ static void dump_v4l2_format(const v4l2_format &fmt)
 
 V4L2Source::V4L2Source(const std::string &dev, const std::string &sub_dev, int req_width, int req_height,
                        TFourCC req_fourcc, size_t buf_cnt, bool multiple_planes, const std::string &sync_dev_path)
-    : m_fd(-1), m_buffer_cnt(buf_cnt),
+    : m_fd(-1), m_sub_fd(-1), m_buffer_cnt(buf_cnt),
       m_buf_type(multiple_planes ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE), m_plane_size(0),
-      m_state(State::INIT), m_consecutive_timeout_count(0), m_timeout_error_threshold(MAX_TIMEOUT_THRESHOLD),
-      m_buffers_queued(false), m_sync_ip(nullptr)
+      m_state(State::INIT), m_consecutive_timeout_count(0), m_buffers_queued(false), m_sync_ip(nullptr)
 {
     if (req_width <= 0 || req_height <= 0 || buf_cnt == 0)
     {
@@ -208,10 +205,11 @@ V4L2Source::V4L2Source(const std::string &dev, const std::string &sub_dev, int r
     m_sub_fd = ::open(sub_dev.c_str(), O_RDWR | O_NONBLOCK);
     if (m_sub_fd < 0)
     {
+        ::close(m_fd);
+        m_fd = -1;
         throw std::runtime_error("Failed to open V4L2 subdevice: " + sub_dev + " - " + std::strerror(errno));
     }
 
-    // Initialize Xilinx sync IP if sync_dev_path is provided
     if (!sync_dev_path.empty() && set_xilinx_low_latency_mode(m_fd, true))
     {
         m_sync_ip = std::make_unique<XilinxSyncIP>(sync_dev_path);
@@ -581,18 +579,13 @@ DQStatus V4L2Source::handle_pollpri_event(int revents)
         return DQStatus::SourceChanged;
     }
 
-    if (!(revents & POLLIN))
-    {
-        return DQStatus::Timeout;
-    }
-
     return DQStatus::OK;
 }
 
 DQResult V4L2Source::handle_timeout(const char *reason)
 {
     ++m_consecutive_timeout_count;
-    if (m_consecutive_timeout_count >= m_timeout_error_threshold)
+    if (m_consecutive_timeout_count >= MAX_TIMEOUT_THRESHOLD)
     {
         VIDEO_ERROR_PRINT("V4L2 dequeue %s %d times consecutively", reason, m_consecutive_timeout_count);
         enter_error_state();
@@ -631,12 +624,16 @@ DQResult V4L2Source::dqueue()
     }
 
     const DQStatus event_status = handle_pollpri_event(poll_result.sub_fd);
-    if (event_status == DQStatus::SourceChanged || event_status == DQStatus::Timeout)
+    if (event_status == DQStatus::SourceChanged)
     {
         return {event_status, nullptr};
     }
 
-    // POLLIN path: dequeue a frame
+    if (!(poll_result.main_fd & POLLIN))
+    {
+        return handle_timeout("no frame ready");
+    }
+
     v4l2_buffer buf{};
     v4l2_plane plane[1]{};
     buf.type = m_buf_type;
@@ -725,7 +722,6 @@ bool V4L2Source::qbuf_idx(unsigned int idx)
 
     auto &b = m_buffers[idx];
 
-    // Add buffer to Xilinx sync IP if enabled
     if (m_sync_ip)
     {
         if (!m_sync_ip->add_buffer(b.sync_desc))

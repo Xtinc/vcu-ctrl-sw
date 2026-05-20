@@ -27,12 +27,11 @@ struct DQResult
 };
 
 /**
- * @brief V4L2Source encapsulates a V4L2 video capture device using external DMA buffer import (DMABUF).
+ * @brief V4L2Source wraps a V4L2 capture device with DMABUF import.
  *
  * This class manages the V4L2 device lifecycle, buffer import, streaming state machine,
- * and safe multi-threaded requeueing of buffers. It is designed for robust integration
- * with hardware-accelerated video pipelines (e.g., Zynq VCU) where buffer management
- * and state transitions must be strictly controlled.
+ * and asynchronous requeueing by AL_TBuffer identity. The class is intended for
+ * hardware-accelerated zero-copy pipelines (for example Zynq VCU).
  *
  * State Machine (single atomic state):
  *
@@ -56,7 +55,7 @@ struct DQResult
  *     stop              -> STOPPED
  *     destructor        -> CLOSED
  *   ERROR:
- *     Only entered by enter_error_state, will immediately auto stop to STOPPED, no direct transitions allowed
+ *     Entered via enter_error_state(), then drained to STOPPED by stop()
  *   CLOSED:
  *     terminal state
  *
@@ -65,7 +64,6 @@ struct DQResult
  *   - Import of external DMA buffers (no internal allocation)
  *   - Thread-safe asynchronous requeue by AL_TBuffer* identity
  *   - Strict error handling and resource cleanup
- *   - Designed for use with hardware encoders/decoders and zero-copy pipelines
  */
 class V4L2Source
 {
@@ -88,7 +86,7 @@ class V4L2Source
 
   public:
     /**
-     * @brief Construct a V4L2Source object, open the device, and configure format.
+        * @brief Open capture/sub-device nodes and configure capture format.
      * @param dev Device node path, e.g. "/dev/video0"
      * @param sub_dev Subdevice node path, e.g. "/dev/v4l-subdev0"
      * @param req_width Requested width
@@ -97,7 +95,7 @@ class V4L2Source
      * @param buf_cnt Number of buffers
      * @param multiple_planes Use multi-planar format (default: true)
      * @param sync_dev_path Xilinx sync device path. If empty or open fails, Xilinx sync is disabled (default: "")
-     * @throw std::exception Throws on initialization failure
+    * @throw std::exception on initialization failure
      */
     V4L2Source(const std::string &dev, const std::string &sub_dev, int req_width, int req_height, TFourCC req_fourcc,
                size_t buf_cnt, bool multiple_planes = true, const std::string &sync_dev_path = "");
@@ -142,7 +140,7 @@ class V4L2Source
      *
      * Blocks up to an internal timeout waiting for a frame or a V4L2 event.
      *
-     * @return DQStatus describing the outcome.
+    * @return DQResult containing dequeue status and buffer pointer.
      */
     DQResult dqueue();
 
@@ -188,7 +186,6 @@ class V4L2Source
     std::thread m_requeue_thread;
 
     int m_consecutive_timeout_count;
-    int m_timeout_error_threshold;
     std::atomic<bool> m_buffers_queued;
 
     std::vector<v4l2_buffer_info> m_buffers;
