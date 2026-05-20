@@ -9,10 +9,10 @@
  */
 struct EncMgrConfig
 {
-  EncoderConfig enc;                   ///< Encoder parameters (width/height are initial fallback values)
-    std::string v4l2_dev;                ///< V4L2 capture device path, e.g. "/dev/video0" (required)
-    std::string v4l2_subdev;             ///< V4L2 sub-device for source detection and events, e.g. "/dev/v4l-subdev0" (required)
-    std::string sync_dev;                ///< Xilinx sync device path (empty = disabled)
+    EncoderConfig enc;       ///< Encoder parameters (width/height are initial fallback values)
+    std::string v4l2_dev;    ///< V4L2 capture device path, e.g. "/dev/video0" (required)
+    std::string v4l2_subdev; ///< V4L2 sub-device for source detection and events, e.g. "/dev/v4l-subdev0" (required)
+    std::string sync_dev;    ///< Xilinx sync device path (empty = disabled)
     int source_check_interval_ms = 2000; ///< Interval for checking source presence in WaitingSource state
 };
 
@@ -70,6 +70,16 @@ struct EncMgrConfig
  */
 class EncMgr
 {
+    enum class State
+    {
+        Opening,       ///< Trying to open V4L2Source
+        Streaming,     ///< Actively capturing and submitting frames to encoder
+        SourceChanged, ///< V4L2_EVENT_SOURCE_CHANGE received; resolve new resolution
+        EncoderFault,  ///< Encoder stopped unexpectedly; rebuild before next open
+        WaitingSource, ///< No source detected; wait on condition variable with periodic check
+        Stopping,      ///< Terminal: exit loop thread
+    };
+
   public:
     /**
      * @brief Construct an EncMgr. Does not start encoding; call start().
@@ -133,46 +143,34 @@ class EncMgr
     std::pair<double, double> fps() const;
 
   private:
-    // ---------------------------------------------------------------------------
-    // Pipeline state machine
-    // ---------------------------------------------------------------------------
-    enum class State
-    {
-        Opening,       ///< Trying to open V4L2Source
-        Streaming,     ///< Actively capturing and submitting frames to encoder
-        SourceChanged, ///< V4L2_EVENT_SOURCE_CHANGE received; resolve new resolution
-        EncoderFault,  ///< Encoder stopped unexpectedly; rebuild before next open
-        WaitingSource, ///< No source detected; wait on condition variable with periodic check
-        Stopping,      ///< Terminal: exit loop thread
-    };
-
-    // Each handler executes one state and returns the next state.
     State on_opening(int &width, int &height);
     State on_streaming();
     State on_source_changed(int &width, int &height);
     State on_encoder_fault(int width, int height);
     State on_waiting_source();
+    static const char *state_to_cstr(State s);
 
-    // Pipeline primitives used by the state handlers.
     bool open_source(int width, int height);
     void close_source();
     bool rebuild_encoder(int width, int height);
+    bool ensure_encoder_at(int width, int height);
     bool handle_source_change(int &width, int &height);
     bool query_source_resolution(int &width, int &height) const;
 
     void loop_thread_func();
 
+  private:
     EncMgrConfig m_cfg;
 
-    std::unique_ptr<RTEncoderV4L2> m_encoder; ///< Created in start(), destroyed on loop exit
-    std::shared_ptr<V4L2Source> m_source;     ///< Opened/closed each capture session
+    std::unique_ptr<RTEncoderV4L2> m_encoder;
+    std::shared_ptr<V4L2Source> m_source;
 
     std::thread m_loop_thread;
     std::atomic<bool> m_running{false};
-    mutable std::mutex m_enc_mutex; ///< Protects m_encoder for external callers
+    mutable std::mutex m_enc_mutex;
 
-    std::mutex m_wait_mutex;              ///< Protects m_wait_cv for WaitingSource state
-    std::condition_variable m_wait_cv;    ///< Condition variable for waiting on source detection
+    std::mutex m_wait_mutex;
+    std::condition_variable m_wait_cv;
 };
 
 #endif // ENC_MGR_H

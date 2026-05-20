@@ -5,14 +5,30 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
-namespace
+static RTEncoderBase::EncodedFrameCallback make_noop_output_callback()
 {
-RTEncoderBase::EncodedFrameCallback make_noop_output_callback()
-{
-    return [](const uint8_t *, size_t) {
-    };
+    return [](const uint8_t *, size_t) {};
 }
-} // namespace
+
+const char *EncMgr::state_to_cstr(State s)
+{
+    switch (s)
+    {
+    case State::Opening:
+        return "Opening";
+    case State::Streaming:
+        return "Streaming";
+    case State::SourceChanged:
+        return "SourceChanged";
+    case State::EncoderFault:
+        return "EncoderFault";
+    case State::WaitingSource:
+        return "WaitingSource";
+    case State::Stopping:
+        return "Stopping";
+    }
+    return "Unknown";
+}
 
 EncMgr::EncMgr(EncMgrConfig cfg) : m_cfg(std::move(cfg))
 {
@@ -212,6 +228,17 @@ bool EncMgr::rebuild_encoder(int width, int height)
     }
 }
 
+bool EncMgr::ensure_encoder_at(int width, int height)
+{
+    if (m_encoder->set_resolution(static_cast<uint32_t>(width), static_cast<uint32_t>(height)))
+    {
+        m_encoder->request_IDR();
+        return true;
+    }
+    VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", width, height);
+    return rebuild_encoder(width, height);
+}
+
 bool EncMgr::query_source_resolution(int &width, int &height) const
 {
     if (m_cfg.v4l2_subdev.empty())
@@ -245,18 +272,8 @@ bool EncMgr::handle_source_change(int &width, int &height)
 
     VIDEO_INFO_PRINT("EncMgr: resolution change %dx%d -> %dx%d", width, height, new_w, new_h);
 
-    if (m_encoder->set_resolution(static_cast<uint32_t>(new_w), static_cast<uint32_t>(new_h)))
-    {
-        m_encoder->request_IDR();
-    }
-    else
-    {
-        VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", new_w, new_h);
-        if (!rebuild_encoder(new_w, new_h))
-        {
-            return false;
-        }
-    }
+    if (!ensure_encoder_at(new_w, new_h))
+        return false;
 
     width = new_w;
     height = new_h;
@@ -282,21 +299,11 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
     if (detected_w != width || detected_h != height)
     {
         VIDEO_INFO_PRINT("EncMgr: resolution changed %dx%d -> %dx%d", width, height, detected_w, detected_h);
-
-        if (!m_encoder->set_resolution(static_cast<uint32_t>(detected_w), static_cast<uint32_t>(detected_h)))
+        if (!ensure_encoder_at(detected_w, detected_h))
         {
-            VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", detected_w, detected_h);
-            if (!rebuild_encoder(detected_w, detected_h))
-            {
-                VIDEO_ERROR_PRINT("EncMgr: rebuild_encoder failed");
-                return State::WaitingSource;
-            }
+            VIDEO_ERROR_PRINT("EncMgr: ensure_encoder_at(%dx%d) failed, stopping", detected_w, detected_h);
+            return State::Stopping;
         }
-        else
-        {
-            m_encoder->request_IDR();
-        }
-
         width = detected_w;
         height = detected_h;
     }
@@ -382,6 +389,7 @@ EncMgr::State EncMgr::on_waiting_source()
     std::unique_lock<std::mutex> lock(m_wait_mutex);
     m_wait_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.source_check_interval_ms),
                        [this] { return !m_running.load(); });
+    lock.unlock();
 
     if (!m_running.load())
         return State::Stopping;
@@ -402,36 +410,46 @@ void EncMgr::loop_thread_func()
     int height = static_cast<int>(m_cfg.enc.height);
     State state = State::Opening;
 
+    VIDEO_INFO_PRINT("EncMgr: loop thread started, initial state=%s", state_to_cstr(state));
+
     while (state != State::Stopping)
     {
+        State next;
         switch (state)
         {
         case State::Opening:
-            state = on_opening(width, height);
+            next = on_opening(width, height);
             break;
         case State::Streaming:
-            state = on_streaming();
+            next = on_streaming();
             break;
         case State::SourceChanged:
-            state = on_source_changed(width, height);
+            next = on_source_changed(width, height);
             break;
         case State::EncoderFault:
-            state = on_encoder_fault(width, height);
+            next = on_encoder_fault(width, height);
             break;
         case State::WaitingSource:
-            state = on_waiting_source();
+            next = on_waiting_source();
             break;
         case State::Stopping:
+            next = State::Stopping;
             break;
         }
+
+        if (next != state)
+        {
+            VIDEO_INFO_PRINT("EncMgr: %s -> %s", state_to_cstr(state), state_to_cstr(next));
+        }
+
+        state = next;
     }
 
     m_running.store(false);
 
-    if (m_encoder)
+    if (m_encoder && !m_encoder->flush())
     {
-        if (!m_encoder->flush())
-            VIDEO_ERROR_PRINT("EncMgr: encoder flush timed out; output may be incomplete");
+        VIDEO_ERROR_PRINT("EncMgr: encoder flush timed out; output may be incomplete");
     }
 
     {

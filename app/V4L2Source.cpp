@@ -714,7 +714,6 @@ bool V4L2Source::probe_subdev_format(const std::string &subdev, int pad, int &wi
         return false;
     }
 
-    VIDEO_INFO_PRINT("probe_subdev_format: detected source %dx%d on %s", width, height, subdev.c_str());
     return true;
 }
 
