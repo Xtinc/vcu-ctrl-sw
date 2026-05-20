@@ -1,12 +1,10 @@
 #include "RTDecoder.h"
-#include "LatencyStats.h"
 
 extern "C"
 {
 #include "lib_common/BufCommon.h"
 #include "lib_common/BufferAPI.h"
 #include "lib_common/BufferPictureDecMeta.h"
-#include "lib_common/BufferSeiMeta.h"
 #include "lib_common/DisplayInfoMeta.h"
 #include "lib_common/FourCC.h"
 #include "lib_common/PicFormat.h"
@@ -85,7 +83,7 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
         m_cbbundles.resolutionFoundCB = {&RTDecoder::sdk_resolution_found, this};
         m_cbbundles.errorCB = {&RTDecoder::sdk_error, this};
         m_cbbundles.endParsingCB = {nullptr, nullptr};
-        m_cbbundles.parsedSeiCB = {&RTDecoder::sdk_parsed_sei, this};
+        m_cbbundles.parsedSeiCB = {nullptr, nullptr};
 
         err = AL_Decoder_Create(&m_hDec, m_pScheduler, m_pAllocator, &m_dec_settings, &m_cbbundles);
         if (AL_IS_ERROR_CODE(err) || !m_hDec)
@@ -100,7 +98,6 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
             throw std::runtime_error("Failed to initialize stream buffer pool");
         }
 
-        m_sei_measurer = std::make_unique<LatencyMeasurer>();
     }
     catch (...)
     {
@@ -213,11 +210,6 @@ void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
     static_cast<RTDecoder *>(pUserParam)->on_sdk_error(eError);
 }
 
-void RTDecoder::sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size, void *pUserParam)
-{
-    static_cast<RTDecoder *>(pUserParam)->on_sdk_parsed_sei(is_prefix, payload_type, payload, payload_size);
-}
-
 AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                           AL_TCropInfo const *pCropInfo)
 {
@@ -323,11 +315,6 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         return;
     }
 
-    if (m_sei_measurer)
-    {
-        m_sei_measurer->on_frame_displayed(pFrame);
-    }
-
     // Give the callback an extra reference so it can hold the buffer beyond
     // this function's scope. The caller MUST call return_display_frame() when
     // done with the frame to return it to the decoder's display picture pool.
@@ -350,16 +337,6 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 void RTDecoder::on_sdk_error(AL_ERR eError)
 {
     signal_error(eError);
-}
-
-void RTDecoder::on_sdk_parsed_sei(bool is_prefix, int payload_type, uint8_t *payload, int payload_size)
-{
-    if (!m_sei_measurer)
-    {
-        return;
-    }
-
-    m_sei_measurer->on_parsed_sei(is_prefix, payload_type, payload, payload_size);
 }
 
 AL_TDecOutputSettings RTDecoder::derive_output_settings(AL_TStreamSettings const &stream_settings)

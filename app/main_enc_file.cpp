@@ -1,6 +1,4 @@
-#include "EncMgr.h"
 #include "RTEncoder.h"
-#include "V4L2Source.h"
 #include "YUVFileIO.h"
 
 extern "C"
@@ -30,10 +28,7 @@ struct FileEncodeCmd
 
 void print_usage(const char *app)
 {
-    VIDEO_ERROR_PRINT("Usage: %s <mode> <cmd.txt|v4l2_dev> <output.265>", app);
-    VIDEO_ERROR_PRINT("  mode: file | v4l2");
-    VIDEO_ERROR_PRINT("  file: %s file <cmd.txt> <output.265>", app);
-    VIDEO_ERROR_PRINT("  v4l2: %s v4l2 <video_device> <output.265>  (reserved)", app);
+    VIDEO_ERROR_PRINT("Usage: %s <cmd.txt> <output.265>", app);
 }
 
 EncoderConfig make_default_config()
@@ -162,8 +157,23 @@ bool parse_file_cmds(const std::string &cmd_file_path, std::vector<FileEncodeCmd
 }
 } // namespace
 
-int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, EncoderConfig &cfg)
+int main(int argc, char *argv[])
 {
+    message_init();
+    if (argc != 3)
+    {
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const std::string cmdFilePath = argv[1];
+    std::ofstream outFile(argv[2], std::ios::binary);
+    if (!outFile)
+    {
+        VIDEO_ERROR_PRINT("Cannot open output file: %s", argv[2]);
+        return EXIT_FAILURE;
+    }
+
     std::vector<FileEncodeCmd> cmds;
     TFourCC fourcc = FOURCC(NV12);
     if (!parse_file_cmds(cmdFilePath, cmds, fourcc))
@@ -171,15 +181,16 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
         return EXIT_FAILURE;
     }
 
+    EncoderConfig cfg = make_default_config();
     unsigned int totalEncodedUnits = 0;
-    std::unique_ptr<RTEncoderFile> encoder;
+
     try
     {
         cfg.width = cmds.front().width;
         cfg.height = cmds.front().height;
         cfg.chroma_mode = (fourcc == FOURCC(NV12)) ? AL_CHROMA_4_2_0 : AL_CHROMA_4_2_2;
 
-        encoder = std::make_unique<RTEncoderFile>(cfg, [&](const uint8_t *pData, size_t size) {
+        auto encoder = std::make_unique<RTEncoderFile>(cfg, [&](const uint8_t *pData, size_t size) {
             VIDEO_INFO_PRINT("[%6u] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
@@ -253,78 +264,4 @@ int encode_file_mode(const std::string &cmdFilePath, std::ofstream &outFile, Enc
         VIDEO_ERROR_PRINT("Encoder error: %s", e.what());
         return EXIT_FAILURE;
     }
-}
-
-int encode_v4l2_mode(const std::string &v4l2_dev, EncoderConfig &cfg)
-{
-    EncMgrConfig mgr_cfg;
-    mgr_cfg.enc = cfg;
-    mgr_cfg.v4l2_dev = v4l2_dev;
-    mgr_cfg.sync_dev = cfg.low_delay_mode ? "/dev/xlnxsync0" : "";
-    mgr_cfg.reconnect_delay_ms = 2000;
-    mgr_cfg.max_reconnect_tries = -1; // run until interrupted
-
-    try
-    {
-        EncMgr mgr(mgr_cfg);
-
-        if (!mgr.start())
-        {
-            VIDEO_ERROR_PRINT("EncMgr start failed");
-            return EXIT_FAILURE;
-        }
-
-        // Block until user interrupts (Ctrl-C / SIGTERM handled externally) or
-        // the manager stops on its own after exhausting reconnect attempts.
-        // For demonstration purposes we join by waiting on stop() which will
-        // block until the loop thread exits naturally.
-        mgr.stop();
-    VIDEO_INFO_PRINT("V4L2 encoding done");
-        return EXIT_SUCCESS;
-    }
-    catch (const std::exception &e)
-    {
-        VIDEO_ERROR_PRINT("V4L2 Encoder error: %s", e.what());
-        return EXIT_FAILURE;
-    }
-}
-
-int main(int argc, char *argv[])
-{
-    message_init();
-    if (argc < 4)
-    {
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    const std::string mode = argv[1];
-    if (mode != "file" && mode != "v4l2")
-    {
-        VIDEO_ERROR_PRINT("Invalid mode: %s (expected: file or v4l2)", mode.c_str());
-        print_usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    EncoderConfig cfg = make_default_config();
-
-    if (mode == "file")
-    {
-        std::ofstream outFile(argv[3], std::ios::binary);
-        if (!outFile)
-        {
-            VIDEO_ERROR_PRINT("Cannot open output file: %s", argv[3]);
-            return EXIT_FAILURE;
-        }
-
-        return encode_file_mode(argv[2], outFile, cfg);
-    }
-    else if (mode == "v4l2")
-    {
-        cfg.width = 3840;
-        cfg.height = 2160;
-        return encode_v4l2_mode(argv[2], cfg);
-    }
-
-    return EXIT_FAILURE;
 }

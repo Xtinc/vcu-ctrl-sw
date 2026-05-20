@@ -1,6 +1,4 @@
 #include "RTEncoder.h"
-#include "ClockSync.h"
-#include "LatencyStats.h"
 
 extern "C"
 {
@@ -214,10 +212,6 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         push_stream_buffers();
         set_resolution(m_cfg.width, m_cfg.height);
 
-        if (m_cfg.enable_latency_measurement)
-        {
-            m_sei_injector = std::make_unique<LatencyInjector>();
-        }
     }
     catch (...)
     {
@@ -512,20 +506,6 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
     if (pMeta)
     {
         get_section_flag(pMeta, 0, eof, idr);
-        if (m_sei_injector)
-        {
-            if (idr)
-            {
-                if (!m_sei_injector->on_frame_encoded(m_hEnc, pStream, const_cast<AL_TBuffer *>(pSrc)))
-                {
-                    return;
-                }
-            }
-            else
-            {
-                m_sei_injector->on_frame_skipped(const_cast<AL_TBuffer *>(pSrc));
-            }
-        }
 
         const auto *pBase = AL_Buffer_GetData(pStream);
         const auto uSize = reconstruct_stream(m_dma_proxy, pStream, 0);
@@ -788,11 +768,6 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
         return false;
     }
 
-    if (m_sei_injector)
-    {
-        m_sei_injector->on_frame_submitted(pBuf);
-    }
-
     return true;
 }
 
@@ -957,11 +932,6 @@ bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
                           AL_Codec_ErrorToString(AL_Encoder_GetLastError(m_hEnc)));
         signal_done();
         return false;
-    }
-
-    if (m_sei_injector)
-    {
-        m_sei_injector->on_frame_submitted(pBuf);
     }
 
     return true;
