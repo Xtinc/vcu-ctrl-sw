@@ -112,7 +112,7 @@ class DRMDisplayBase
     void event_thread_fn();
     static void on_page_flip_cb(int fd, unsigned seq, unsigned tv_sec,
                                 unsigned tv_usec, void *user_data);
-    void on_flip_done();
+    void on_flip_done(unsigned tv_sec, unsigned tv_usec);
 
     DRMDisplayConfig     m_cfg;
     FrameReleaseCallback m_release_cb;
@@ -130,18 +130,20 @@ class DRMDisplayBase
     ConnProps  m_conn_props   {};
 
     Slot                    m_slots[2];
-    std::mutex              m_mutex;
+    bool                    m_in_flight {false}; ///< True while an atomic commit is outstanding.
+    std::mutex              m_mutex;             ///< Guards m_slots and m_in_flight.
     std::condition_variable m_cv;
 
-    bool m_in_flight {false};
-
+    // ── Vblank timing (event thread only — no lock needed) ────────────────
     using SteadyClock = std::chrono::steady_clock;
     using TimePoint   = SteadyClock::time_point;
     using Nanos       = std::chrono::nanoseconds;
 
     TimePoint m_last_flip_tp {};
-    Nanos     m_frame_ns     {16'666'666LL};
+    Nanos     m_frame_ns     {16'666'666LL}; ///< EMA of vblank interval; default = 60 fps.
+    int       m_in_flight_retries {0};      ///< Consecutive poll timeouts while in-flight (watchdog counter).
 
+    // ── Thread management ─────────────────────────────────────────────────
     std::atomic<bool> m_stopped {false};
     std::thread       m_event_thread;
     ClockEntry        m_submit_timer;

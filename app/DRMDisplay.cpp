@@ -36,12 +36,18 @@ static uint32_t allegro_to_drm_fourcc(uint32_t al_fourcc)
 {
     switch (al_fourcc)
     {
-    case FOURCC(NV12): return DRM_FORMAT_NV12;
-    case FOURCC(XV15): return DRM_FORMAT_XV15;
-    case FOURCC(NV16): return DRM_FORMAT_NV16;
-    case FOURCC(XV20): return DRM_FORMAT_XV20;
-    case FOURCC(NV24): return DRM_FORMAT_NV24;
-    default:           return 0;
+    case FOURCC(NV12):
+        return DRM_FORMAT_NV12;
+    case FOURCC(XV15):
+        return DRM_FORMAT_XV15;
+    case FOURCC(NV16):
+        return DRM_FORMAT_NV16;
+    case FOURCC(XV20):
+        return DRM_FORMAT_XV20;
+    case FOURCC(NV24):
+        return DRM_FORMAT_NV24;
+    default:
+        return 0;
     }
 }
 
@@ -57,15 +63,14 @@ static drmModeConnector *find_first_connected_connector(int fd, drmModeRes *res)
     return nullptr;
 }
 
-static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res,
-                                             drmModeConnector *conn, int *pipe)
+static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res, drmModeConnector *conn, int *pipe)
 {
     for (int e = 0; e < conn->count_encoders; ++e)
     {
         auto *enc = drmModeGetEncoder(fd, conn->encoders[e]);
         if (!enc)
             continue;
-        uint32_t crtc_id  = enc->crtc_id;
+        uint32_t crtc_id = enc->crtc_id;
         uint32_t possible = enc->possible_crtcs;
         drmModeFreeEncoder(enc);
 
@@ -75,7 +80,8 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res,
             {
                 if (res->crtcs[c] == crtc_id)
                 {
-                    if (pipe) *pipe = c;
+                    if (pipe)
+                        *pipe = c;
                     return drmModeGetCrtc(fd, crtc_id);
                 }
             }
@@ -85,7 +91,8 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res,
             int idx = __builtin_ctz(possible);
             if (idx < res->count_crtcs)
             {
-                if (pipe) *pipe = idx;
+                if (pipe)
+                    *pipe = idx;
                 return drmModeGetCrtc(fd, res->crtcs[idx]);
             }
         }
@@ -93,8 +100,7 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res,
     return nullptr;
 }
 
-static drmModePlane *find_plane_for_crtc(int fd, drmModePlaneRes *pres,
-                                          int pipe, int prefer_type)
+static drmModePlane *find_plane_for_crtc(int fd, drmModePlaneRes *pres, int pipe, int prefer_type)
 {
     drmModePlane *fallback = nullptr;
     for (uint32_t i = 0; i < pres->count_planes; ++i)
@@ -173,9 +179,7 @@ DRMDisplayBase::~DRMDisplayBase()
 // ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────
 
 DRMDisplay::DRMDisplay(const DRMDisplayConfig &cfg, TypedReleaseCallback release_cb)
-    : DRMDisplayBase(cfg, [release_cb](void *key) {
-          release_cb(static_cast<AL_TBuffer *>(key));
-      })
+    : DRMDisplayBase(cfg, [release_cb](void *key) { release_cb(static_cast<AL_TBuffer *>(key)); })
 {
 }
 
@@ -273,10 +277,10 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
             return;
         }
 
-        target->buf   = key;
+        target->buf = key;
         target->fb_id = fb_id;
-        target->w     = w;
-        target->h     = h;
+        target->w = w;
+        target->h = h;
         target->state = SlotState::PENDING;
     }
 
@@ -288,7 +292,7 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
 void DRMDisplayBase::event_thread_fn()
 {
     drmEventContext evctx{};
-    evctx.version          = DRM_EVENT_CONTEXT_VERSION;
+    evctx.version = DRM_EVENT_CONTEXT_VERSION;
     evctx.page_flip_handler = on_page_flip_cb;
 
     while (true)
@@ -297,21 +301,40 @@ void DRMDisplayBase::event_thread_fn()
         {
             std::unique_lock<std::mutex> lk(m_mutex);
             m_cv.wait(lk, [this] {
-                return m_stopped.load(std::memory_order_acquire)
-                    || m_in_flight
-                    || slot_by_state_locked(SlotState::PENDING) != nullptr;
+                return m_stopped.load(std::memory_order_acquire) || m_in_flight ||
+                       slot_by_state_locked(SlotState::PENDING) != nullptr;
             });
         }
 
         if (m_stopped.load(std::memory_order_acquire))
             break;
 
-        // ── ② Service in-flight flip (poll for event) ─────────────────────
+        // ── ② Drain in-flight flip event ──────────────────────────────────
+        // Timeout adapts to half the current frame interval so we don't
+        // over-sleep at low frame rates or spin too tightly at high ones.
         if (m_in_flight)
         {
+            const int timeout_ms = std::max(
+                1, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(m_frame_ns / 2).count()));
             struct pollfd pfd{m_drm_fd, POLLIN, 0};
-            if (::poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN))
+            if (::poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN))
+            {
                 drmHandleEvent(m_drm_fd, &evctx);
+                m_in_flight_retries = 0;
+            }
+            else if (++m_in_flight_retries > 8)
+            {
+                // Watchdog: hardware has not delivered a flip event for ~4 frame
+                // intervals. This indicates a driver stall or display disconnect.
+                // Reset in-flight state so new frames can be submitted again.
+                VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, "
+                                  "resetting in-flight state",
+                                  m_in_flight_retries);
+                std::lock_guard<std::mutex> lk(m_mutex);
+                m_in_flight = false;
+                m_in_flight_retries = 0;
+                m_last_flip_tp = TimePoint{}; // invalidate stale vblank reference
+            }
             continue; // re-evaluate state at top of loop
         }
 
@@ -322,38 +345,26 @@ void DRMDisplayBase::event_thread_fn()
             if (!slot_by_state_locked(SlotState::PENDING))
                 continue; // frame was replaced and evicted while we slept
 
-            if (m_last_flip_tp == TimePoint{})
+            // Guard against EMA over-estimation causing submit_at to drift far
+            // into the future (positive feedback: late submit → missed vblank →
+            // larger interval sample → later submit next time). If the computed
+            // deadline is already more than one frame away from now, submit
+            // immediately to break the cycle.
+            const auto now = SteadyClock::now();
+            submit_at = (m_last_flip_tp == TimePoint{})
+                            ? now                                                   // first frame: submit immediately
+                            : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time; // subsequent: align to vblank
+            if (submit_at > now + m_frame_ns)
             {
-                // First frame: submit immediately.
-                submit_at = SteadyClock::now();
-            }
-            else
-            {
-                submit_at = m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time;
-            }
-        }
-
-        // Coarse wait: use poll so we remain responsive to flip events and stops.
-        // Hand off the final 800 µs to ClockEntry for CLOCK_MONOTONIC precision.
-        {
-            auto coarse_deadline = submit_at - std::chrono::microseconds{800};
-            auto now             = SteadyClock::now();
-
-            if (now < coarse_deadline)
-            {
-                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              coarse_deadline - now)
-                              .count();
-                struct pollfd pfd{m_drm_fd, POLLIN, 0};
-                if (::poll(&pfd, 1, static_cast<int>(ms > 0 ? ms : 1)) > 0
-                    && (pfd.revents & POLLIN))
-                    drmHandleEvent(m_drm_fd, &evctx);
-
-                continue; // re-evaluate — a flip event may have fired
+                submit_at = now;
             }
         }
 
-        // Precise sub-ms wait.
+        // ── ④ Wait until submit deadline ─────────────────────────────────
+        // No flip is in-flight at this point (m_in_flight == false), so there
+        // are no DRM events to drain during the wait. ClockEntry uses
+        // CLOCK_MONOTONIC and is cancellable via stop(), so it covers the
+        // full frame interval directly — no separate coarse/fine split needed.
         m_submit_timer.reset();
         if (m_submit_timer.wait_until(submit_at) == -1)
             continue; // cancelled (stop signal)
@@ -361,7 +372,7 @@ void DRMDisplayBase::event_thread_fn()
         if (m_stopped.load(std::memory_order_acquire))
             break;
 
-        // ── ④ Commit ──────────────────────────────────────────────────────
+        // ── ⑤ Commit ──────────────────────────────────────────────────────
         {
             std::lock_guard<std::mutex> lk(m_mutex);
             if (!m_in_flight && slot_by_state_locked(SlotState::PENDING))
@@ -372,24 +383,27 @@ void DRMDisplayBase::event_thread_fn()
 
 // ── Flip completion callback ──────────────────────────────────────────────────
 
-void DRMDisplayBase::on_page_flip_cb(int /*fd*/, unsigned /*seq*/,
-                                      unsigned /*tv_sec*/, unsigned /*tv_usec*/,
-                                      void *user_data)
+void DRMDisplayBase::on_page_flip_cb(int /*fd*/, unsigned /*seq*/, unsigned tv_sec, unsigned tv_usec, void *user_data)
 {
-    static_cast<DRMDisplayBase *>(user_data)->on_flip_done();
+    static_cast<DRMDisplayBase *>(user_data)->on_flip_done(tv_sec, tv_usec);
 }
 
-void DRMDisplayBase::on_flip_done()
+void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
 {
+    // Reconstruct the hardware vblank timestamp from the kernel-supplied
+    // CLOCK_MONOTONIC values (requires DRM_CLIENT_CAP_TIMESTAMP_MONOTONIC).
+    // This is more accurate than SteadyClock::now() because it reflects the
+    // actual vblank moment, not the scheduling delay until this callback runs.
+    const TimePoint hw_tp = TimePoint{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
+
     // Update vblank interval EMA (event thread only — no lock needed for timing).
-    auto now = SteadyClock::now();
     if (m_last_flip_tp != TimePoint{})
     {
-        auto interval = now - m_last_flip_tp;
+        auto interval = hw_tp - m_last_flip_tp;
         // EMA α=0.1 : weight new sample lightly to smooth jitter.
         m_frame_ns = m_frame_ns * 9 / 10 + interval / 10;
     }
-    m_last_flip_tp = now;
+    m_last_flip_tp = hw_tp;
 
     // Transition RELEASING → FREE and fire the release callback.
     {
@@ -430,7 +444,7 @@ bool DRMDisplayBase::schedule_flip_locked()
         // do_modeset_locked already committed with PAGE_FLIP_EVENT.
         // Promote PENDING → SCANNING; old SCANNING (none) → RELEASING skipped.
         pending->state = SlotState::SCANNING;
-        m_in_flight    = true;
+        m_in_flight = true;
         return true;
     }
 
@@ -442,16 +456,16 @@ bool DRMDisplayBase::schedule_flip_locked()
         return false;
     }
 
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id,   pending->fb_id);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, pending->fb_id);
     drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, m_crtc_id);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x,  0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y,  0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w,  pending->w);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h,  pending->h);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x,   0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y,   0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w,   pending->w << 16);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h,   pending->h << 16);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, pending->w);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, pending->h);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, pending->w << 16);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, pending->h << 16);
 
     constexpr uint32_t kFlipFlags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
     int ret = drmModeAtomicCommit(m_drm_fd, req, kFlipFlags, this);
@@ -469,7 +483,7 @@ bool DRMDisplayBase::schedule_flip_locked()
         scanning->state = SlotState::RELEASING;
 
     pending->state = SlotState::SCANNING;
-    m_in_flight    = true;
+    m_in_flight = true;
     return true;
 }
 
@@ -492,8 +506,7 @@ bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
     }
 
     uint32_t blob_id = 0;
-    int ret = drmModeCreatePropertyBlob(m_drm_fd, &crtc->mode,
-                                        sizeof(crtc->mode), &blob_id);
+    int ret = drmModeCreatePropertyBlob(m_drm_fd, &crtc->mode, sizeof(crtc->mode), &blob_id);
     drmModeFreeCrtc(crtc);
     if (ret != 0)
     {
@@ -513,32 +526,30 @@ bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
     }
 
     // Connector: bind to CRTC.
-    drmModeAtomicAddProperty(req, m_conn_id,  m_conn_props.crtc_id,  m_crtc_id);
+    drmModeAtomicAddProperty(req, m_conn_id, m_conn_props.crtc_id, m_crtc_id);
     // CRTC: enable and set mode.
-    drmModeAtomicAddProperty(req, m_crtc_id,  m_crtc_props.active,   1);
-    drmModeAtomicAddProperty(req, m_crtc_id,  m_crtc_props.mode_id,  blob_id);
+    drmModeAtomicAddProperty(req, m_crtc_id, m_crtc_props.active, 1);
+    drmModeAtomicAddProperty(req, m_crtc_id, m_crtc_props.mode_id, blob_id);
     // Plane: full geometry.
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id,   fb_id);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, fb_id);
     drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, m_crtc_id);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x,  0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y,  0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w,  w);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h,  h);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x,   0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y,   0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w,   w << 16);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h,   h << 16);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, w);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, h);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, w << 16);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, h << 16);
 
-    constexpr uint32_t kModesetFlags = DRM_MODE_ATOMIC_ALLOW_MODESET
-                                     | DRM_MODE_ATOMIC_NONBLOCK
-                                     | DRM_MODE_PAGE_FLIP_EVENT;
+    constexpr uint32_t kModesetFlags =
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
     ret = drmModeAtomicCommit(m_drm_fd, req, kModesetFlags, this);
     drmModeAtomicFree(req);
 
     if (ret != 0)
     {
-        VIDEO_ERROR_PRINT("DRMDisplay: modeset drmModeAtomicCommit: %s (%d)",
-                          ::strerror(errno), errno);
+        VIDEO_ERROR_PRINT("DRMDisplay: modeset drmModeAtomicCommit: %s (%d)", ::strerror(errno), errno);
         return false;
     }
     return true;
@@ -550,10 +561,12 @@ void DRMDisplayBase::init_drm()
 {
     m_drm_fd = ::open(m_cfg.drm_device.c_str(), O_RDWR | O_CLOEXEC);
     if (m_drm_fd < 0)
-        throw std::runtime_error("DRMDisplay: cannot open '" + m_cfg.drm_device
-                                 + "': " + ::strerror(errno));
+        throw std::runtime_error("DRMDisplay: cannot open '" + m_cfg.drm_device + "': " + ::strerror(errno));
 
     drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    // Use CLOCK_MONOTONIC for page-flip event timestamps so they are
+    // directly comparable with SteadyClock (also CLOCK_MONOTONIC).
+    drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_TIMESTAMP_MONOTONIC, 1);
 
     // ── Require Atomic API ────────────────────────────────────────────────
     if (drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
@@ -572,18 +585,16 @@ void DRMDisplayBase::init_drm()
     }
 
     // Connector
-    drmModeConnector *conn =
-        (m_cfg.connector_id >= 0)
-            ? drmModeGetConnector(m_drm_fd, static_cast<uint32_t>(m_cfg.connector_id))
-            : find_first_connected_connector(m_drm_fd, res);
+    drmModeConnector *conn = (m_cfg.connector_id >= 0)
+                                 ? drmModeGetConnector(m_drm_fd, static_cast<uint32_t>(m_cfg.connector_id))
+                                 : find_first_connected_connector(m_drm_fd, res);
     if (!conn)
     {
         drmModeFreeResources(res);
         close_drm();
-        throw std::runtime_error(
-            m_cfg.connector_id >= 0
-                ? "DRMDisplay: connector " + std::to_string(m_cfg.connector_id) + " not found"
-                : "DRMDisplay: no connected connector found");
+        throw std::runtime_error(m_cfg.connector_id >= 0
+                                     ? "DRMDisplay: connector " + std::to_string(m_cfg.connector_id) + " not found"
+                                     : "DRMDisplay: no connected connector found");
     }
     m_conn_id = conn->connector_id;
 
@@ -643,28 +654,20 @@ void DRMDisplayBase::init_drm()
     drmModeFreePlane(plane);
 
     // ── Query property IDs ────────────────────────────────────────────────
-    auto gp_plane = [&](const char *n) {
-        return get_prop_id(m_drm_fd, m_plane_id, DRM_MODE_OBJECT_PLANE, n);
-    };
-    auto gp_crtc  = [&](const char *n) {
-        return get_prop_id(m_drm_fd, m_crtc_id,  DRM_MODE_OBJECT_CRTC,  n);
-    };
-    auto gp_conn  = [&](const char *n) {
-        return get_prop_id(m_drm_fd, m_conn_id,  DRM_MODE_OBJECT_CONNECTOR, n);
-    };
+    auto gp_plane = [&](const char *n) { return get_prop_id(m_drm_fd, m_plane_id, DRM_MODE_OBJECT_PLANE, n); };
+    auto gp_crtc = [&](const char *n) { return get_prop_id(m_drm_fd, m_crtc_id, DRM_MODE_OBJECT_CRTC, n); };
+    auto gp_conn = [&](const char *n) { return get_prop_id(m_drm_fd, m_conn_id, DRM_MODE_OBJECT_CONNECTOR, n); };
 
     m_plane_props = {
-        gp_plane("FB_ID"),  gp_plane("CRTC_ID"),
-        gp_plane("CRTC_X"), gp_plane("CRTC_Y"), gp_plane("CRTC_W"), gp_plane("CRTC_H"),
-        gp_plane("SRC_X"),  gp_plane("SRC_Y"),  gp_plane("SRC_W"),  gp_plane("SRC_H"),
+        gp_plane("FB_ID"),  gp_plane("CRTC_ID"), gp_plane("CRTC_X"), gp_plane("CRTC_Y"), gp_plane("CRTC_W"),
+        gp_plane("CRTC_H"), gp_plane("SRC_X"),   gp_plane("SRC_Y"),  gp_plane("SRC_W"),  gp_plane("SRC_H"),
     };
-    m_crtc_props  = { gp_crtc("ACTIVE"), gp_crtc("MODE_ID") };
-    m_conn_props  = { gp_conn("CRTC_ID") };
+    m_crtc_props = {gp_crtc("ACTIVE"), gp_crtc("MODE_ID")};
+    m_conn_props = {gp_conn("CRTC_ID")};
 
     // Validate mandatory plane props.
-    if (!m_plane_props.fb_id || !m_plane_props.crtc_id
-        || !m_plane_props.crtc_w || !m_plane_props.crtc_h
-        || !m_plane_props.src_w  || !m_plane_props.src_h)
+    if (!m_plane_props.fb_id || !m_plane_props.crtc_id || !m_plane_props.crtc_w || !m_plane_props.crtc_h ||
+        !m_plane_props.src_w || !m_plane_props.src_h)
     {
         close_drm();
         throw std::runtime_error("DRMDisplay: plane is missing required atomic properties");
@@ -680,8 +683,8 @@ void DRMDisplayBase::init_drm()
         throw std::runtime_error("DRMDisplay: connector is missing CRTC_ID property");
     }
 
-    VIDEO_DEBUG_PRINT("DRMDisplay: fd=%d connector=%u crtc=%u plane=%u pipe=%d",
-                      m_drm_fd, m_conn_id, m_crtc_id, m_plane_id, m_pipe);
+    VIDEO_DEBUG_PRINT("DRMDisplay: fd=%d connector=%u crtc=%u plane=%u pipe=%d", m_drm_fd, m_conn_id, m_crtc_id,
+                      m_plane_id, m_pipe);
 }
 
 void DRMDisplayBase::close_drm()
@@ -697,8 +700,7 @@ void DRMDisplayBase::close_drm()
 
 bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &out_fb_id)
 {
-    auto *meta = reinterpret_cast<AL_TPixMapMetaData *>(
-        AL_Buffer_GetMetaData(buf, AL_META_TYPE_PIXMAP));
+    auto *meta = reinterpret_cast<AL_TPixMapMetaData *>(AL_Buffer_GetMetaData(buf, AL_META_TYPE_PIXMAP));
     if (!meta)
     {
         VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: no AL_TPixMapMetaData");
@@ -707,8 +709,7 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
     const uint32_t drm_fmt = allegro_to_drm_fourcc(meta->tFourCC);
     if (!drm_fmt)
     {
-        VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: unsupported pixel format 0x%08X",
-                          meta->tFourCC);
+        VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: unsupported pixel format 0x%08X", meta->tFourCC);
         return false;
     }
 
@@ -728,12 +729,12 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
     const int num_planes = (AL_GetChromaMode(meta->tFourCC) == AL_CHROMA_MONO) ? 1 : 2;
     static const AL_EPlaneId kPlaneIds[2] = {AL_PLANE_Y, AL_PLANE_UV};
 
-    uint32_t bo_handles[4]    = {};
-    uint32_t pitches[4]       = {};
-    uint32_t offsets[4]       = {};
-    uint32_t gem_handles[4]   = {};
-    int      imported_chunk[4] = {-1, -1, -1, -1};
-    int      num_gem           = 0;
+    uint32_t bo_handles[4] = {};
+    uint32_t pitches[4] = {};
+    uint32_t offsets[4] = {};
+    uint32_t gem_handles[4] = {};
+    int imported_chunk[4] = {-1, -1, -1, -1};
+    int num_gem = 0;
 
     auto *linux_alloc = reinterpret_cast<AL_TLinuxDmaAllocator *>(buf->pAllocator);
 
@@ -746,26 +747,28 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
         // Deduplicate chunks (Y and UV may share the same DMA buffer).
         int gi = -1;
         for (int k = 0; k < num_gem; ++k)
-            if (imported_chunk[k] == pl.iChunkIdx) { gi = k; break; }
+            if (imported_chunk[k] == pl.iChunkIdx)
+            {
+                gi = k;
+                break;
+            }
 
         if (gi < 0)
         {
             int dma_fd = AL_LinuxDmaAllocator_GetFd(linux_alloc, buf->hBufs[pl.iChunkIdx]);
             if (dma_fd < 0)
             {
-                VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: cannot get DMA-buf fd (chunk %d)",
-                                  pl.iChunkIdx);
+                VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: cannot get DMA-buf fd (chunk %d)", pl.iChunkIdx);
                 goto cleanup;
             }
             uint32_t gem = 0;
             if (drmPrimeFDToHandle(m_drm_fd, dma_fd, &gem) != 0)
             {
-                VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: drmPrimeFDToHandle: %s",
-                                  ::strerror(errno));
+                VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: drmPrimeFDToHandle: %s", ::strerror(errno));
                 goto cleanup;
             }
             gi = num_gem;
-            gem_handles[num_gem]   = gem;
+            gem_handles[num_gem] = gem;
             imported_chunk[num_gem++] = pl.iChunkIdx;
         }
         bo_handles[pi] = gem_handles[gi];
@@ -773,19 +776,17 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
 
     {
         uint32_t fb_id = 0;
-        if (drmModeAddFB2(m_drm_fd, w, h, drm_fmt,
-                          bo_handles, pitches, offsets, &fb_id, 0) != 0)
+        if (drmModeAddFB2(m_drm_fd, w, h, drm_fmt, bo_handles, pitches, offsets, &fb_id, 0) != 0)
         {
-            VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: drmModeAddFB2: %s (%d)",
-                              ::strerror(errno), errno);
+            VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: drmModeAddFB2: %s (%d)", ::strerror(errno), errno);
             goto cleanup;
         }
 
         {
             std::lock_guard<std::mutex> lk(m_cache_mutex);
-            CachedFB &cached  = m_fb_cache[buf];
-            cached.fb_id      = fb_id;
-            cached.num_gem    = num_gem;
+            CachedFB &cached = m_fb_cache[buf];
+            cached.fb_id = fb_id;
+            cached.num_gem = num_gem;
             for (int k = 0; k < num_gem; ++k)
                 cached.gem_handles[k] = gem_handles[k];
         }
@@ -850,21 +851,21 @@ void DRMDisplayDumb::alloc_dumb_bufs()
         DumbBuf &b = m_bufs[i];
 
         drm_mode_create_dumb create{};
-        create.width  = m_width;
+        create.width = m_width;
         create.height = m_height;
-        create.bpp    = 32; // XRGB8888
+        create.bpp = 32; // XRGB8888
         if (drmIoctl(drm_fd(), DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0)
             throw std::runtime_error(std::string("DRMDisplayDumb: CREATE_DUMB: ") + ::strerror(errno));
 
         b.gem_handle = create.handle;
-        b.pitch      = create.pitch;
-        b.size       = create.size;
+        b.pitch = create.pitch;
+        b.size = create.size;
 
         uint32_t handles[4] = {create.handle};
         uint32_t pitches[4] = {create.pitch};
         uint32_t offsets[4] = {};
-        if (drmModeAddFB2(drm_fd(), m_width, m_height, DRM_FORMAT_XRGB8888,
-                          handles, pitches, offsets, &b.fb_id, 0) != 0)
+        if (drmModeAddFB2(drm_fd(), m_width, m_height, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &b.fb_id, 0) !=
+            0)
             throw std::runtime_error(std::string("DRMDisplayDumb: AddFB2: ") + ::strerror(errno));
 
         drm_mode_map_dumb map_dumb{};
@@ -872,9 +873,8 @@ void DRMDisplayDumb::alloc_dumb_bufs()
         if (drmIoctl(drm_fd(), DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0)
             throw std::runtime_error(std::string("DRMDisplayDumb: MAP_DUMB: ") + ::strerror(errno));
 
-        b.mapped = ::mmap(nullptr, static_cast<size_t>(b.size),
-                          PROT_READ | PROT_WRITE, MAP_SHARED,
-                          drm_fd(), static_cast<off_t>(map_dumb.offset));
+        b.mapped = ::mmap(nullptr, static_cast<size_t>(b.size), PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd(),
+                          static_cast<off_t>(map_dumb.offset));
         if (b.mapped == MAP_FAILED)
         {
             b.mapped = nullptr;
@@ -885,8 +885,7 @@ void DRMDisplayDumb::alloc_dumb_bufs()
         for (uint64_t p = 0; p < b.size / 4; ++p)
             px[p] = kColours[i];
 
-        VIDEO_DEBUG_PRINT("DRMDisplayDumb: buf[%d] gem=%u fb=%u pitch=%u size=%llu",
-                          i, b.gem_handle, b.fb_id, b.pitch,
+        VIDEO_DEBUG_PRINT("DRMDisplayDumb: buf[%d] gem=%u fb=%u pitch=%u size=%llu", i, b.gem_handle, b.fb_id, b.pitch,
                           static_cast<unsigned long long>(b.size));
     }
 }
@@ -914,4 +913,3 @@ void DRMDisplayDumb::free_dumb_bufs() noexcept
         }
     }
 }
-
