@@ -151,11 +151,11 @@ class DRMDisplayBase
 
 // ── DRMDisplay: Allegro VCU DMA-buf zero-copy ──────────────────────────────────────
 
-extern "C"
-{
-#include "lib_common/BufferAPI.h"
-#include "lib_decode/lib_decode.h"
-}
+// Forward declarations — full definitions are included in DRMDisplay.cpp.
+// This avoids pulling heavy Allegro C headers into every translation unit that
+// only needs the DRMDisplay interface.
+struct AL_TBuffer;
+struct AL_TInfoDecode;
 
 #include <array>
 #include <map>

@@ -5,6 +5,7 @@ extern "C"
 #include "lib_common/BufferAPI.h"
 #include "lib_common/BufferPixMapMeta.h"
 #include "lib_common/FourCC.h"
+#include "lib_decode/lib_decode.h"
 #include "lib_fpga/DmaAllocLinux.h"
 #include "lib_rtos/message.h"
 }
@@ -178,8 +179,15 @@ DRMDisplayBase::~DRMDisplayBase()
 
 // ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────
 
+static DRMDisplayBase::FrameReleaseCallback wrap_typed_cb(DRMDisplay::TypedReleaseCallback cb)
+{
+    if (!cb)
+        return {}; // null FrameReleaseCallback → base ctor throws std::invalid_argument
+    return [cb = std::move(cb)](void *key) { cb(static_cast<AL_TBuffer *>(key)); };
+}
+
 DRMDisplay::DRMDisplay(const DRMDisplayConfig &cfg, TypedReleaseCallback release_cb)
-    : DRMDisplayBase(cfg, [release_cb](void *key) { release_cb(static_cast<AL_TBuffer *>(key)); })
+    : DRMDisplayBase(cfg, wrap_typed_cb(std::move(release_cb)))
 {
 }
 
@@ -330,10 +338,16 @@ void DRMDisplayBase::event_thread_fn()
                 VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, "
                                   "resetting in-flight state",
                                   m_in_flight_retries);
+                // Recover any RELEASING slot: the commit was issued so the hardware
+                // is done with the previous buffer even if the event was lost.
+                // The SCANNING slot is left as-is — freeing a buffer the display
+                // controller may still be reading would cause visual corruption.
                 std::lock_guard<std::mutex> lk(m_mutex);
                 m_in_flight = false;
                 m_in_flight_retries = 0;
                 m_last_flip_tp = TimePoint{}; // invalidate stale vblank reference
+                Slot *rel = slot_by_state_locked(SlotState::RELEASING);
+                if (rel) { m_release_cb(rel->buf); *rel = Slot{}; }
             }
             continue; // re-evaluate state at top of loop
         }
@@ -355,9 +369,7 @@ void DRMDisplayBase::event_thread_fn()
                             ? now                                                   // first frame: submit immediately
                             : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time; // subsequent: align to vblank
             if (submit_at > now + m_frame_ns)
-            {
                 submit_at = now;
-            }
         }
 
         // ── ④ Wait until submit deadline ─────────────────────────────────
