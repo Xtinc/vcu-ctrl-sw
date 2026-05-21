@@ -164,7 +164,6 @@ int main(int argc, char *argv[])
             // a valid frame format is available.
             DRMDisplayConfig drm_cfg;
             drm_cfg.drm_device = drm_device;
-            drm_cfg.enable_vsync = true;
             try
             {
                 display = std::make_unique<DRMDisplay>(drm_cfg, [&decoder](AL_TBuffer *f) {
