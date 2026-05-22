@@ -183,6 +183,7 @@ class ClockEntry
 {
   public:
     using ClockTP = std::chrono::steady_clock::time_point;
+    using Nanos = std::chrono::nanoseconds;
 
     ClockEntry();
     ClockEntry(const ClockEntry &) = delete;

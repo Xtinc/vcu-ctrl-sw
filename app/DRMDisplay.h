@@ -119,6 +119,8 @@ class DRMDisplayBase
     Slot *slot_by_state_locked(SlotState s);
 
     void event_thread_fn();
+    void drain_flip_event(drmEventContext &evctx);
+    TimePoint compute_submit_deadline();
     static void on_page_flip_cb(int fd, unsigned seq, unsigned tv_sec, unsigned tv_usec, void *user_data);
     void on_flip_done(unsigned tv_sec, unsigned tv_usec);
 

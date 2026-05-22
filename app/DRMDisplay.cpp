@@ -255,6 +255,7 @@ void DRMDisplayBase::event_thread_fn()
 
     while (true)
     {
+        // ── Phase 1: sleep until there is work ───────────────────────────
         {
             std::unique_lock<std::mutex> lk(m_mutex);
             m_cv.wait(lk, [this] {
@@ -264,77 +265,79 @@ void DRMDisplayBase::event_thread_fn()
         }
 
         if (m_stopped.load(std::memory_order_acquire))
-        {
             break;
-        }
 
+        // ── Phase 2: drain the in-flight flip event via poll ─────────────
         if (m_in_flight)
         {
-            const int timeout_ms = std::max(
-                1, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(m_frame_ns / 2).count()));
-            struct pollfd pfd{m_drm_fd, POLLIN, 0};
-            if (::poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN))
-            {
-                drmHandleEvent(m_drm_fd, &evctx);
-                m_in_flight_retries = 0;
-            }
-            else if (++m_in_flight_retries > 8)
-            {
-                VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, resetting in-flight state",
-                                  m_in_flight_retries);
-
-                std::lock_guard<std::mutex> lk(m_mutex);
-                m_in_flight = false;
-                m_in_flight_retries = 0;
-                m_last_flip_tp = TimePoint{}; // invalidate stale vblank reference
-                Slot *rel = slot_by_state_locked(SlotState::RELEASING);
-                if (rel)
-                {
-                    m_release_cb(rel->buf);
-                    *rel = Slot{};
-                }
-            }
-            continue; // re-evaluate state at top of loop
+            drain_flip_event(evctx);
+            continue; // re-enter Phase 1 to re-check m_in_flight / m_stopped
         }
 
-        TimePoint submit_at;
-        {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            if (!slot_by_state_locked(SlotState::PENDING))
-                continue; // frame was replaced and evicted while we slept
-
-            // Guard against EMA over-estimation causing submit_at to drift far
-            // into the future (positive feedback: late submit → missed vblank →
-            // larger interval sample → later submit next time). If the computed
-            // deadline is already more than one frame away from now, submit
-            // immediately to break the cycle.
-            const auto now = SteadyClock::now();
-            submit_at = (m_last_flip_tp == TimePoint{})
-                            ? now                                                   // first frame: submit immediately
-                            : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time; // subsequent: align to vblank
-            if (submit_at > now + m_frame_ns)
-            {
-                submit_at = now;
-            }
-        }
+        // ── Phase 3: wait until the vblank submission window ─────────────
+        const TimePoint submit_at = compute_submit_deadline();
+        if (submit_at == TimePoint{})
+            continue; // PENDING was evicted while we waited in Phase 1
         m_submit_timer.reset();
         if (m_submit_timer.wait_until(submit_at) == -1)
-        {
-            continue; // cancelled (stop signal)
-        }
+            continue; // timer cancelled by stop()
 
         if (m_stopped.load(std::memory_order_acquire))
-        {
             break;
-        }
 
+        // ── Phase 4: commit the atomic page flip ──────────────────────────
         {
             std::lock_guard<std::mutex> lk(m_mutex);
             if (!m_in_flight && slot_by_state_locked(SlotState::PENDING))
-            {
                 schedule_flip_locked();
-            }
         }
+    }
+}
+
+DRMDisplayBase::TimePoint DRMDisplayBase::compute_submit_deadline()
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if (!slot_by_state_locked(SlotState::PENDING))
+        return TimePoint{}; // sentinel: no pending frame
+
+    const auto now = SteadyClock::now();
+    // Aim to submit submit_lead_time before the predicted next vblank.
+    // First frame has no history, so submit immediately.
+    TimePoint deadline = (m_last_flip_tp == TimePoint{})
+                             ? now
+                             : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time;
+    // Clamp: if EMA drifted and deadline is > 1 frame away, submit now to
+    // break the positive feedback (late submit → larger interval → later submit).
+    if (deadline > now + m_frame_ns)
+        deadline = now;
+    return deadline;
+}
+
+void DRMDisplayBase::drain_flip_event(drmEventContext &evctx)
+{
+    const int timeout_ms = std::max(
+        1, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(m_frame_ns / 2).count()));
+    struct pollfd pfd{m_drm_fd, POLLIN, 0};
+
+    if (::poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN))
+    {
+        drmHandleEvent(m_drm_fd, &evctx); // → on_flip_done → clears m_in_flight
+        m_in_flight_retries = 0;
+        return;
+    }
+
+    if (++m_in_flight_retries <= 8)
+        return;
+
+    VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, resetting", m_in_flight_retries);
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_in_flight = false;
+    m_in_flight_retries = 0;
+    m_last_flip_tp = TimePoint{};
+    if (Slot *rel = slot_by_state_locked(SlotState::RELEASING))
+    {
+        m_release_cb(rel->buf);
+        *rel = Slot{};
     }
 }
 
@@ -519,6 +522,7 @@ void DRMDisplayBase::init_drm()
     }
 
     drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_TIMESTAMP_MONOTONIC, 1);
 
     if (drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
     {
@@ -689,13 +693,13 @@ DRMDisplay::~DRMDisplay()
 
 void DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info)
 {
+    if (!frame)
+        return;
     if (m_stopped.load(std::memory_order_acquire))
     {
         m_release_cb(frame);
         return;
     }
-    if (!frame)
-        return;
 
     const auto w = static_cast<uint32_t>(info.tDim.iWidth);
     const auto h = static_cast<uint32_t>(info.tDim.iHeight);
