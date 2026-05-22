@@ -13,20 +13,38 @@
 #include <string>
 #include <thread>
 
-/**
- * @brief Configuration parameters for DRMDisplayBase and its subclasses.
- */
 struct DRMDisplayConfig
 {
     std::string drm_device = "/dev/dri/card0"; ///< DRM device node path.
     int connector_id = -1;                     ///< KMS connector ID (-1 = auto-detect).
     int crtc_id = -1;                          ///< KMS CRTC ID (-1 = auto-detect).
     int plane_id = -1;                         ///< KMS plane ID (-1 = auto-detect overlay/primary).
-
-    /// How far before the predicted vblank to submit the atomic commit.
-    /// Smaller = lower latency but higher risk of missing the vblank window.
-    /// Default: 1 ms — safe for most hardware.
     std::chrono::nanoseconds submit_lead_time{2'000'000LL};
+};
+
+struct PlaneProps
+{
+    uint32_t fb_id = 0;
+    uint32_t crtc_id = 0;
+    uint32_t crtc_x = 0;
+    uint32_t crtc_y = 0;
+    uint32_t crtc_w = 0;
+    uint32_t crtc_h = 0;
+    uint32_t src_x = 0;
+    uint32_t src_y = 0;
+    uint32_t src_w = 0;
+    uint32_t src_h = 0;
+};
+
+struct CrtcProps
+{
+    uint32_t active = 0;
+    uint32_t mode_id = 0;
+};
+
+struct ConnProps
+{
+    uint32_t crtc_id = 0;
 };
 
 /**
@@ -53,6 +71,23 @@ struct DRMDisplayConfig
  */
 class DRMDisplayBase
 {
+    enum class SlotState
+    {
+        FREE,
+        PENDING,
+        SCANNING,
+        RELEASING
+    };
+
+    struct Slot
+    {
+        void *buf = nullptr;
+        uint32_t fb_id = 0;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        SlotState state = SlotState::FREE;
+    };
+
   public:
     using FrameReleaseCallback = std::function<void(void *)>;
 
@@ -77,53 +112,24 @@ class DRMDisplayBase
      *  fb_id : registered DRM framebuffer (caller is responsible for its lifetime).
      */
     void submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h);
+    int drm_fd() const;
 
-  protected:
-    enum class SlotState
-    {
-        FREE,
-        PENDING,
-        SCANNING,
-        RELEASING
-    };
-
-    struct Slot
-    {
-        void *buf = nullptr;
-        uint32_t fb_id = 0;
-        uint32_t w = 0;
-        uint32_t h = 0;
-        SlotState state = SlotState::FREE;
-    };
-
-    struct PlaneProps
-    {
-        uint32_t fb_id = 0, crtc_id = 0;
-        uint32_t crtc_x = 0, crtc_y = 0, crtc_w = 0, crtc_h = 0;
-        uint32_t src_x = 0, src_y = 0, src_w = 0, src_h = 0;
-    };
-    struct CrtcProps
-    {
-        uint32_t active = 0, mode_id = 0;
-    };
-    struct ConnProps
-    {
-        uint32_t crtc_id = 0;
-    };
+  private:
+    static void on_page_flip_cb(int fd, unsigned seq, unsigned tv_sec, unsigned tv_usec, void *user_data);
 
     void init_drm();
     void close_drm();
 
     bool do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h);
     bool schedule_flip_locked();
+    ClockEntry::ClockTP compute_submit_deadline();
+    void drain_flip_event();
+    void on_flip_done(unsigned tv_sec, unsigned tv_usec);
+    void event_thread_fn();
+
     Slot *slot_by_state_locked(SlotState s);
 
-    void event_thread_fn();
-    void drain_flip_event(drmEventContext &evctx);
-    TimePoint compute_submit_deadline();
-    static void on_page_flip_cb(int fd, unsigned seq, unsigned tv_sec, unsigned tv_usec, void *user_data);
-    void on_flip_done(unsigned tv_sec, unsigned tv_usec);
-
+  protected:
     DRMDisplayConfig m_cfg;
     FrameReleaseCallback m_release_cb;
 
@@ -144,12 +150,8 @@ class DRMDisplayBase
     std::mutex m_mutex;
     std::condition_variable m_cv;
 
-    using SteadyClock = std::chrono::steady_clock;
-    using TimePoint = SteadyClock::time_point;
-    using Nanos = std::chrono::nanoseconds;
-
-    TimePoint m_last_flip_tp{};
-    Nanos m_frame_ns{16'666'666LL};
+    ClockEntry::ClockTP m_last_flip_tp{};
+    ClockEntry::Nanos m_frame_ns{16'666'666LL};
     int m_in_flight_retries{0};
 
     std::atomic<bool> m_stopped{false};

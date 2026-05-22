@@ -30,7 +30,7 @@ extern "C"
 #define DRM_FORMAT_XV20 fourcc_code('X', 'V', '2', '0')
 #endif
 
-static uint32_t allegro_to_drm_fourcc(uint32_t al_fourcc)
+static uint32_t fourcc_to_drm_fourcc(uint32_t al_fourcc)
 {
     switch (al_fourcc)
     {
@@ -106,6 +106,11 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res, drmModeConn
 
 static drmModePlane *find_plane_for_crtc(int fd, drmModePlaneRes *pres, int pipe, int prefer_type)
 {
+    if (pipe < 0)
+    {
+        return nullptr;
+    }
+
     drmModePlane *fallback = nullptr;
     for (uint32_t i = 0; i < pres->count_planes; ++i)
     {
@@ -168,6 +173,11 @@ static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type, const ch
     return id;
 }
 
+void DRMDisplayBase::on_page_flip_cb(int /*fd*/, unsigned /*seq*/, unsigned tv_sec, unsigned tv_usec, void *user_data)
+{
+    static_cast<DRMDisplayBase *>(user_data)->on_flip_done(tv_sec, tv_usec);
+}
+
 DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback release_cb)
     : m_cfg(cfg), m_release_cb(std::move(release_cb))
 {
@@ -220,16 +230,14 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
 {
     {
         std::lock_guard<std::mutex> lk(m_mutex);
-
-        // Latest-frame-wins: evict any existing PENDING frame immediately.
-        Slot *pending = slot_by_state_locked(SlotState::PENDING);
+        auto *pending = slot_by_state_locked(SlotState::PENDING);
         if (pending)
         {
             m_release_cb(pending->buf);
             *pending = Slot{};
         }
 
-        Slot *target = slot_by_state_locked(SlotState::FREE);
+        auto *target = slot_by_state_locked(SlotState::FREE);
         if (!target)
         {
             VIDEO_ERROR_PRINT("DRMDisplay: no free slot, dropping frame");
@@ -247,270 +255,9 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
     m_cv.notify_one();
 }
 
-void DRMDisplayBase::event_thread_fn()
+int DRMDisplayBase::drm_fd() const
 {
-    drmEventContext evctx{};
-    evctx.version = DRM_EVENT_CONTEXT_VERSION;
-    evctx.page_flip_handler = on_page_flip_cb;
-
-    while (true)
-    {
-        // ── Phase 1: sleep until there is work ───────────────────────────
-        {
-            std::unique_lock<std::mutex> lk(m_mutex);
-            m_cv.wait(lk, [this] {
-                return m_stopped.load(std::memory_order_acquire) || m_in_flight ||
-                       slot_by_state_locked(SlotState::PENDING) != nullptr;
-            });
-        }
-
-        if (m_stopped.load(std::memory_order_acquire))
-            break;
-
-        // ── Phase 2: drain the in-flight flip event via poll ─────────────
-        if (m_in_flight)
-        {
-            drain_flip_event(evctx);
-            continue; // re-enter Phase 1 to re-check m_in_flight / m_stopped
-        }
-
-        // ── Phase 3: wait until the vblank submission window ─────────────
-        const TimePoint submit_at = compute_submit_deadline();
-        if (submit_at == TimePoint{})
-            continue; // PENDING was evicted while we waited in Phase 1
-        m_submit_timer.reset();
-        if (m_submit_timer.wait_until(submit_at) == -1)
-            continue; // timer cancelled by stop()
-
-        if (m_stopped.load(std::memory_order_acquire))
-            break;
-
-        // ── Phase 4: commit the atomic page flip ──────────────────────────
-        {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            if (!m_in_flight && slot_by_state_locked(SlotState::PENDING))
-                schedule_flip_locked();
-        }
-    }
-}
-
-DRMDisplayBase::TimePoint DRMDisplayBase::compute_submit_deadline()
-{
-    std::lock_guard<std::mutex> lk(m_mutex);
-    if (!slot_by_state_locked(SlotState::PENDING))
-        return TimePoint{}; // sentinel: no pending frame
-
-    const auto now = SteadyClock::now();
-    // Aim to submit submit_lead_time before the predicted next vblank.
-    // First frame has no history, so submit immediately.
-    TimePoint deadline = (m_last_flip_tp == TimePoint{})
-                             ? now
-                             : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time;
-    // Clamp: if EMA drifted and deadline is > 1 frame away, submit now to
-    // break the positive feedback (late submit → larger interval → later submit).
-    if (deadline > now + m_frame_ns)
-        deadline = now;
-    return deadline;
-}
-
-void DRMDisplayBase::drain_flip_event(drmEventContext &evctx)
-{
-    const int timeout_ms = std::max(
-        1, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(m_frame_ns / 2).count()));
-    struct pollfd pfd{m_drm_fd, POLLIN, 0};
-
-    if (::poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN))
-    {
-        drmHandleEvent(m_drm_fd, &evctx); // → on_flip_done → clears m_in_flight
-        m_in_flight_retries = 0;
-        return;
-    }
-
-    if (++m_in_flight_retries <= 8)
-        return;
-
-    VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, resetting", m_in_flight_retries);
-    std::lock_guard<std::mutex> lk(m_mutex);
-    m_in_flight = false;
-    m_in_flight_retries = 0;
-    m_last_flip_tp = TimePoint{};
-    if (Slot *rel = slot_by_state_locked(SlotState::RELEASING))
-    {
-        m_release_cb(rel->buf);
-        *rel = Slot{};
-    }
-}
-
-void DRMDisplayBase::on_page_flip_cb(int /*fd*/, unsigned /*seq*/, unsigned tv_sec, unsigned tv_usec, void *user_data)
-{
-    static_cast<DRMDisplayBase *>(user_data)->on_flip_done(tv_sec, tv_usec);
-}
-
-void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
-{
-    // Reconstruct the hardware vblank timestamp from the kernel-supplied
-    // CLOCK_MONOTONIC values (requires DRM_CLIENT_CAP_TIMESTAMP_MONOTONIC).
-    // This is more accurate than SteadyClock::now() because it reflects the
-    // actual vblank moment, not the scheduling delay until this callback runs.
-    const TimePoint hw_tp = TimePoint{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
-    // Update vblank interval EMA (event thread only — no lock needed for timing).
-    if (m_last_flip_tp != TimePoint{})
-    {
-        auto interval = hw_tp - m_last_flip_tp;
-        // EMA α=0.1 : weight new sample lightly to smooth jitter.
-        m_frame_ns = m_frame_ns * 9 / 10 + interval / 10;
-    }
-    m_last_flip_tp = hw_tp;
-
-    // Transition RELEASING → FREE and fire the release callback.
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        Slot *rel = slot_by_state_locked(SlotState::RELEASING);
-        if (rel)
-        {
-            m_release_cb(rel->buf);
-            *rel = Slot{};
-        }
-        m_in_flight = false;
-    }
-
-    // Wake the event loop so it can service any queued PENDING frame.
-    m_cv.notify_one();
-}
-
-bool DRMDisplayBase::schedule_flip_locked()
-{
-    Slot *pending = slot_by_state_locked(SlotState::PENDING);
-    if (!pending)
-    {
-        return false;
-    }
-
-    // First frame: full atomic modeset.
-    if (!m_modeset_done)
-    {
-        if (!do_modeset_locked(pending->fb_id, pending->w, pending->h))
-        {
-            VIDEO_ERROR_PRINT("DRMDisplay: modeset failed, dropping frame");
-            m_release_cb(pending->buf);
-            *pending = Slot{};
-            return false;
-        }
-        m_modeset_done = true;
-        // do_modeset_locked already committed with PAGE_FLIP_EVENT.
-        // Promote PENDING → SCANNING; old SCANNING (none) → RELEASING skipped.
-        pending->state = SlotState::SCANNING;
-        m_in_flight = true;
-        return true;
-    }
-
-    // Subsequent frames: non-blocking atomic page flip.
-    auto *req = drmModeAtomicAlloc();
-    if (!req)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicAlloc failed");
-        return false;
-    }
-
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, pending->fb_id);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, m_crtc_id);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, pending->w);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, pending->h);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, pending->w << 16);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, pending->h << 16);
-
-    constexpr uint32_t kFlipFlags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
-    int ret = drmModeAtomicCommit(m_drm_fd, req, kFlipFlags, this);
-    drmModeAtomicFree(req);
-
-    if (ret != 0)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicCommit: %s (%d)", ::strerror(errno), errno);
-        return false;
-    }
-
-    // State transitions: SCANNING → RELEASING, PENDING → SCANNING.
-    Slot *scanning = slot_by_state_locked(SlotState::SCANNING);
-    if (scanning)
-    {
-        scanning->state = SlotState::RELEASING;
-    }
-
-    pending->state = SlotState::SCANNING;
-    m_in_flight = true;
-    return true;
-}
-
-bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
-{
-    // Read current mode from CRTC.
-    auto *crtc = drmModeGetCrtc(m_drm_fd, m_crtc_id);
-    if (!crtc)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: drmModeGetCrtc failed for modeset");
-        return false;
-    }
-    if (!crtc->mode_valid)
-    {
-        drmModeFreeCrtc(crtc);
-        VIDEO_ERROR_PRINT("DRMDisplay: CRTC has no valid mode");
-        return false;
-    }
-
-    uint32_t blob_id = 0;
-    int ret = drmModeCreatePropertyBlob(m_drm_fd, &crtc->mode, sizeof(crtc->mode), &blob_id);
-    drmModeFreeCrtc(crtc);
-    if (ret != 0)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: drmModeCreatePropertyBlob: %s", ::strerror(errno));
-        return false;
-    }
-
-    if (m_mode_blob_id)
-    {
-        drmModeDestroyPropertyBlob(m_drm_fd, m_mode_blob_id);
-    }
-    m_mode_blob_id = blob_id;
-
-    auto *req = drmModeAtomicAlloc();
-    if (!req)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicAlloc failed (modeset)");
-        return false;
-    }
-
-    // Connector: bind to CRTC.
-    drmModeAtomicAddProperty(req, m_conn_id, m_conn_props.crtc_id, m_crtc_id);
-    // CRTC: enable and set mode.
-    drmModeAtomicAddProperty(req, m_crtc_id, m_crtc_props.active, 1);
-    drmModeAtomicAddProperty(req, m_crtc_id, m_crtc_props.mode_id, blob_id);
-    // Plane: full geometry.
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, fb_id);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, m_crtc_id);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, w);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, h);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, w << 16);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, h << 16);
-
-    constexpr uint32_t kModesetFlags =
-        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
-    ret = drmModeAtomicCommit(m_drm_fd, req, kModesetFlags, this);
-    drmModeAtomicFree(req);
-
-    if (ret != 0)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: modeset drmModeAtomicCommit: %s (%d)", ::strerror(errno), errno);
-        return false;
-    }
-    return true;
+    return m_drm_fd;
 }
 
 void DRMDisplayBase::init_drm()
@@ -522,7 +269,7 @@ void DRMDisplayBase::init_drm()
     }
 
     drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-    drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_TIMESTAMP_MONOTONIC, 1);
+    drmSetClientCap(m_drm_fd, DRM_CAP_TIMESTAMP_MONOTONIC, 1);
 
     if (drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
     {
@@ -574,6 +321,12 @@ void DRMDisplayBase::init_drm()
     {
         close_drm();
         throw std::runtime_error("DRMDisplay: cannot find CRTC for connector");
+    }
+    if (m_pipe < 0)
+    {
+        drmModeFreeCrtc(crtc);
+        close_drm();
+        throw std::runtime_error("DRMDisplay: selected CRTC is not present in DRM resources");
     }
     m_crtc_id = crtc->crtc_id;
     drmModeFreeCrtc(crtc);
@@ -648,16 +401,280 @@ void DRMDisplayBase::close_drm()
     }
 }
 
-DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
+bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
 {
-    for (auto &slot : m_slots)
+    auto *crtc = drmModeGetCrtc(m_drm_fd, m_crtc_id);
+    if (!crtc)
     {
-        if (slot.state == s)
+        VIDEO_ERROR_PRINT("DRMDisplay: drmModeGetCrtc failed for modeset");
+        return false;
+    }
+    if (!crtc->mode_valid)
+    {
+        drmModeFreeCrtc(crtc);
+        VIDEO_ERROR_PRINT("DRMDisplay: CRTC has no valid mode");
+        return false;
+    }
+
+    uint32_t blob_id = 0;
+    int ret = drmModeCreatePropertyBlob(m_drm_fd, &crtc->mode, sizeof(crtc->mode), &blob_id);
+    drmModeFreeCrtc(crtc);
+    if (ret != 0)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: drmModeCreatePropertyBlob: %s", ::strerror(errno));
+        return false;
+    }
+
+    if (m_mode_blob_id)
+    {
+        drmModeDestroyPropertyBlob(m_drm_fd, m_mode_blob_id);
+    }
+    m_mode_blob_id = blob_id;
+
+    auto *req = drmModeAtomicAlloc();
+    if (!req)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicAlloc failed (modeset)");
+        return false;
+    }
+
+    drmModeAtomicAddProperty(req, m_conn_id, m_conn_props.crtc_id, m_crtc_id);
+    drmModeAtomicAddProperty(req, m_crtc_id, m_crtc_props.active, 1);
+    drmModeAtomicAddProperty(req, m_crtc_id, m_crtc_props.mode_id, blob_id);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, fb_id);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, m_crtc_id);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, w);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, h);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, w << 16);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, h << 16);
+
+    constexpr uint32_t kModesetFlags =
+        DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+    ret = drmModeAtomicCommit(m_drm_fd, req, kModesetFlags, this);
+    drmModeAtomicFree(req);
+
+    if (ret != 0)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: modeset drmModeAtomicCommit: %s (%d)", ::strerror(errno), errno);
+        return false;
+    }
+    return true;
+}
+
+bool DRMDisplayBase::schedule_flip_locked()
+{
+    auto *pending = slot_by_state_locked(SlotState::PENDING);
+    if (!pending)
+    {
+        return false;
+    }
+
+    if (!m_modeset_done)
+    {
+        if (!do_modeset_locked(pending->fb_id, pending->w, pending->h))
         {
-            return &slot;
+            VIDEO_ERROR_PRINT("DRMDisplay: modeset failed, dropping frame");
+            m_release_cb(pending->buf);
+            *pending = Slot{};
+            return false;
+        }
+        m_modeset_done = true;
+        // do_modeset_locked already committed with PAGE_FLIP_EVENT.
+        // Promote PENDING → SCANNING; old SCANNING (none) → RELEASING skipped.
+        pending->state = SlotState::SCANNING;
+        m_in_flight = true;
+        return true;
+    }
+
+    auto *req = drmModeAtomicAlloc();
+    if (!req)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicAlloc failed");
+        return false;
+    }
+
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, pending->fb_id);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, m_crtc_id);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, pending->w);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, pending->h);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, pending->w << 16);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, pending->h << 16);
+
+    constexpr uint32_t kFlipFlags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+    int ret = drmModeAtomicCommit(m_drm_fd, req, kFlipFlags, this);
+    drmModeAtomicFree(req);
+
+    if (ret != 0)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicCommit: %s (%d)", ::strerror(errno), errno);
+        return false;
+    }
+
+    // State transitions: SCANNING -> RELEASING, PENDING -> SCANNING.
+    auto *scanning = slot_by_state_locked(SlotState::SCANNING);
+    if (scanning)
+    {
+        scanning->state = SlotState::RELEASING;
+    }
+
+    pending->state = SlotState::SCANNING;
+    m_in_flight = true;
+    return true;
+}
+
+ClockEntry::ClockTP DRMDisplayBase::compute_submit_deadline()
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if (!slot_by_state_locked(SlotState::PENDING))
+    {
+        return {};
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    auto deadline =
+        (m_last_flip_tp == ClockEntry::ClockTP{}) ? now : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time;
+    if (deadline > now + m_frame_ns)
+    {
+        deadline = now;
+    }
+
+    return deadline;
+}
+
+void DRMDisplayBase::drain_flip_event()
+{
+    drmEventContext evctx{};
+    evctx.version = DRM_EVENT_CONTEXT_VERSION;
+    evctx.page_flip_handler = on_page_flip_cb;
+
+    const int timeout_ms =
+        std::max(1, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(m_frame_ns / 2).count()));
+    struct pollfd pfd{m_drm_fd, POLLIN, 0};
+
+    if (::poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN))
+    {
+        drmHandleEvent(m_drm_fd, &evctx); // -> on_flip_done -> clears m_in_flight
+        m_in_flight_retries = 0;
+        return;
+    }
+
+    if (++m_in_flight_retries <= 8)
+    {
+        return;
+    }
+
+    VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, resetting", m_in_flight_retries);
+    std::lock_guard<std::mutex> lk(m_mutex);
+    m_in_flight = false;
+    m_in_flight_retries = 0;
+    m_last_flip_tp = ClockEntry::ClockTP{};
+    auto *rel = slot_by_state_locked(SlotState::RELEASING);
+    if (rel)
+    {
+        m_release_cb(rel->buf);
+        *rel = Slot{};
+    }
+}
+
+void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
+{
+    const auto hw_tp = ClockEntry::ClockTP{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
+    if (m_last_flip_tp != ClockEntry::ClockTP{})
+    {
+        auto interval = hw_tp - m_last_flip_tp;
+        m_frame_ns = m_frame_ns * 19 / 20 + interval / 20;
+    }
+
+    m_last_flip_tp = hw_tp;
+
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        auto *rel = slot_by_state_locked(SlotState::RELEASING);
+        if (rel)
+        {
+            m_release_cb(rel->buf);
+            *rel = Slot{};
+        }
+        m_in_flight = false;
+    }
+
+    // Wake the event loop so it can service any queued PENDING frame.
+    m_cv.notify_one();
+}
+
+void DRMDisplayBase::event_thread_fn()
+{
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> lk(m_mutex);
+            m_cv.wait(lk, [this] {
+                return m_stopped.load(std::memory_order_acquire) || m_in_flight ||
+                       slot_by_state_locked(SlotState::PENDING) != nullptr;
+            });
+        }
+
+        if (m_stopped.load(std::memory_order_acquire))
+        {
+            break;
+        }
+
+        if (m_in_flight)
+        {
+            drain_flip_event();
+            continue; // re-enter loop to re-check m_in_flight / m_stopped
+        }
+
+        const auto submit_at = compute_submit_deadline();
+        if (submit_at == ClockEntry::ClockTP{})
+        {
+            continue; // PENDING was evicted while we waited
+        }
+
+        m_submit_timer.reset();
+
+        if (m_submit_timer.wait_until(submit_at) == -1)
+        {
+            continue;
+        }
+
+        if (m_stopped.load(std::memory_order_acquire))
+        {
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            if (!m_in_flight && slot_by_state_locked(SlotState::PENDING))
+            {
+                schedule_flip_locked();
+            }
         }
     }
-    return nullptr;
+}
+
+DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
+{
+    if (m_slots[0].state == s)
+    {
+        return &m_slots[0];
+    }
+    else if (m_slots[1].state == s)
+    {
+        return &m_slots[1];
+    }
+    else
+    {
+        return nullptr;
+    }
 }
 
 // ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────
@@ -724,7 +741,7 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
         VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: no AL_TPixMapMetaData");
         return false;
     }
-    const uint32_t drm_fmt = allegro_to_drm_fourcc(meta->tFourCC);
+    const uint32_t drm_fmt = fourcc_to_drm_fourcc(meta->tFourCC);
     if (!drm_fmt)
     {
         VIDEO_ERROR_PRINT("DRMDisplay::prepare_fb: unsupported pixel format 0x%08X", meta->tFourCC);
