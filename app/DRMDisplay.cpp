@@ -5,7 +5,6 @@ extern "C"
 #include "lib_common/BufferAPI.h"
 #include "lib_common/BufferPixMapMeta.h"
 #include "lib_common/FourCC.h"
-#include "lib_decode/lib_decode.h"
 #include "lib_fpga/DmaAllocLinux.h"
 #include "lib_rtos/message.h"
 }
@@ -31,8 +30,6 @@ extern "C"
 #define DRM_FORMAT_XV20 fourcc_code('X', 'V', '2', '0')
 #endif
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 static uint32_t allegro_to_drm_fourcc(uint32_t al_fourcc)
 {
     switch (al_fourcc)
@@ -45,8 +42,6 @@ static uint32_t allegro_to_drm_fourcc(uint32_t al_fourcc)
         return DRM_FORMAT_NV16;
     case FOURCC(XV20):
         return DRM_FORMAT_XV20;
-    case FOURCC(NV24):
-        return DRM_FORMAT_NV24;
     default:
         return 0;
     }
@@ -58,7 +53,9 @@ static drmModeConnector *find_first_connected_connector(int fd, drmModeRes *res)
     {
         auto *conn = drmModeGetConnector(fd, res->connectors[i]);
         if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0)
+        {
             return conn;
+        }
         drmModeFreeConnector(conn);
     }
     return nullptr;
@@ -70,7 +67,9 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res, drmModeConn
     {
         auto *enc = drmModeGetEncoder(fd, conn->encoders[e]);
         if (!enc)
+        {
             continue;
+        }
         uint32_t crtc_id = enc->crtc_id;
         uint32_t possible = enc->possible_crtcs;
         drmModeFreeEncoder(enc);
@@ -82,7 +81,9 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res, drmModeConn
                 if (res->crtcs[c] == crtc_id)
                 {
                     if (pipe)
+                    {
                         *pipe = c;
+                    }
                     return drmModeGetCrtc(fd, crtc_id);
                 }
             }
@@ -93,7 +94,9 @@ static drmModeCrtc *find_crtc_for_connector(int fd, drmModeRes *res, drmModeConn
             if (idx < res->count_crtcs)
             {
                 if (pipe)
+                {
                     *pipe = idx;
+                }
                 return drmModeGetCrtc(fd, res->crtcs[idx]);
             }
         }
@@ -120,7 +123,9 @@ static drmModePlane *find_plane_for_crtc(int fd, drmModePlaneRes *pres, int pipe
             {
                 auto *prop = drmModeGetProperty(fd, props->props[p]);
                 if (prop && std::strcmp(prop->name, "type") == 0)
+                {
                     plane_type = static_cast<int>(props->prop_values[p]);
+                }
                 drmModeFreeProperty(prop);
             }
             drmModeFreeObjectProperties(props);
@@ -131,9 +136,13 @@ static drmModePlane *find_plane_for_crtc(int fd, drmModePlaneRes *pres, int pipe
             return plane;
         }
         if (!fallback)
+        {
             fallback = plane;
+        }
         else
+        {
             drmModeFreePlane(plane);
+        }
     }
     return fallback;
 }
@@ -142,26 +151,30 @@ static uint32_t get_prop_id(int fd, uint32_t obj_id, uint32_t obj_type, const ch
 {
     auto *props = drmModeObjectGetProperties(fd, obj_id, obj_type);
     if (!props)
+    {
         return 0;
+    }
     uint32_t id = 0;
     for (uint32_t i = 0; i < props->count_props && !id; ++i)
     {
         auto *prop = drmModeGetProperty(fd, props->props[i]);
         if (prop && std::strcmp(prop->name, name) == 0)
+        {
             id = prop->prop_id;
+        }
         drmModeFreeProperty(prop);
     }
     drmModeFreeObjectProperties(props);
     return id;
 }
 
-// ── Construction / destruction ────────────────────────────────────────────────
-
 DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback release_cb)
     : m_cfg(cfg), m_release_cb(std::move(release_cb))
 {
     if (!m_release_cb)
+    {
         throw std::invalid_argument("DRMDisplay: release_cb must not be null");
+    }
 
     init_drm();
     m_event_thread = std::thread(&DRMDisplayBase::event_thread_fn, this);
@@ -170,62 +183,28 @@ DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback
 DRMDisplayBase::~DRMDisplayBase()
 {
     stop();
-
     if (m_mode_blob_id)
-        drmModeDestroyPropertyBlob(m_drm_fd, m_mode_blob_id);
-
-    close_drm();
-}
-
-// ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────
-
-static DRMDisplayBase::FrameReleaseCallback wrap_typed_cb(DRMDisplay::TypedReleaseCallback cb)
-{
-    if (!cb)
-        return {}; // null FrameReleaseCallback → base ctor throws std::invalid_argument
-    return [cb = std::move(cb)](void *key) { cb(static_cast<AL_TBuffer *>(key)); };
-}
-
-DRMDisplay::DRMDisplay(const DRMDisplayConfig &cfg, TypedReleaseCallback release_cb)
-    : DRMDisplayBase(cfg, wrap_typed_cb(std::move(release_cb)))
-{
-}
-
-DRMDisplay::~DRMDisplay()
-{
-    // Stop the event thread before touching DRM objects it may reference.
-    stop();
-
-    std::lock_guard<std::mutex> lk(m_cache_mutex);
-    for (auto &kv : m_fb_cache)
     {
-        auto &fb = kv.second;
-        if (fb.fb_id)
-            drmModeRmFB(drm_fd(), fb.fb_id);
-        for (int k = 0; k < fb.num_gem; ++k)
-        {
-            if (fb.gem_handles[k])
-            {
-                drm_gem_close ca{};
-                ca.handle = fb.gem_handles[k];
-                drmIoctl(drm_fd(), DRM_IOCTL_GEM_CLOSE, &ca);
-            }
-        }
+        drmModeDestroyPropertyBlob(m_drm_fd, m_mode_blob_id);
     }
+    close_drm();
 }
 
 void DRMDisplayBase::stop()
 {
     if (m_stopped.exchange(true, std::memory_order_acq_rel))
+    {
         return;
+    }
 
     m_submit_timer.cancel();
     m_cv.notify_all();
 
     if (m_event_thread.joinable())
+    {
         m_event_thread.join();
+    }
 
-    // Release any frames still held in slots.
     std::lock_guard<std::mutex> lk(m_mutex);
     for (auto &s : m_slots)
     {
@@ -236,33 +215,6 @@ void DRMDisplayBase::stop()
         }
     }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
-
-void DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info)
-{
-    if (m_stopped.load(std::memory_order_acquire))
-    {
-        m_release_cb(frame);
-        return;
-    }
-    if (!frame)
-        return;
-
-    const auto w = static_cast<uint32_t>(info.tDim.iWidth);
-    const auto h = static_cast<uint32_t>(info.tDim.iHeight);
-
-    uint32_t fb_id = 0;
-    if (!prepare_fb(frame, w, h, fb_id))
-    {
-        m_release_cb(frame);
-        return;
-    }
-
-    submit(frame, fb_id, w, h);
-}
-
-// ── DRMDisplayBase::submit (protected) ───────────────────────────────────────
 
 void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
 {
@@ -295,8 +247,6 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
     m_cv.notify_one();
 }
 
-// ── Event thread ──────────────────────────────────────────────────────────────
-
 void DRMDisplayBase::event_thread_fn()
 {
     drmEventContext evctx{};
@@ -305,7 +255,6 @@ void DRMDisplayBase::event_thread_fn()
 
     while (true)
     {
-        // ── ① Wait for work ───────────────────────────────────────────────
         {
             std::unique_lock<std::mutex> lk(m_mutex);
             m_cv.wait(lk, [this] {
@@ -315,11 +264,10 @@ void DRMDisplayBase::event_thread_fn()
         }
 
         if (m_stopped.load(std::memory_order_acquire))
+        {
             break;
+        }
 
-        // ── ② Drain in-flight flip event ──────────────────────────────────
-        // Timeout adapts to half the current frame interval so we don't
-        // over-sleep at low frame rates or spin too tightly at high ones.
         if (m_in_flight)
         {
             const int timeout_ms = std::max(
@@ -332,16 +280,9 @@ void DRMDisplayBase::event_thread_fn()
             }
             else if (++m_in_flight_retries > 8)
             {
-                // Watchdog: hardware has not delivered a flip event for ~4 frame
-                // intervals. This indicates a driver stall or display disconnect.
-                // Reset in-flight state so new frames can be submitted again.
-                VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, "
-                                  "resetting in-flight state",
+                VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, resetting in-flight state",
                                   m_in_flight_retries);
-                // Recover any RELEASING slot: the commit was issued so the hardware
-                // is done with the previous buffer even if the event was lost.
-                // The SCANNING slot is left as-is — freeing a buffer the display
-                // controller may still be reading would cause visual corruption.
+
                 std::lock_guard<std::mutex> lk(m_mutex);
                 m_in_flight = false;
                 m_in_flight_retries = 0;
@@ -356,7 +297,6 @@ void DRMDisplayBase::event_thread_fn()
             continue; // re-evaluate state at top of loop
         }
 
-        // ── ③ PENDING frame present — compute vblank submit deadline ──────
         TimePoint submit_at;
         {
             std::lock_guard<std::mutex> lk(m_mutex);
@@ -373,31 +313,30 @@ void DRMDisplayBase::event_thread_fn()
                             ? now                                                   // first frame: submit immediately
                             : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time; // subsequent: align to vblank
             if (submit_at > now + m_frame_ns)
+            {
                 submit_at = now;
+            }
         }
-
-        // ── ④ Wait until submit deadline ─────────────────────────────────
-        // No flip is in-flight at this point (m_in_flight == false), so there
-        // are no DRM events to drain during the wait. ClockEntry uses
-        // CLOCK_MONOTONIC and is cancellable via stop(), so it covers the
-        // full frame interval directly — no separate coarse/fine split needed.
         m_submit_timer.reset();
         if (m_submit_timer.wait_until(submit_at) == -1)
+        {
             continue; // cancelled (stop signal)
+        }
 
         if (m_stopped.load(std::memory_order_acquire))
+        {
             break;
+        }
 
-        // ── ⑤ Commit ──────────────────────────────────────────────────────
         {
             std::lock_guard<std::mutex> lk(m_mutex);
             if (!m_in_flight && slot_by_state_locked(SlotState::PENDING))
+            {
                 schedule_flip_locked();
+            }
         }
     }
 }
-
-// ── Flip completion callback ──────────────────────────────────────────────────
 
 void DRMDisplayBase::on_page_flip_cb(int /*fd*/, unsigned /*seq*/, unsigned tv_sec, unsigned tv_usec, void *user_data)
 {
@@ -411,7 +350,6 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
     // This is more accurate than SteadyClock::now() because it reflects the
     // actual vblank moment, not the scheduling delay until this callback runs.
     const TimePoint hw_tp = TimePoint{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
-
     // Update vblank interval EMA (event thread only — no lock needed for timing).
     if (m_last_flip_tp != TimePoint{})
     {
@@ -437,14 +375,13 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
     m_cv.notify_one();
 }
 
-// ── schedule_flip_locked ──────────────────────────────────────────────────────
-//  Precondition: m_mutex held, !m_in_flight, PENDING slot exists.
-
 bool DRMDisplayBase::schedule_flip_locked()
 {
     Slot *pending = slot_by_state_locked(SlotState::PENDING);
     if (!pending)
+    {
         return false;
+    }
 
     // First frame: full atomic modeset.
     if (!m_modeset_done)
@@ -496,14 +433,14 @@ bool DRMDisplayBase::schedule_flip_locked()
     // State transitions: SCANNING → RELEASING, PENDING → SCANNING.
     Slot *scanning = slot_by_state_locked(SlotState::SCANNING);
     if (scanning)
+    {
         scanning->state = SlotState::RELEASING;
+    }
 
     pending->state = SlotState::SCANNING;
     m_in_flight = true;
     return true;
 }
-
-// ── do_modeset_locked ─────────────────────────────────────────────────────────
 
 bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
 {
@@ -531,7 +468,9 @@ bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
     }
 
     if (m_mode_blob_id)
+    {
         drmModeDestroyPropertyBlob(m_drm_fd, m_mode_blob_id);
+    }
     m_mode_blob_id = blob_id;
 
     auto *req = drmModeAtomicAlloc();
@@ -571,20 +510,16 @@ bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
     return true;
 }
 
-// ── init_drm ──────────────────────────────────────────────────────────────────
-
 void DRMDisplayBase::init_drm()
 {
     m_drm_fd = ::open(m_cfg.drm_device.c_str(), O_RDWR | O_CLOEXEC);
     if (m_drm_fd < 0)
+    {
         throw std::runtime_error("DRMDisplay: cannot open '" + m_cfg.drm_device + "': " + ::strerror(errno));
+    }
 
     drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-    // Use CLOCK_MONOTONIC for page-flip event timestamps so they are
-    // directly comparable with SteadyClock (also CLOCK_MONOTONIC).
-    drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_TIMESTAMP_MONOTONIC, 1);
 
-    // ── Require Atomic API ────────────────────────────────────────────────
     if (drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
     {
         close_drm();
@@ -592,7 +527,6 @@ void DRMDisplayBase::init_drm()
                                  "DRM_CLIENT_CAP_ATOMIC");
     }
 
-    // ── Enumerate resources ───────────────────────────────────────────────
     auto *res = drmModeGetResources(m_drm_fd);
     if (!res)
     {
@@ -600,7 +534,6 @@ void DRMDisplayBase::init_drm()
         throw std::runtime_error("DRMDisplay: drmModeGetResources failed");
     }
 
-    // Connector
     drmModeConnector *conn = (m_cfg.connector_id >= 0)
                                  ? drmModeGetConnector(m_drm_fd, static_cast<uint32_t>(m_cfg.connector_id))
                                  : find_first_connected_connector(m_drm_fd, res);
@@ -614,7 +547,6 @@ void DRMDisplayBase::init_drm()
     }
     m_conn_id = conn->connector_id;
 
-    // CRTC
     drmModeCrtc *crtc = nullptr;
     if (m_cfg.crtc_id >= 0)
     {
@@ -642,7 +574,6 @@ void DRMDisplayBase::init_drm()
     m_crtc_id = crtc->crtc_id;
     drmModeFreeCrtc(crtc);
 
-    // Plane
     auto *pres = drmModeGetPlaneResources(m_drm_fd);
     if (!pres)
     {
@@ -656,9 +587,11 @@ void DRMDisplayBase::init_drm()
     }
     else
     {
-        plane = find_plane_for_crtc(m_drm_fd, pres, m_pipe, DRM_PLANE_TYPE_OVERLAY);
+        plane = find_plane_for_crtc(m_drm_fd, pres, m_pipe, DRM_PLANE_TYPE_PRIMARY);
         if (!plane)
-            plane = find_plane_for_crtc(m_drm_fd, pres, m_pipe, DRM_PLANE_TYPE_PRIMARY);
+        {
+            plane = find_plane_for_crtc(m_drm_fd, pres, m_pipe, DRM_PLANE_TYPE_OVERLAY);
+        }
     }
     drmModeFreePlaneResources(pres);
     if (!plane)
@@ -669,7 +602,6 @@ void DRMDisplayBase::init_drm()
     m_plane_id = plane->plane_id;
     drmModeFreePlane(plane);
 
-    // ── Query property IDs ────────────────────────────────────────────────
     auto gp_plane = [&](const char *n) { return get_prop_id(m_drm_fd, m_plane_id, DRM_MODE_OBJECT_PLANE, n); };
     auto gp_crtc = [&](const char *n) { return get_prop_id(m_drm_fd, m_crtc_id, DRM_MODE_OBJECT_CRTC, n); };
     auto gp_conn = [&](const char *n) { return get_prop_id(m_drm_fd, m_conn_id, DRM_MODE_OBJECT_CONNECTOR, n); };
@@ -710,6 +642,72 @@ void DRMDisplayBase::close_drm()
         ::close(m_drm_fd);
         m_drm_fd = -1;
     }
+}
+
+DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
+{
+    for (auto &slot : m_slots)
+    {
+        if (slot.state == s)
+        {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+// ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────
+
+DRMDisplay::DRMDisplay(const DRMDisplayConfig &cfg, TypedReleaseCallback release_cb)
+    : DRMDisplayBase(cfg, [release_cb](void *key) { release_cb(static_cast<AL_TBuffer *>(key)); })
+{
+}
+
+DRMDisplay::~DRMDisplay()
+{
+    stop();
+
+    std::lock_guard<std::mutex> lk(m_cache_mutex);
+    for (auto &kv : m_fb_cache)
+    {
+        auto &fb = kv.second;
+        if (fb.fb_id)
+        {
+            drmModeRmFB(m_drm_fd, fb.fb_id);
+        }
+        for (int k = 0; k < fb.num_gem; ++k)
+        {
+            if (fb.gem_handles[k])
+            {
+                drm_gem_close ca{};
+                ca.handle = fb.gem_handles[k];
+                drmIoctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &ca);
+            }
+        }
+    }
+}
+
+void DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info)
+{
+    if (m_stopped.load(std::memory_order_acquire))
+    {
+        m_release_cb(frame);
+        return;
+    }
+    if (!frame)
+        return;
+
+    const auto w = static_cast<uint32_t>(info.tDim.iWidth);
+    const auto h = static_cast<uint32_t>(info.tDim.iHeight);
+
+    uint32_t fb_id = 0;
+    if (!prepare_fb(frame, w, h, fb_id))
+    {
+        m_release_cb(frame);
+        return;
+    }
+
+    submit(frame, fb_id, w, h);
 }
 
 // ── DRMDisplay::prepare_fb (DMA-buf import) ──────────────────────────────────
@@ -821,17 +819,19 @@ cleanup:
     return false;
 }
 
-// ── Slot helper ───────────────────────────────────────────────────────────────
-
-DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
+static void fill_rgb888(void *vaddr, uint32_t pitch, uint32_t width, uint32_t height, uint8_t r, uint8_t g, uint8_t b)
 {
-    for (auto &slot : m_slots)
-        if (slot.state == s)
-            return &slot;
-    return nullptr;
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        uint8_t *row = static_cast<uint8_t *>(vaddr) + y * pitch;
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            row[x * 3 + 0] = b; // B
+            row[x * 3 + 1] = g; // G
+            row[x * 3 + 2] = r; // R
+        }
+    }
 }
-
-// ── DRMDisplayDumb ─────────────────────────────────────────────────────────────────
 
 DRMDisplayDumb::DRMDisplayDumb(const DRMDisplayConfig &cfg, uint32_t width, uint32_t height,
                                FrameReleaseCallback release_cb)
@@ -869,9 +869,11 @@ void DRMDisplayDumb::alloc_dumb_bufs()
         drm_mode_create_dumb create{};
         create.width = m_width;
         create.height = m_height;
-        create.bpp = 32; // XRGB8888
-        if (drmIoctl(drm_fd(), DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0)
+        create.bpp = 24; // RG24
+        if (drmIoctl(m_drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0)
+        {
             throw std::runtime_error(std::string("DRMDisplayDumb: CREATE_DUMB: ") + ::strerror(errno));
+        }
 
         b.gem_handle = create.handle;
         b.pitch = create.pitch;
@@ -880,16 +882,19 @@ void DRMDisplayDumb::alloc_dumb_bufs()
         uint32_t handles[4] = {create.handle};
         uint32_t pitches[4] = {create.pitch};
         uint32_t offsets[4] = {};
-        if (drmModeAddFB2(drm_fd(), m_width, m_height, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &b.fb_id, 0) !=
-            0)
+        if (drmModeAddFB2(m_drm_fd, m_width, m_height, DRM_FORMAT_RGB888, handles, pitches, offsets, &b.fb_id, 0))
+        {
             throw std::runtime_error(std::string("DRMDisplayDumb: AddFB2: ") + ::strerror(errno));
+        }
 
         drm_mode_map_dumb map_dumb{};
         map_dumb.handle = create.handle;
-        if (drmIoctl(drm_fd(), DRM_IOCTL_MODE_MAP_DUMB, &map_dumb) != 0)
+        if (drmIoctl(m_drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb))
+        {
             throw std::runtime_error(std::string("DRMDisplayDumb: MAP_DUMB: ") + ::strerror(errno));
+        }
 
-        b.mapped = ::mmap(nullptr, static_cast<size_t>(b.size), PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd(),
+        b.mapped = ::mmap(nullptr, static_cast<size_t>(b.size), PROT_READ | PROT_WRITE, MAP_SHARED, m_drm_fd,
                           static_cast<off_t>(map_dumb.offset));
         if (b.mapped == MAP_FAILED)
         {
@@ -897,9 +902,10 @@ void DRMDisplayDumb::alloc_dumb_bufs()
             throw std::runtime_error(std::string("DRMDisplayDumb: mmap: ") + ::strerror(errno));
         }
 
-        auto *px = static_cast<uint32_t *>(b.mapped);
-        for (uint64_t p = 0; p < b.size / 4; ++p)
-            px[p] = kColours[i];
+        fill_rgb888(b.mapped, b.pitch, m_width, m_height,
+                    (kColours[i] >> 16) & 0xFF, // R
+                    (kColours[i] >> 8) & 0xFF,  // G
+                    (kColours[i] >> 0) & 0xFF); // B
 
         VIDEO_DEBUG_PRINT("DRMDisplayDumb: buf[%d] gem=%u fb=%u pitch=%u size=%llu", i, b.gem_handle, b.fb_id, b.pitch,
                           static_cast<unsigned long long>(b.size));
@@ -917,14 +923,14 @@ void DRMDisplayDumb::free_dumb_bufs() noexcept
         }
         if (b.fb_id)
         {
-            drmModeRmFB(drm_fd(), b.fb_id);
+            drmModeRmFB(m_drm_fd, b.fb_id);
             b.fb_id = 0;
         }
         if (b.gem_handle)
         {
             drm_mode_destroy_dumb dd{};
             dd.handle = b.gem_handle;
-            drmIoctl(drm_fd(), DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+            drmIoctl(m_drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
             b.gem_handle = 0;
         }
     }

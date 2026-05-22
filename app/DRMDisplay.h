@@ -3,11 +3,12 @@
 
 #include "lib_network/clock_wait.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdint>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,7 +26,7 @@ struct DRMDisplayConfig
     /// How far before the predicted vblank to submit the atomic commit.
     /// Smaller = lower latency but higher risk of missing the vblank window.
     /// Default: 1 ms — safe for most hardware.
-    std::chrono::nanoseconds submit_lead_time{1'000'000LL};
+    std::chrono::nanoseconds submit_lead_time{2'000'000LL};
 };
 
 /**
@@ -71,20 +72,13 @@ class DRMDisplayBase
     void stop();
 
   protected:
-    /** Returns the open DRM file descriptor. Valid between construction and destruction. */
-    int drm_fd() const
-    {
-        return m_drm_fd;
-    }
-
     /** Enqueue a pre-resolved frame into the display pipeline. Never blocks.
      *  key   : opaque handle returned to FrameReleaseCallback when the frame is retired.
      *  fb_id : registered DRM framebuffer (caller is responsible for its lifetime).
      */
     void submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h);
 
-  private:
-    // ── Slot state machine ────────────────────────────────────────────────
+  protected:
     enum class SlotState
     {
         FREE,
@@ -144,35 +138,28 @@ class DRMDisplayBase
     ConnProps m_conn_props{};
 
     Slot m_slots[2];
-    bool m_in_flight{false}; ///< True while an atomic commit is outstanding.
-    std::mutex m_mutex;      ///< Guards m_slots and m_in_flight.
+    bool m_in_flight{false};
+    std::mutex m_mutex;
     std::condition_variable m_cv;
 
-    // ── Vblank timing (event thread only — no lock needed) ────────────────
     using SteadyClock = std::chrono::steady_clock;
     using TimePoint = SteadyClock::time_point;
     using Nanos = std::chrono::nanoseconds;
 
     TimePoint m_last_flip_tp{};
-    Nanos m_frame_ns{16'666'666LL}; ///< EMA of vblank interval; default = 60 fps.
-    int m_in_flight_retries{0};     ///< Consecutive poll timeouts while in-flight (watchdog counter).
+    Nanos m_frame_ns{16'666'666LL};
+    int m_in_flight_retries{0};
 
-    // ── Thread management ─────────────────────────────────────────────────
     std::atomic<bool> m_stopped{false};
     std::thread m_event_thread;
     ClockEntry m_submit_timer;
 };
 
-// ── DRMDisplay: Allegro VCU DMA-buf zero-copy ──────────────────────────────────────
-
-// Forward declarations — full definitions are included in DRMDisplay.cpp.
-// This avoids pulling heavy Allegro C headers into every translation unit that
-// only needs the DRMDisplay interface.
-struct AL_TBuffer;
-struct AL_TInfoDecode;
-
-#include <array>
-#include <map>
+extern "C"
+{
+#include "lib_common/BufferAPI.h"
+#include "lib_decode/lib_decode.h"
+}
 
 /**
  * @brief DRM/KMS display for Xilinx VCU decoded frames — DMA-buf zero-copy import.
@@ -205,8 +192,6 @@ class DRMDisplay : public DRMDisplayBase
     std::map<AL_TBuffer *, CachedFB> m_fb_cache;
     std::mutex m_cache_mutex;
 };
-
-// ── DRMDisplayDumb: kernel dumb-buffer (CPU-accessible XRGB8888) ──────────────────
 
 /**
  * @brief DRM display subclass backed by kernel dumb buffers (CPU-accessible XRGB8888).

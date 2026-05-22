@@ -46,7 +46,17 @@ target_link_libraries(vcu_enc_v4l2 PRIVATE liballegro_encode_static)
 add_executable(vcu_dec
     ${APP_COMMON_SRC}
     ${APP_DEC_SRC}
+     $<TARGET_OBJECTS:lib_network_obj>
 )
-target_link_libraries(vcu_dec PRIVATE liballegro_decode_static ${LIBDRM_LIBRARIES})
+target_link_libraries(vcu_dec PRIVATE liballegro_decode_static ${LIBDRM_LIBRARIES} )
 target_include_directories(vcu_dec PRIVATE ${LIBDRM_INCLUDE_DIRS})
+
+add_executable(dumb_test
+    ${APP_COMMON_SRC}
+    DRMDisplay.cpp
+    DRMDumbTest.cpp
+     $<TARGET_OBJECTS:lib_network_obj>
+)
+target_link_libraries(dumb_test PRIVATE liballegro_decode_static ${LIBDRM_LIBRARIES} )
+target_include_directories(dumb_test PRIVATE ${LIBDRM_INCLUDE_DIRS})
 
