@@ -347,7 +347,11 @@ void DRMDisplayBase::event_thread_fn()
                 m_in_flight_retries = 0;
                 m_last_flip_tp = TimePoint{}; // invalidate stale vblank reference
                 Slot *rel = slot_by_state_locked(SlotState::RELEASING);
-                if (rel) { m_release_cb(rel->buf); *rel = Slot{}; }
+                if (rel)
+                {
+                    m_release_cb(rel->buf);
+                    *rel = Slot{};
+                }
             }
             continue; // re-evaluate state at top of loop
         }
