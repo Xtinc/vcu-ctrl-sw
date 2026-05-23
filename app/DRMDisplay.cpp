@@ -18,6 +18,8 @@ extern "C"
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -29,6 +31,60 @@ extern "C"
 #ifndef DRM_FORMAT_XV20
 #define DRM_FORMAT_XV20 fourcc_code('X', 'V', '2', '0')
 #endif
+
+static int score_drm_mode(const drmModeModeInfo *m, int desired_width, int desired_height, int desired_refresh)
+{
+    if (desired_width > 0 && m->hdisplay != static_cast<uint16_t>(desired_width))
+        return INT_MIN;
+    if (desired_height > 0 && m->vdisplay != static_cast<uint16_t>(desired_height))
+        return INT_MIN;
+
+    int s = (m->type & DRM_MODE_TYPE_PREFERRED) ? 100 : 0;
+    if (desired_refresh > 0)
+    {
+        int d = static_cast<int>(m->vrefresh) - desired_refresh;
+        s += 200 - std::min(d < 0 ? -d : d, 200);
+    }
+    else
+    {
+        s += static_cast<int>(m->vrefresh);
+    }
+    return s;
+}
+
+/// Select the best drmModeModeInfo from \p conn based on the caller's preferences.
+/// Falls back to the PREFERRED flag, then to the first mode if nothing else matches.
+/// Returns nullptr only when \p conn has no modes at all.
+static const drmModeModeInfo *select_best_mode(const drmModeConnector *conn, int desired_width, int desired_height,
+                                               int desired_refresh)
+{
+    const drmModeModeInfo *best = nullptr;
+    int best_score = INT_MIN;
+
+    for (int i = 0; i < conn->count_modes; ++i)
+    {
+        int s = score_drm_mode(&conn->modes[i], desired_width, desired_height, desired_refresh);
+        if (s > best_score)
+        {
+            best_score = s;
+            best = &conn->modes[i];
+        }
+    }
+
+    // Fallback when the dimension filter rejected every mode.
+    if (!best || best_score == INT_MIN)
+    {
+        for (int i = 0; i < conn->count_modes; ++i)
+            if (conn->modes[i].type & DRM_MODE_TYPE_PREFERRED)
+            {
+                return &conn->modes[i];
+            }
+        if (conn->count_modes > 0)
+            return &conn->modes[0];
+        return nullptr;
+    }
+    return best;
+}
 
 static uint32_t fourcc_to_drm_fourcc(uint32_t al_fourcc)
 {
@@ -189,6 +245,13 @@ DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback
     init_drm();
     m_adaptive_lead_time = m_cfg.submit_lead_time;
     m_event_thread = std::thread(&DRMDisplayBase::event_thread_fn, this);
+
+    sched_param sp{};
+    sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    if (::pthread_setschedparam(m_event_thread.native_handle(), SCHED_FIFO, &sp) != 0)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: failed to set real-time priority: %s", ::strerror(errno));
+    }
 }
 
 DRMDisplayBase::~DRMDisplayBase()
@@ -256,11 +319,6 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
     m_cv.notify_one();
 }
 
-int DRMDisplayBase::drm_fd() const
-{
-    return m_drm_fd;
-}
-
 void DRMDisplayBase::init_drm()
 {
     m_drm_fd = ::open(m_cfg.drm_device.c_str(), O_RDWR | O_CLOEXEC);
@@ -298,7 +356,25 @@ void DRMDisplayBase::init_drm()
                                      ? "DRMDisplay: connector " + std::to_string(m_cfg.connector_id) + " not found"
                                      : "DRMDisplay: no connected connector found");
     }
+
     m_conn_id = conn->connector_id;
+
+    {
+        const auto *best = select_best_mode(conn, m_cfg.desired_width, m_cfg.desired_height, m_cfg.desired_refresh);
+        if (best)
+        {
+            m_selected_mode = *best;
+            if (best->htotal && best->vtotal && best->clock)
+                m_frame_ns =
+                    ClockEntry::Nanos(static_cast<int64_t>(best->htotal) * best->vtotal * 1'000'000LL / best->clock);
+            VIDEO_DEBUG_PRINT("DRMDisplay: selected mode %dx%d@%uHz (clock=%ukHz) -> frame %.3f ms", best->hdisplay,
+                              best->vdisplay, best->vrefresh, best->clock, m_frame_ns.count() * 1e-6);
+        }
+        else
+        {
+            VIDEO_ERROR_PRINT("DRMDisplay: connector has no modes, modeset will fail");
+        }
+    }
 
     drmModeCrtc *crtc = nullptr;
     if (m_cfg.crtc_id >= 0)
@@ -405,22 +481,14 @@ void DRMDisplayBase::close_drm()
 
 bool DRMDisplayBase::do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h)
 {
-    auto *crtc = drmModeGetCrtc(m_drm_fd, m_crtc_id);
-    if (!crtc)
+    if (!m_selected_mode.hdisplay)
     {
-        VIDEO_ERROR_PRINT("DRMDisplay: drmModeGetCrtc failed for modeset");
-        return false;
-    }
-    if (!crtc->mode_valid)
-    {
-        drmModeFreeCrtc(crtc);
-        VIDEO_ERROR_PRINT("DRMDisplay: CRTC has no valid mode");
+        VIDEO_ERROR_PRINT("DRMDisplay: no display mode selected, cannot perform modeset");
         return false;
     }
 
     uint32_t blob_id = 0;
-    int ret = drmModeCreatePropertyBlob(m_drm_fd, &crtc->mode, sizeof(crtc->mode), &blob_id);
-    drmModeFreeCrtc(crtc);
+    int ret = drmModeCreatePropertyBlob(m_drm_fd, &m_selected_mode, sizeof(m_selected_mode), &blob_id);
     if (ret != 0)
     {
         VIDEO_ERROR_PRINT("DRMDisplay: drmModeCreatePropertyBlob: %s", ::strerror(errno));
@@ -591,20 +659,18 @@ void DRMDisplayBase::drain_flip_event()
 void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
 {
     const auto hw_tp = ClockEntry::ClockTP{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
-    if (m_last_flip_tp != ClockEntry::ClockTP{})
-    {
-        m_frame_ns = m_frame_ns * 19 / 20 + (hw_tp - m_last_flip_tp) / 20;
-    }
-
     m_last_flip_tp = hw_tp;
 
     if (m_commit_tp != ClockEntry::ClockTP{})
     {
         const auto commit_to_flip = hw_tp - m_commit_tp;
+        VIDEO_DEBUG_PRINT("DRMDisplay: commit -> flip %.1f ms, frame %.1f ms, lead_time %.1f ms",
+                          commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6,
+                          m_adaptive_lead_time.count() * 1e-6);
         if (commit_to_flip > m_adaptive_lead_time + m_frame_ns / 2)
         {
             const auto prev = m_adaptive_lead_time;
-            m_adaptive_lead_time = std::min(m_adaptive_lead_time + m_frame_ns / 8, m_frame_ns / 3);
+            m_adaptive_lead_time = std::min(m_adaptive_lead_time + m_frame_ns / 16, m_frame_ns / 3);
             VIDEO_ERROR_PRINT("DRMDisplay: vblank missed (commit -> flip %.1f ms, frame %.1f ms). "
                               "submit_lead_time %.1f ms -> %.1f ms.",
                               commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6, prev.count() * 1e-6,
