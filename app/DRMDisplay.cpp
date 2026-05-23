@@ -187,6 +187,7 @@ DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback
     }
 
     init_drm();
+    m_adaptive_lead_time = m_cfg.submit_lead_time;
     m_event_thread = std::thread(&DRMDisplayBase::event_thread_fn, this);
 }
 
@@ -269,7 +270,8 @@ void DRMDisplayBase::init_drm()
     }
 
     drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-    drmSetClientCap(m_drm_fd, DRM_CAP_TIMESTAMP_MONOTONIC, 1);
+    // DRM_CAP_TIMESTAMP_MONOTONIC is a device cap queried via drmGetCap, not a client cap.
+    // On Linux >= 3.x the vblank timestamps are always CLOCK_MONOTONIC; nothing to set.
 
     if (drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
     {
@@ -518,6 +520,8 @@ bool DRMDisplayBase::schedule_flip_locked()
         return false;
     }
 
+    m_commit_tp = std::chrono::steady_clock::now();
+
     // State transitions: SCANNING -> RELEASING, PENDING -> SCANNING.
     auto *scanning = slot_by_state_locked(SlotState::SCANNING);
     if (scanning)
@@ -540,7 +544,7 @@ ClockEntry::ClockTP DRMDisplayBase::compute_submit_deadline()
 
     const auto now = std::chrono::steady_clock::now();
     auto deadline =
-        (m_last_flip_tp == ClockEntry::ClockTP{}) ? now : m_last_flip_tp + m_frame_ns - m_cfg.submit_lead_time;
+        (m_last_flip_tp == ClockEntry::ClockTP{}) ? now : m_last_flip_tp + m_frame_ns - m_adaptive_lead_time;
     if (deadline > now + m_frame_ns)
     {
         deadline = now;
@@ -589,11 +593,34 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
     const auto hw_tp = ClockEntry::ClockTP{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
     if (m_last_flip_tp != ClockEntry::ClockTP{})
     {
-        auto interval = hw_tp - m_last_flip_tp;
-        m_frame_ns = m_frame_ns * 19 / 20 + interval / 20;
+        m_frame_ns = m_frame_ns * 19 / 20 + (hw_tp - m_last_flip_tp) / 20;
     }
 
     m_last_flip_tp = hw_tp;
+
+    if (m_commit_tp != ClockEntry::ClockTP{})
+    {
+        const auto commit_to_flip = hw_tp - m_commit_tp;
+        if (commit_to_flip > m_adaptive_lead_time + m_frame_ns / 2)
+        {
+            const auto prev = m_adaptive_lead_time;
+            m_adaptive_lead_time = std::min(m_adaptive_lead_time + m_frame_ns / 8, m_frame_ns / 3);
+            VIDEO_ERROR_PRINT("DRMDisplay: vblank missed (commit -> flip %.1f ms, frame %.1f ms). "
+                              "submit_lead_time %.1f ms -> %.1f ms.",
+                              commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6, prev.count() * 1e-6,
+                              m_adaptive_lead_time.count() * 1e-6);
+        }
+        else
+        {
+            const auto excess = m_adaptive_lead_time - m_cfg.submit_lead_time;
+            if (excess.count() > 0)
+            {
+                m_adaptive_lead_time -= excess / 100;
+            }
+        }
+
+        m_commit_tp = {};
+    }
 
     {
         std::lock_guard<std::mutex> lk(m_mutex);
@@ -606,7 +633,6 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
         m_in_flight = false;
     }
 
-    // Wake the event loop so it can service any queued PENDING frame.
     m_cv.notify_one();
 }
 

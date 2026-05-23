@@ -153,6 +153,8 @@ class DRMDisplayBase
     ClockEntry::ClockTP m_last_flip_tp{};
     ClockEntry::Nanos m_frame_ns{16'666'666LL};
     int m_in_flight_retries{0};
+    ClockEntry::ClockTP m_commit_tp{}; ///< steady_clock timestamp of the last drmModeAtomicCommit (flip, not modeset).
+    ClockEntry::Nanos m_adaptive_lead_time{}; ///< Auto-tuned submit lead time; starts at cfg.submit_lead_time.
 
     std::atomic<bool> m_stopped{false};
     std::thread m_event_thread;
