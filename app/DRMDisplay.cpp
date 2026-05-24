@@ -33,11 +33,17 @@ extern "C"
 #define DRM_FORMAT_XV20 fourcc_code('X', 'V', '2', '0')
 #endif
 
+static constexpr ClockEntry::Nanos kSubmitLeadMin{500'000LL};
+static constexpr ClockEntry::Nanos kPhaseTargetMarginMin{500'000LL};
+static constexpr ClockEntry::Nanos kPhaseTargetMarginMax{2'000'000LL};
+static constexpr ClockEntry::Nanos kPhaseDeadband{150'000LL};
+static constexpr int kFrameSmoothGain = 64;
+static constexpr int kPhaseStepDiv = 16;
+static constexpr int kPhaseLimitDiv = 4;
+
 static ClockEntry::Nanos compute_fixed_submit_lead(const DRMDisplayConfig &cfg, ClockEntry::Nanos frame_ns)
 {
-    const auto lead_min = ClockEntry::Nanos{500'000LL};
-    const auto lead_max = frame_ns / 3;
-    return std::min(std::max(cfg.submit_lead_time, lead_min), lead_max);
+    return std::min(std::max(cfg.submit_lead_time, kSubmitLeadMin), frame_ns / 3);
 }
 
 static int score_drm_mode(const drmModeModeInfo *m, int desired_width, int desired_height, int desired_refresh)
@@ -588,11 +594,6 @@ bool DRMDisplayBase::schedule_flip_locked()
     }
 
     m_commit_tp = std::chrono::steady_clock::now();
-    const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
-    const auto submit_to_commit = m_commit_tp - (m_last_flip_tp + m_frame_ns - lead_time + m_wait_phase_adjust);
-    VIDEO_DEBUG_PRINT("DRMDisplay: submit -> commit %.3f ms, frame %.3f ms, lead_time %.3f ms, phase_wait %.3f ms",
-                      submit_to_commit.count() * 1e-6, m_frame_ns.count() * 1e-6, lead_time.count() * 1e-6,
-                      m_wait_phase_adjust.count() * 1e-6);
 
     // State transitions: SCANNING -> RELEASING, PENDING -> SCANNING.
     auto *scanning = slot_by_state_locked(SlotState::SCANNING);
@@ -665,9 +666,6 @@ void DRMDisplayBase::drain_flip_event()
 void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
 {
     const auto hw_tp = ClockEntry::ClockTP{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
-    const auto cb_now_tp = std::chrono::steady_clock::now();
-    VIDEO_DEBUG_PRINT("DRMDisplay: cb now-hw %.3f ms",
-                      std::chrono::duration<double, std::milli>(cb_now_tp - hw_tp).count());
 
     const auto prev_flip_tp = m_last_flip_tp;
     m_last_flip_tp = hw_tp;
@@ -677,7 +675,7 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
         const auto observed_frame = std::chrono::duration_cast<ClockEntry::Nanos>(hw_tp - prev_flip_tp);
         if (observed_frame >= m_frame_ns / 2 && observed_frame <= m_frame_ns * 3 / 2)
         {
-            m_frame_ns += (observed_frame - m_frame_ns) / 64;
+            m_frame_ns += (observed_frame - m_frame_ns) / kFrameSmoothGain;
         }
     }
 
@@ -685,14 +683,8 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
     {
         const auto commit_to_flip = hw_tp - m_commit_tp;
         const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
-        const auto target_margin =
-            std::min(std::max(m_frame_ns / 16, ClockEntry::Nanos{800'000LL}), ClockEntry::Nanos{2'000'000LL});
-        const auto deadband = ClockEntry::Nanos{150'000LL};
-        const auto phase_limit = m_frame_ns / 4;
-
-        VIDEO_DEBUG_PRINT("DRMDisplay: commit -> flip %.1f ms, frame %.1f ms, lead_time %.1f ms, phase_wait %.1f ms",
-                          commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6, lead_time.count() * 1e-6,
-                          m_wait_phase_adjust.count() * 1e-6);
+        const auto target_margin = std::min(std::max(m_frame_ns / 16, kPhaseTargetMarginMin), kPhaseTargetMarginMax);
+        const auto phase_limit = m_frame_ns / kPhaseLimitDiv;
 
         if (commit_to_flip > lead_time + m_frame_ns / 2)
         {
@@ -700,7 +692,7 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
                               "advance phase_wait from %.1f ms.",
                               commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6,
                               m_wait_phase_adjust.count() * 1e-6);
-            m_wait_phase_adjust -= m_frame_ns / 16;
+            m_wait_phase_adjust -= m_frame_ns / kPhaseStepDiv;
             if (m_wait_phase_adjust < -phase_limit)
             {
                 m_wait_phase_adjust = -phase_limit;
@@ -709,9 +701,9 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
         else
         {
             const auto error = commit_to_flip - target_margin;
-            if (error > deadband || error < -deadband)
+            if (error > kPhaseDeadband || error < -kPhaseDeadband)
             {
-                m_wait_phase_adjust += error / 16;
+                m_wait_phase_adjust += error / kPhaseStepDiv;
                 if (m_wait_phase_adjust > phase_limit)
                 {
                     m_wait_phase_adjust = phase_limit;
@@ -769,22 +761,12 @@ void DRMDisplayBase::event_thread_fn()
             continue; // PENDING was evicted while we waited
         }
 
-        const auto now_before_wait = std::chrono::steady_clock::now();
-        const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
-        VIDEO_DEBUG_PRINT("DRMDisplay: wait submit_in %.3f ms (frame %.3f ms, lead_time %.3f ms, phase_wait %.3f ms)",
-                          std::chrono::duration<double, std::milli>(submit_at - now_before_wait).count(),
-                          m_frame_ns.count() * 1e-6, lead_time.count() * 1e-6, m_wait_phase_adjust.count() * 1e-6);
-
         m_submit_timer.reset();
 
         if (m_submit_timer.wait_until(submit_at) == -1)
         {
             continue;
         }
-
-        const auto wake_tp = std::chrono::steady_clock::now();
-        VIDEO_DEBUG_PRINT("DRMDisplay: woke %.3f ms after submit_at",
-                          std::chrono::duration<double, std::milli>(wake_tp - submit_at).count());
 
         if (m_stopped.load(std::memory_order_acquire))
         {
@@ -888,14 +870,31 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
         return false;
     }
 
-    // Fast path: cache hit.
+    // Fast path: cache hit with matching dimensions.
     {
         std::lock_guard<std::mutex> lk(m_cache_mutex);
         auto it = m_fb_cache.find(buf);
         if (it != m_fb_cache.end())
         {
-            out_fb_id = it->second.fb_id;
-            return true;
+            if (it->second.w == w && it->second.h == h)
+            {
+                out_fb_id = it->second.fb_id;
+                return true;
+            }
+            // Dimensions changed (stream resolution change within pool bounds) —
+            // unregister the stale framebuffer and close its GEM handles.
+            if (it->second.fb_id)
+                drmModeRmFB(m_drm_fd, it->second.fb_id);
+            for (int k = 0; k < it->second.num_gem; ++k)
+            {
+                if (it->second.gem_handles[k])
+                {
+                    drm_gem_close ca{};
+                    ca.handle = it->second.gem_handles[k];
+                    drmIoctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &ca);
+                }
+            }
+            m_fb_cache.erase(it);
         }
     }
 
@@ -961,6 +960,8 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
             std::lock_guard<std::mutex> lk(m_cache_mutex);
             CachedFB &cached = m_fb_cache[buf];
             cached.fb_id = fb_id;
+            cached.w = w;
+            cached.h = h;
             cached.num_gem = num_gem;
             for (int k = 0; k < num_gem; ++k)
                 cached.gem_handles[k] = gem_handles[k];

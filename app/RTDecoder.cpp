@@ -79,7 +79,7 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
         }
 
         m_cbbundles.displayCB = {&RTDecoder::sdk_display, this};
-        m_cbbundles.endDecodingCB = {nullptr, nullptr};
+        m_cbbundles.endDecodingCB = {&RTDecoder::sdk_end_decoding, this};
         m_cbbundles.resolutionFoundCB = {&RTDecoder::sdk_resolution_found, this};
         m_cbbundles.errorCB = {&RTDecoder::sdk_error, this};
         m_cbbundles.endParsingCB = {nullptr, nullptr};
@@ -97,7 +97,6 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
         {
             throw std::runtime_error("Failed to initialize stream buffer pool");
         }
-
     }
     catch (...)
     {
@@ -192,6 +191,19 @@ AL_ERR RTDecoder::sdk_resolution_found(int iBufferNumber, AL_TStreamSettings con
     }
 }
 
+void RTDecoder::sdk_end_decoding(AL_TBuffer *pDecodedFrame, void *pUserParam)
+{
+    auto *self = static_cast<RTDecoder *>(pUserParam);
+    try
+    {
+        self->on_sdk_end_decoding(pDecodedFrame);
+    }
+    catch (...)
+    {
+        self->signal_error(AL_ERROR);
+    }
+}
+
 void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam)
 {
     auto *self = static_cast<RTDecoder *>(pUserParam);
@@ -208,6 +220,11 @@ void RTDecoder::sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUs
 void RTDecoder::sdk_error(AL_ERR eError, void *pUserParam)
 {
     static_cast<RTDecoder *>(pUserParam)->on_sdk_error(eError);
+}
+
+void RTDecoder::on_sdk_end_decoding(AL_TBuffer *pDecodedFrame)
+{
+    (void)pDecodedFrame;
 }
 
 AL_ERR RTDecoder::on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,

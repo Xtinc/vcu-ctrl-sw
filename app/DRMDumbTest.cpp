@@ -8,15 +8,19 @@ extern "C"
 #include <chrono>
 #include <thread>
 
-DRMDumbTest::DRMDumbTest(const Config &cfg) : m_cfg(cfg)
+DRMDumbTest::DRMDumbTest(const DRMDisplayConfig &cfg) : m_cfg(cfg)
 {
-    m_display = std::make_unique<DRMDisplayDumb>(cfg.drm, cfg.width, cfg.height, [](void *) {});
+    m_display = std::make_unique<DRMDisplayDumb>(cfg,
+                                                static_cast<uint32_t>(cfg.desired_width  ? cfg.desired_width  : 1920),
+                                                static_cast<uint32_t>(cfg.desired_height ? cfg.desired_height : 1080),
+                                                [](void *) {});
 }
 
 void DRMDumbTest::run(uint32_t frames)
 {
     using namespace std::chrono;
-    const nanoseconds frame_interval{1'000'000'000LL / m_cfg.fps};
+    const int fps = m_cfg.desired_refresh > 0 ? m_cfg.desired_refresh : 60;
+    const nanoseconds frame_interval{1'000'000'000LL / fps};
 
     auto next = steady_clock::now();
     auto stat_start = next;
@@ -42,9 +46,11 @@ void DRMDumbTest::run(uint32_t frames)
 
 int main(int, char **)
 {
-    DRMDumbTest::Config cfg;
-    cfg.drm.drm_device = "/dev/dri/card0";
-    cfg.fps = 60;
+    DRMDisplayConfig cfg;
+    cfg.drm_device      = "/dev/dri/card0";
+    cfg.desired_width   = 1920;
+    cfg.desired_height  = 1080;
+    cfg.desired_refresh = 60;
     DRMDumbTest test(cfg);
     test.run(600); // ~10 seconds
     return 0;

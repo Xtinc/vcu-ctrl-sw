@@ -193,10 +193,12 @@ class RTDecoder
   private:
     static AL_ERR sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                        AL_TCropInfo const *pCropInfo, void *pUserParam);
+    static void sdk_end_decoding(AL_TBuffer *pDecodedFrame, void *pUserParam);
     static void sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo, void *pUserParam);
     static void sdk_error(AL_ERR eError, void *pUserParam);
     AL_ERR on_sdk_resolution_found(int iBufferNumber, AL_TStreamSettings const *pStreamSettings,
                                    AL_TCropInfo const *pCropInfo);
+    void on_sdk_end_decoding(AL_TBuffer *pDecodedFrame);
     void on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo);
     void on_sdk_error(AL_ERR eError);
 
@@ -205,9 +207,9 @@ class RTDecoder
     bool attach_display_metadata(AL_TBuffer *pDecPict);
     bool can_reuse_rec_pool(AL_TPicFormat const &pic_format, AL_TDimension const &dim, int pitch_y) const;
 
-    void signal_done();                                 // transitions to Done and wakes flush() waiter
-    void signal_error(AL_ERR err);                      // logs error then calls signal_done()
-    void update_fps();                                  // called from on_sdk_display per output frame
+    void signal_done();            // transitions to Done and wakes flush() waiter
+    void signal_error(AL_ERR err); // logs error then calls signal_done()
+    void update_fps();             // called from on_sdk_display per output frame
     void cleanup();
 
   private:
@@ -224,7 +226,7 @@ class RTDecoder
 
     std::unique_ptr<GenericBufPool> m_src_buf_pool;
     std::unique_ptr<PixMapBufPool> m_rec_buf_pool;
-    
+
     mutable std::mutex m_fps_mutex;
     double m_fps;
     uint32_t m_frame_count;

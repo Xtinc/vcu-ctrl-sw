@@ -22,8 +22,8 @@ struct DRMDisplayConfig
     int plane_id = -1;                         ///< KMS plane ID (-1 = auto-detect overlay/primary).
     int desired_width = 0;                     ///< Preferred display width in pixels  (0 = no preference).
     int desired_height = 0;                    ///< Preferred display height in pixels (0 = no preference).
-    int desired_refresh = 60;                   ///< Preferred refresh rate in Hz       (0 = prefer PREFERRED flag / highest).
-    std::chrono::nanoseconds submit_lead_time{2'000'000LL};
+    int desired_refresh = 0;                   ///< Preferred refresh rate in Hz       (0 = prefer PREFERRED flag / highest).
+    std::chrono::nanoseconds submit_lead_time{4'000'000LL};
 };
 
 struct PlaneProps
@@ -52,25 +52,26 @@ struct ConnProps
 };
 
 /**
- * @brief Abstract base: DRM/KMS double-buffer + Atomic API event loop.
+ * @brief DRM/KMS double-buffer display base with Atomic API event loop.
  *
- * Implements the complete event thread, double-buffer state machine (4 states × 2 slots),
- * vblank-timed Atomic API submission (ClockEntry), and page-flip event handling.
+ * Manages the event thread, a 4-state double-buffer pipeline, and vblank-timed
+ * page-flip submission via ClockEntry.  Subclasses resolve a DRM framebuffer ID
+ * from their frame type and call the protected submit().
  *
- * Double-buffer state machine:
- *   FREE ──show()──► PENDING ──schedule_flip()──► SCANNING
- *    ▲   (latest-wins: old PENDING released)          │
- *    │                                                │ drmModeAtomicCommit
- *    │                               SCANNING ──► RELEASING
- *    └─────────────── on_flip_done: RELEASING ──► FREE + release_cb
+ * @par Double-buffer state machine
+ * @code
+ *   FREE ──submit()──> PENDING ──schedule_flip()──> SCANNING
+ *    ^   (latest-wins: old PENDING released)             │
+ *    │                                                   │ drmModeAtomicCommit
+ *    │                                SCANNING ──> RELEASING
+ *    └──────────────── on_flip_done: RELEASING ──> FREE + release_cb
+ * @endcode
  *
- * Thread model:
- * • Producer thread: show() — places frame in PENDING, never blocks.
- * • Event thread: all DRM API calls — drmModeAtomicCommit, poll, drmHandleEvent.
+ * @par Thread model
+ * - **Producer thread**: submit() — enqueues frames, never blocks.
+ * - **Event thread**: all DRM calls — drmModeAtomicCommit, poll, drmHandleEvent.
  *
- * Subclasses call the protected submit() after resolving the DRM framebuffer ID.
- *
- * @note Requires DRM_CLIENT_CAP_ATOMIC (throws std::runtime_error otherwise).
+ * @note Requires @c DRM_CLIENT_CAP_ATOMIC; throws std::runtime_error otherwise.
  * @note Non-copyable, non-movable.
  */
 class DRMDisplayBase
@@ -95,11 +96,14 @@ class DRMDisplayBase
   public:
     using FrameReleaseCallback = std::function<void(void *)>;
 
-    /** @throws std::invalid_argument  if release_cb is null.
-     *  @throws std::runtime_error     on DRM open / Atomic cap / resource enumeration failure. */
+    /**
+     * @brief Open the DRM device, enumerate KMS resources, and start the event thread.
+     * @param cfg      Display configuration (device path, preferred mode, timing).
+     * @param release_cb  Called for each frame when it leaves the scanout pipeline.
+     * @throws std::invalid_argument  if @p release_cb is null.
+     * @throws std::runtime_error     on DRM open / Atomic cap / resource enumeration failure.
+     */
     explicit DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback release_cb);
-
-    /** Stops the event thread and releases all held frames. */
     virtual ~DRMDisplayBase();
 
     DRMDisplayBase(const DRMDisplayBase &) = delete;
@@ -107,13 +111,25 @@ class DRMDisplayBase
     DRMDisplayBase(DRMDisplayBase &&) = delete;
     DRMDisplayBase &operator=(DRMDisplayBase &&) = delete;
 
-    /** Drain the event thread and release all held frames via FrameReleaseCallback. Idempotent. */
+    /**
+     * @brief Drain the event thread and release all held frames via FrameReleaseCallback.
+     *
+     * Idempotent; safe to call multiple times or before destruction.
+     */
     void stop();
 
   protected:
-    /** Enqueue a pre-resolved frame into the display pipeline. Never blocks.
-     *  key   : opaque handle returned to FrameReleaseCallback when the frame is retired.
-     *  fb_id : registered DRM framebuffer (caller is responsible for its lifetime).
+    /**
+     * @brief Enqueue a pre-resolved frame into the display pipeline.
+     *
+     * Never blocks.  If a PENDING frame already exists it is released immediately
+     * (latest-wins policy).  If no free slot is available the new frame is dropped
+     * and released via FrameReleaseCallback.
+     *
+     * @param key    Opaque handle passed back to FrameReleaseCallback when retired.
+     * @param fb_id  Registered DRM framebuffer; caller owns its lifetime.
+     * @param w      Frame width in pixels.
+     * @param h      Frame height in pixels.
      */
     void submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h);
 
@@ -155,10 +171,10 @@ class DRMDisplayBase
 
     ClockEntry::ClockTP m_last_flip_tp{};
     ClockEntry::Nanos m_frame_ns{16'666'666LL};
-    drmModeModeInfo m_selected_mode{}; ///< Display mode chosen during init_drm().
+    drmModeModeInfo m_selected_mode{};
     int m_in_flight_retries{0};
-    ClockEntry::ClockTP m_commit_tp{}; ///< steady_clock timestamp of the last drmModeAtomicCommit (flip, not modeset).
-    ClockEntry::Nanos m_wait_phase_adjust{}; ///< Signed wait-time offset used to align submit phase to vblank.
+    ClockEntry::ClockTP m_commit_tp{};
+    ClockEntry::Nanos m_wait_phase_adjust{};
 
     std::atomic<bool> m_stopped{false};
     std::thread m_event_thread;
@@ -195,6 +211,8 @@ class DRMDisplay : public DRMDisplayBase
     struct CachedFB
     {
         uint32_t fb_id = 0;
+        uint32_t w = 0;
+        uint32_t h = 0;
         std::array<uint32_t, 4> gem_handles{};
         int num_gem = 0;
     };
