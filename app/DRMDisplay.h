@@ -22,7 +22,7 @@ struct DRMDisplayConfig
     int plane_id = -1;                         ///< KMS plane ID (-1 = auto-detect overlay/primary).
     int desired_width = 0;                     ///< Preferred display width in pixels  (0 = no preference).
     int desired_height = 0;                    ///< Preferred display height in pixels (0 = no preference).
-    int desired_refresh = 0;                   ///< Preferred refresh rate in Hz       (0 = prefer PREFERRED flag / highest).
+    int desired_refresh = 60;                   ///< Preferred refresh rate in Hz       (0 = prefer PREFERRED flag / highest).
     std::chrono::nanoseconds submit_lead_time{2'000'000LL};
 };
 
@@ -158,7 +158,7 @@ class DRMDisplayBase
     drmModeModeInfo m_selected_mode{}; ///< Display mode chosen during init_drm().
     int m_in_flight_retries{0};
     ClockEntry::ClockTP m_commit_tp{}; ///< steady_clock timestamp of the last drmModeAtomicCommit (flip, not modeset).
-    ClockEntry::Nanos m_adaptive_lead_time{}; ///< Auto-tuned submit lead time; starts at cfg.submit_lead_time.
+    ClockEntry::Nanos m_wait_phase_adjust{}; ///< Signed wait-time offset used to align submit phase to vblank.
 
     std::atomic<bool> m_stopped{false};
     std::thread m_event_thread;

@@ -15,6 +15,7 @@ extern "C"
 #include <xf86drmMode.h>
 
 #include <cerrno>
+#include <climits>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
@@ -31,6 +32,13 @@ extern "C"
 #ifndef DRM_FORMAT_XV20
 #define DRM_FORMAT_XV20 fourcc_code('X', 'V', '2', '0')
 #endif
+
+static ClockEntry::Nanos compute_fixed_submit_lead(const DRMDisplayConfig &cfg, ClockEntry::Nanos frame_ns)
+{
+    const auto lead_min = ClockEntry::Nanos{500'000LL};
+    const auto lead_max = frame_ns / 3;
+    return std::min(std::max(cfg.submit_lead_time, lead_min), lead_max);
+}
 
 static int score_drm_mode(const drmModeModeInfo *m, int desired_width, int desired_height, int desired_refresh)
 {
@@ -52,9 +60,6 @@ static int score_drm_mode(const drmModeModeInfo *m, int desired_width, int desir
     return s;
 }
 
-/// Select the best drmModeModeInfo from \p conn based on the caller's preferences.
-/// Falls back to the PREFERRED flag, then to the first mode if nothing else matches.
-/// Returns nullptr only when \p conn has no modes at all.
 static const drmModeModeInfo *select_best_mode(const drmModeConnector *conn, int desired_width, int desired_height,
                                                int desired_refresh)
 {
@@ -71,7 +76,6 @@ static const drmModeModeInfo *select_best_mode(const drmModeConnector *conn, int
         }
     }
 
-    // Fallback when the dimension filter rejected every mode.
     if (!best || best_score == INT_MIN)
     {
         for (int i = 0; i < conn->count_modes; ++i)
@@ -243,7 +247,6 @@ DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback
     }
 
     init_drm();
-    m_adaptive_lead_time = m_cfg.submit_lead_time;
     m_event_thread = std::thread(&DRMDisplayBase::event_thread_fn, this);
 
     sched_param sp{};
@@ -328,14 +331,10 @@ void DRMDisplayBase::init_drm()
     }
 
     drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-    // DRM_CAP_TIMESTAMP_MONOTONIC is a device cap queried via drmGetCap, not a client cap.
-    // On Linux >= 3.x the vblank timestamps are always CLOCK_MONOTONIC; nothing to set.
-
     if (drmSetClientCap(m_drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
     {
         close_drm();
-        throw std::runtime_error("DRMDisplay: kernel does not support "
-                                 "DRM_CLIENT_CAP_ATOMIC");
+        throw std::runtime_error("DRMDisplay: kernel does not support DRM_CLIENT_CAP_ATOMIC");
     }
 
     auto *res = drmModeGetResources(m_drm_fd);
@@ -589,6 +588,11 @@ bool DRMDisplayBase::schedule_flip_locked()
     }
 
     m_commit_tp = std::chrono::steady_clock::now();
+    const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
+    const auto submit_to_commit = m_commit_tp - (m_last_flip_tp + m_frame_ns - lead_time + m_wait_phase_adjust);
+    VIDEO_DEBUG_PRINT("DRMDisplay: submit -> commit %.3f ms, frame %.3f ms, lead_time %.3f ms, phase_wait %.3f ms",
+                      submit_to_commit.count() * 1e-6, m_frame_ns.count() * 1e-6, lead_time.count() * 1e-6,
+                      m_wait_phase_adjust.count() * 1e-6);
 
     // State transitions: SCANNING -> RELEASING, PENDING -> SCANNING.
     auto *scanning = slot_by_state_locked(SlotState::SCANNING);
@@ -611,8 +615,9 @@ ClockEntry::ClockTP DRMDisplayBase::compute_submit_deadline()
     }
 
     const auto now = std::chrono::steady_clock::now();
+    const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
     auto deadline =
-        (m_last_flip_tp == ClockEntry::ClockTP{}) ? now : m_last_flip_tp + m_frame_ns - m_adaptive_lead_time;
+        (m_last_flip_tp == ClockEntry::ClockTP{}) ? now : m_last_flip_tp + m_frame_ns - lead_time + m_wait_phase_adjust;
     if (deadline > now + m_frame_ns)
     {
         deadline = now;
@@ -647,7 +652,8 @@ void DRMDisplayBase::drain_flip_event()
     std::lock_guard<std::mutex> lk(m_mutex);
     m_in_flight = false;
     m_in_flight_retries = 0;
-    m_last_flip_tp = ClockEntry::ClockTP{};
+    m_last_flip_tp = {};
+    m_wait_phase_adjust = {};
     auto *rel = slot_by_state_locked(SlotState::RELEASING);
     if (rel)
     {
@@ -659,29 +665,61 @@ void DRMDisplayBase::drain_flip_event()
 void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
 {
     const auto hw_tp = ClockEntry::ClockTP{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
+    const auto cb_now_tp = std::chrono::steady_clock::now();
+    VIDEO_DEBUG_PRINT("DRMDisplay: cb now-hw %.3f ms",
+                      std::chrono::duration<double, std::milli>(cb_now_tp - hw_tp).count());
+
+    const auto prev_flip_tp = m_last_flip_tp;
     m_last_flip_tp = hw_tp;
+
+    if (prev_flip_tp != ClockEntry::ClockTP{})
+    {
+        const auto observed_frame = std::chrono::duration_cast<ClockEntry::Nanos>(hw_tp - prev_flip_tp);
+        if (observed_frame >= m_frame_ns / 2 && observed_frame <= m_frame_ns * 3 / 2)
+        {
+            m_frame_ns += (observed_frame - m_frame_ns) / 64;
+        }
+    }
 
     if (m_commit_tp != ClockEntry::ClockTP{})
     {
         const auto commit_to_flip = hw_tp - m_commit_tp;
-        VIDEO_DEBUG_PRINT("DRMDisplay: commit -> flip %.1f ms, frame %.1f ms, lead_time %.1f ms",
-                          commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6,
-                          m_adaptive_lead_time.count() * 1e-6);
-        if (commit_to_flip > m_adaptive_lead_time + m_frame_ns / 2)
+        const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
+        const auto target_margin =
+            std::min(std::max(m_frame_ns / 16, ClockEntry::Nanos{800'000LL}), ClockEntry::Nanos{2'000'000LL});
+        const auto deadband = ClockEntry::Nanos{150'000LL};
+        const auto phase_limit = m_frame_ns / 4;
+
+        VIDEO_DEBUG_PRINT("DRMDisplay: commit -> flip %.1f ms, frame %.1f ms, lead_time %.1f ms, phase_wait %.1f ms",
+                          commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6, lead_time.count() * 1e-6,
+                          m_wait_phase_adjust.count() * 1e-6);
+
+        if (commit_to_flip > lead_time + m_frame_ns / 2)
         {
-            const auto prev = m_adaptive_lead_time;
-            m_adaptive_lead_time = std::min(m_adaptive_lead_time + m_frame_ns / 16, m_frame_ns / 3);
             VIDEO_ERROR_PRINT("DRMDisplay: vblank missed (commit -> flip %.1f ms, frame %.1f ms). "
-                              "submit_lead_time %.1f ms -> %.1f ms.",
-                              commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6, prev.count() * 1e-6,
-                              m_adaptive_lead_time.count() * 1e-6);
+                              "advance phase_wait from %.1f ms.",
+                              commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6,
+                              m_wait_phase_adjust.count() * 1e-6);
+            m_wait_phase_adjust -= m_frame_ns / 16;
+            if (m_wait_phase_adjust < -phase_limit)
+            {
+                m_wait_phase_adjust = -phase_limit;
+            }
         }
         else
         {
-            const auto excess = m_adaptive_lead_time - m_cfg.submit_lead_time;
-            if (excess.count() > 0)
+            const auto error = commit_to_flip - target_margin;
+            if (error > deadband || error < -deadband)
             {
-                m_adaptive_lead_time -= excess / 100;
+                m_wait_phase_adjust += error / 16;
+                if (m_wait_phase_adjust > phase_limit)
+                {
+                    m_wait_phase_adjust = phase_limit;
+                }
+                else if (m_wait_phase_adjust < -phase_limit)
+                {
+                    m_wait_phase_adjust = -phase_limit;
+                }
             }
         }
 
@@ -731,12 +769,22 @@ void DRMDisplayBase::event_thread_fn()
             continue; // PENDING was evicted while we waited
         }
 
+        const auto now_before_wait = std::chrono::steady_clock::now();
+        const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
+        VIDEO_DEBUG_PRINT("DRMDisplay: wait submit_in %.3f ms (frame %.3f ms, lead_time %.3f ms, phase_wait %.3f ms)",
+                          std::chrono::duration<double, std::milli>(submit_at - now_before_wait).count(),
+                          m_frame_ns.count() * 1e-6, lead_time.count() * 1e-6, m_wait_phase_adjust.count() * 1e-6);
+
         m_submit_timer.reset();
 
         if (m_submit_timer.wait_until(submit_at) == -1)
         {
             continue;
         }
+
+        const auto wake_tp = std::chrono::steady_clock::now();
+        VIDEO_DEBUG_PRINT("DRMDisplay: woke %.3f ms after submit_at",
+                          std::chrono::duration<double, std::milli>(wake_tp - submit_at).count());
 
         if (m_stopped.load(std::memory_order_acquire))
         {
