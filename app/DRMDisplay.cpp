@@ -15,7 +15,6 @@ extern "C"
 #include <xf86drmMode.h>
 
 #include <cerrno>
-#include <climits>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
@@ -46,22 +45,32 @@ static ClockEntry::Nanos compute_fixed_submit_lead(const DRMDisplayConfig &cfg, 
     return std::min(std::max(cfg.submit_lead_time, kSubmitLeadMin), frame_ns / 3);
 }
 
+static uint32_t mode_vrefresh_mHz(const drmModeModeInfo *m)
+{
+    if (!m->htotal || !m->vtotal)
+        return m->vrefresh * 1000u;
+    const uint64_t num =
+        static_cast<uint64_t>(m->clock) * 1'000'000ULL * ((m->flags & DRM_MODE_FLAG_INTERLACE) ? 2u : 1u);
+    return static_cast<uint32_t>(num / (static_cast<uint64_t>(m->htotal) * m->vtotal));
+}
+
 static int score_drm_mode(const drmModeModeInfo *m, int desired_width, int desired_height, int desired_refresh)
 {
     if (desired_width > 0 && m->hdisplay != static_cast<uint16_t>(desired_width))
-        return INT_MIN;
+        return 0;
     if (desired_height > 0 && m->vdisplay != static_cast<uint16_t>(desired_height))
-        return INT_MIN;
+        return 0;
 
+    const uint32_t refresh_mHz = mode_vrefresh_mHz(m);
     int s = (m->type & DRM_MODE_TYPE_PREFERRED) ? 100 : 0;
     if (desired_refresh > 0)
     {
-        int d = static_cast<int>(m->vrefresh) - desired_refresh;
-        s += 200 - std::min(d < 0 ? -d : d, 200);
+        const int d = static_cast<int>(refresh_mHz) - desired_refresh * 1000;
+        s += 200 - std::min(d < 0 ? -d : d, 200'000) / 1000;
     }
     else
     {
-        s += static_cast<int>(m->vrefresh);
+        s += static_cast<int>(refresh_mHz / 1000);
     }
     return s;
 }
@@ -70,32 +79,29 @@ static const drmModeModeInfo *select_best_mode(const drmModeConnector *conn, int
                                                int desired_refresh)
 {
     const drmModeModeInfo *best = nullptr;
-    int best_score = INT_MIN;
+    int best_score = 0;
 
     for (int i = 0; i < conn->count_modes; ++i)
     {
-        int s = score_drm_mode(&conn->modes[i], desired_width, desired_height, desired_refresh);
-        VIDEO_DEBUG_PRINT(
-            "DRMDisplay: mode[%d] %dx%d@%uHz (clock=%ukHz, type=0x%x) score=%d%s", i, conn->modes[i].hdisplay,
-            conn->modes[i].vdisplay, conn->modes[i].vrefresh, conn->modes[i].clock, conn->modes[i].type, s,
-            s == INT_MIN ? " (filtered)" : (conn->modes[i].type & DRM_MODE_TYPE_PREFERRED ? " [PREFERRED]" : ""));
+        const drmModeModeInfo *mi = &conn->modes[i];
+        const int s = score_drm_mode(mi, desired_width, desired_height, desired_refresh);
+        const uint32_t mHz = mode_vrefresh_mHz(mi);
+        VIDEO_DEBUG_PRINT("DRMDisplay: mode[%d] %dx%d@%u.%03uHz (clock=%ukHz, type=0x%x) score=%d%s", i, mi->hdisplay,
+                          mi->vdisplay, mHz / 1000, mHz % 1000, mi->clock, mi->type, s,
+                          s == 0 ? " (filtered)" : (mi->type & DRM_MODE_TYPE_PREFERRED ? " [PREFERRED]" : ""));
         if (s > best_score)
         {
             best_score = s;
-            best = &conn->modes[i];
+            best = mi;
         }
     }
 
-    if (!best || best_score == INT_MIN)
+    if (!best)
     {
         for (int i = 0; i < conn->count_modes; ++i)
             if (conn->modes[i].type & DRM_MODE_TYPE_PREFERRED)
-            {
                 return &conn->modes[i];
-            }
-        if (conn->count_modes > 0)
-            return &conn->modes[0];
-        return nullptr;
+        return conn->count_modes > 0 ? &conn->modes[0] : nullptr;
     }
     return best;
 }
@@ -248,8 +254,7 @@ void DRMDisplayBase::on_page_flip_cb(int /*fd*/, unsigned /*seq*/, unsigned tv_s
     static_cast<DRMDisplayBase *>(user_data)->on_flip_done(tv_sec, tv_usec);
 }
 
-DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg)
-    : m_cfg(cfg)
+DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg) : m_cfg(cfg)
 {
     init_drm();
     m_event_thread = std::thread(&DRMDisplayBase::event_thread_fn, this);
