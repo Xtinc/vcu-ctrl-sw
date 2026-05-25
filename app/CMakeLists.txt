@@ -20,6 +20,7 @@ set(APP_ENC_V4L2_SRC
 )
 
 set(APP_DEC_SRC
+    DecMgr.cpp
     DRMDisplay.cpp
     RTDecoder.cpp
     SliceFeeder.cpp

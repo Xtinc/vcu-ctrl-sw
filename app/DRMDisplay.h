@@ -94,16 +94,12 @@ class DRMDisplayBase
     };
 
   public:
-    using FrameReleaseCallback = std::function<void(void *)>;
-
     /**
      * @brief Open the DRM device, enumerate KMS resources, and start the event thread.
      * @param cfg      Display configuration (device path, preferred mode, timing).
-     * @param release_cb  Called for each frame when it leaves the scanout pipeline.
-     * @throws std::invalid_argument  if @p release_cb is null.
      * @throws std::runtime_error     on DRM open / Atomic cap / resource enumeration failure.
      */
-    explicit DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback release_cb);
+    explicit DRMDisplayBase(const DRMDisplayConfig &cfg);
     virtual ~DRMDisplayBase();
 
     DRMDisplayBase(const DRMDisplayBase &) = delete;
@@ -149,8 +145,13 @@ class DRMDisplayBase
     Slot *slot_by_state_locked(SlotState s);
 
   protected:
+    /**
+     * @brief Called whenever a frame handle leaves the pipeline (drop, eviction, flip-done).
+     * Subclasses implement typed release logic; base class never stores the callback.
+     */
+    virtual void release_frame(void *key) noexcept = 0;
+
     DRMDisplayConfig m_cfg;
-    FrameReleaseCallback m_release_cb;
 
     int m_drm_fd{-1};
     uint32_t m_conn_id{0};
@@ -205,9 +206,11 @@ class DRMDisplay : public DRMDisplayBase
     void show(AL_TBuffer *frame, const AL_TInfoDecode &info);
 
   private:
+    void release_frame(void *key) noexcept override;
     bool prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &out_fb_id);
 
   private:
+    TypedReleaseCallback m_typed_cb;
     struct CachedFB
     {
         uint32_t fb_id = 0;
@@ -237,8 +240,7 @@ class DRMDisplay : public DRMDisplayBase
 class DRMDisplayDumb : public DRMDisplayBase
 {
   public:
-    explicit DRMDisplayDumb(const DRMDisplayConfig &cfg, uint32_t width, uint32_t height,
-                            FrameReleaseCallback release_cb);
+    explicit DRMDisplayDumb(const DRMDisplayConfig &cfg, uint32_t width, uint32_t height);
     ~DRMDisplayDumb() override;
 
     /** Mutable pointer to the mapped XRGB8888 pixel data of slot i (0 or 1). */
@@ -257,6 +259,8 @@ class DRMDisplayDumb : public DRMDisplayBase
     }
 
   private:
+    void release_frame(void * /*key*/) noexcept override {}
+
     struct DumbBuf
     {
         uint32_t gem_handle = 0;

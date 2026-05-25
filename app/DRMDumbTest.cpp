@@ -10,10 +10,9 @@ extern "C"
 
 DRMDumbTest::DRMDumbTest(const DRMDisplayConfig &cfg) : m_cfg(cfg)
 {
-    m_display = std::make_unique<DRMDisplayDumb>(cfg,
-                                                static_cast<uint32_t>(cfg.desired_width  ? cfg.desired_width  : 1920),
-                                                static_cast<uint32_t>(cfg.desired_height ? cfg.desired_height : 1080),
-                                                [](void *) {});
+    m_display =
+        std::make_unique<DRMDisplayDumb>(cfg, static_cast<uint32_t>(cfg.desired_width ? cfg.desired_width : 1920),
+                                         static_cast<uint32_t>(cfg.desired_height ? cfg.desired_height : 1080));
 }
 
 void DRMDumbTest::run(uint32_t frames)
@@ -47,9 +46,9 @@ void DRMDumbTest::run(uint32_t frames)
 int main(int, char **)
 {
     DRMDisplayConfig cfg;
-    cfg.drm_device      = "/dev/dri/card0";
-    cfg.desired_width   = 1920;
-    cfg.desired_height  = 1080;
+    cfg.drm_device = "/dev/dri/card0";
+    cfg.desired_width = 1920;
+    cfg.desired_height = 1080;
     cfg.desired_refresh = 60;
     DRMDumbTest test(cfg);
     test.run(600); // ~10 seconds

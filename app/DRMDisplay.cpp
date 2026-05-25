@@ -248,14 +248,9 @@ void DRMDisplayBase::on_page_flip_cb(int /*fd*/, unsigned /*seq*/, unsigned tv_s
     static_cast<DRMDisplayBase *>(user_data)->on_flip_done(tv_sec, tv_usec);
 }
 
-DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg, FrameReleaseCallback release_cb)
-    : m_cfg(cfg), m_release_cb(std::move(release_cb))
+DRMDisplayBase::DRMDisplayBase(const DRMDisplayConfig &cfg)
+    : m_cfg(cfg)
 {
-    if (!m_release_cb)
-    {
-        throw std::invalid_argument("DRMDisplay: release_cb must not be null");
-    }
-
     init_drm();
     m_event_thread = std::thread(&DRMDisplayBase::event_thread_fn, this);
 
@@ -297,7 +292,7 @@ void DRMDisplayBase::stop()
     {
         if (s.buf)
         {
-            m_release_cb(s.buf);
+            release_frame(s.buf);
             s = Slot{};
         }
     }
@@ -310,7 +305,7 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
         auto *pending = slot_by_state_locked(SlotState::PENDING);
         if (pending)
         {
-            m_release_cb(pending->buf);
+            release_frame(pending->buf);
             *pending = Slot{};
         }
 
@@ -318,7 +313,7 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
         if (!target)
         {
             VIDEO_ERROR_PRINT("DRMDisplay: no free slot, dropping frame");
-            m_release_cb(key);
+            release_frame(key);
             return;
         }
 
@@ -557,7 +552,7 @@ bool DRMDisplayBase::schedule_flip_locked()
         if (!do_modeset_locked(pending->fb_id, pending->w, pending->h))
         {
             VIDEO_ERROR_PRINT("DRMDisplay: modeset failed, dropping frame");
-            m_release_cb(pending->buf);
+            release_frame(pending->buf);
             *pending = Slot{};
             return false;
         }
@@ -662,7 +657,7 @@ void DRMDisplayBase::drain_flip_event()
     auto *rel = slot_by_state_locked(SlotState::RELEASING);
     if (rel)
     {
-        m_release_cb(rel->buf);
+        release_frame(rel->buf);
         *rel = Slot{};
     }
 }
@@ -727,7 +722,7 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
         auto *rel = slot_by_state_locked(SlotState::RELEASING);
         if (rel)
         {
-            m_release_cb(rel->buf);
+            release_frame(rel->buf);
             *rel = Slot{};
         }
         m_in_flight = false;
@@ -806,8 +801,13 @@ DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
 // ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────
 
 DRMDisplay::DRMDisplay(const DRMDisplayConfig &cfg, TypedReleaseCallback release_cb)
-    : DRMDisplayBase(cfg, [release_cb](void *key) { release_cb(static_cast<AL_TBuffer *>(key)); })
+    : DRMDisplayBase(cfg), m_typed_cb(std::move(release_cb))
 {
+}
+
+void DRMDisplay::release_frame(void *key) noexcept
+{
+    m_typed_cb(static_cast<AL_TBuffer *>(key));
 }
 
 DRMDisplay::~DRMDisplay()
@@ -840,7 +840,7 @@ void DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info)
         return;
     if (m_stopped.load(std::memory_order_acquire))
     {
-        m_release_cb(frame);
+        m_typed_cb(frame);
         return;
     }
 
@@ -850,7 +850,7 @@ void DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info)
     uint32_t fb_id = 0;
     if (!prepare_fb(frame, w, h, fb_id))
     {
-        m_release_cb(frame);
+        m_typed_cb(frame);
         return;
     }
 
@@ -999,9 +999,8 @@ static void fill_rgb888(void *vaddr, uint32_t pitch, uint32_t width, uint32_t he
     }
 }
 
-DRMDisplayDumb::DRMDisplayDumb(const DRMDisplayConfig &cfg, uint32_t width, uint32_t height,
-                               FrameReleaseCallback release_cb)
-    : DRMDisplayBase(cfg, std::move(release_cb)), m_width(width), m_height(height)
+DRMDisplayDumb::DRMDisplayDumb(const DRMDisplayConfig &cfg, uint32_t width, uint32_t height)
+    : DRMDisplayBase(cfg), m_width(width), m_height(height)
 {
     alloc_dumb_bufs();
 }
