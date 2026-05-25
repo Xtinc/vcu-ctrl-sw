@@ -277,6 +277,17 @@ DRMDisplayBase::~DRMDisplayBase()
     close_drm();
 }
 
+void DRMDisplayBase::drain()
+{
+    std::unique_lock<std::mutex> lk(m_mutex);
+    m_cv.wait(lk, [this] {
+        return m_stopped.load(std::memory_order_relaxed) ||
+               (!slot_by_state_locked(SlotState::PENDING) &&
+                !slot_by_state_locked(SlotState::SCANNING) &&
+                !slot_by_state_locked(SlotState::RELEASING));
+    });
+}
+
 void DRMDisplayBase::stop()
 {
     if (m_stopped.exchange(true, std::memory_order_acq_rel))

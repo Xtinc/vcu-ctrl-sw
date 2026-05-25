@@ -108,6 +108,15 @@ class DRMDisplayBase
     DRMDisplayBase &operator=(DRMDisplayBase &&) = delete;
 
     /**
+     * @brief Wait until all held frames have been released via FrameReleaseCallback.
+     *
+     * Blocks until both internal slots reach FREE state (all page-flips complete and
+     * all release callbacks have fired).  Does NOT stop the event thread; the display
+     * continues to accept new frames after drain() returns.  Safe to call at any time.
+     */
+    void drain();
+
+    /**
      * @brief Drain the event thread and release all held frames via FrameReleaseCallback.
      *
      * Idempotent; safe to call multiple times or before destruction.
