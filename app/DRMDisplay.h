@@ -113,8 +113,10 @@ class DRMDisplayBase
      * Blocks until both internal slots reach FREE state (all page-flips complete and
      * all release callbacks have fired).  Does NOT stop the event thread; the display
      * continues to accept new frames after drain() returns.  Safe to call at any time.
+    * Subclasses may extend this to release resources that are only safe to drop after
+    * all slots are free.
      */
-    void drain();
+      virtual void drain();
 
     /**
      * @brief Drain the event thread and release all held frames via FrameReleaseCallback.
@@ -205,21 +207,6 @@ extern "C"
  */
 class DRMDisplay : public DRMDisplayBase
 {
-  public:
-    /** Typed release callback: matches decoder's return_display_frame signature. */
-    using TypedReleaseCallback = std::function<void(AL_TBuffer *)>;
-
-    explicit DRMDisplay(const DRMDisplayConfig &cfg, TypedReleaseCallback release_cb);
-    ~DRMDisplay() override;
-
-    void show(AL_TBuffer *frame, const AL_TInfoDecode &info);
-
-  private:
-    void release_frame(void *key) noexcept override;
-    bool prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &out_fb_id);
-
-  private:
-    TypedReleaseCallback m_typed_cb;
     struct CachedFB
     {
         uint32_t fb_id = 0;
@@ -229,6 +216,24 @@ class DRMDisplay : public DRMDisplayBase
         int num_gem = 0;
     };
 
+  public:
+    /** Typed release callback: matches decoder's return_display_frame signature. */
+    using TypedReleaseCallback = std::function<void(AL_TBuffer *)>;
+
+    explicit DRMDisplay(const DRMDisplayConfig &cfg, TypedReleaseCallback release_cb);
+    ~DRMDisplay() override;
+
+    void drain() override;
+    void show(AL_TBuffer *frame, const AL_TInfoDecode &info);
+
+  private:
+    void release_frame(void *key) noexcept override;
+    bool prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &out_fb_id);
+    void clear_cache() noexcept;
+    void destroy_cached_fb(CachedFB &fb) noexcept;
+
+  private:
+    TypedReleaseCallback m_typed_cb;
     std::map<AL_TBuffer *, CachedFB> m_fb_cache;
     std::mutex m_cache_mutex;
 };

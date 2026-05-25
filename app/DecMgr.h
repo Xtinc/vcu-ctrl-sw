@@ -82,7 +82,8 @@ struct DecMgrConfig
  * Decoder errors (e.g., corrupted bitstream, resource exhaustion) are handled
  * transparently:
  * - push_stream() detects decoder failure
- * - Automatically rebuilds decoder in-place (display kept alive)
+ * - Drains display and releases decoder-owned framebuffer imports
+ * - Automatically rebuilds decoder in-place
  * - Retries the push operation
  * - Caller sees only a boolean success/failure
  *
@@ -207,7 +208,7 @@ class DecMgr
      * @par Error recovery
      * If the decoder fails (corrupted stream, resource exhaustion):
      * 1. Current decoder is flushed and destroyed
-     * 2. Display is drained (pending frames displayed)
+     * 2. Display is drained and cached imports for old decoder buffers are released
      * 3. Fresh decoder is created with same configuration
      * 4. Push operation is retried automatically
      * 5. Returns false only if rebuild fails or pipeline is stopped

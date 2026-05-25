@@ -830,24 +830,43 @@ DRMDisplay::~DRMDisplay()
 {
     stop();
 
+    clear_cache();
+}
+
+void DRMDisplay::drain()
+{
+    DRMDisplayBase::drain();
+    clear_cache();
+}
+
+void DRMDisplay::clear_cache() noexcept
+{
     std::lock_guard<std::mutex> lk(m_cache_mutex);
     for (auto &kv : m_fb_cache)
     {
-        auto &fb = kv.second;
-        if (fb.fb_id)
+        destroy_cached_fb(kv.second);
+    }
+    m_fb_cache.clear();
+}
+
+void DRMDisplay::destroy_cached_fb(CachedFB &fb) noexcept
+{
+    if (fb.fb_id)
+    {
+        drmModeRmFB(m_drm_fd, fb.fb_id);
+        fb.fb_id = 0;
+    }
+    for (int k = 0; k < fb.num_gem; ++k)
+    {
+        if (fb.gem_handles[k])
         {
-            drmModeRmFB(m_drm_fd, fb.fb_id);
-        }
-        for (int k = 0; k < fb.num_gem; ++k)
-        {
-            if (fb.gem_handles[k])
-            {
-                drm_gem_close ca{};
-                ca.handle = fb.gem_handles[k];
-                drmIoctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &ca);
-            }
+            drm_gem_close ca{};
+            ca.handle = fb.gem_handles[k];
+            drmIoctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &ca);
+            fb.gem_handles[k] = 0;
         }
     }
+    fb.num_gem = 0;
 }
 
 void DRMDisplay::show(AL_TBuffer *frame, const AL_TInfoDecode &info)
@@ -903,17 +922,7 @@ bool DRMDisplay::prepare_fb(AL_TBuffer *buf, uint32_t w, uint32_t h, uint32_t &o
             }
             // Dimensions changed (stream resolution change within pool bounds) —
             // unregister the stale framebuffer and close its GEM handles.
-            if (it->second.fb_id)
-                drmModeRmFB(m_drm_fd, it->second.fb_id);
-            for (int k = 0; k < it->second.num_gem; ++k)
-            {
-                if (it->second.gem_handles[k])
-                {
-                    drm_gem_close ca{};
-                    ca.handle = it->second.gem_handles[k];
-                    drmIoctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &ca);
-                }
-            }
+            destroy_cached_fb(it->second);
             m_fb_cache.erase(it);
         }
     }
