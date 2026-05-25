@@ -115,7 +115,7 @@ bool DecMgr::push_stream(const void *data, size_t size, uint8_t flags)
         return true;
 
     // Decoder failed or unavailable — rebuild and retry.
-    VIDEO_WARN_PRINT("DecMgr: decoder error detected, rebuilding");
+    VIDEO_ERROR_PRINT("DecMgr: decoder error detected, rebuilding");
     if (!do_rebuild())
         return false;
 
