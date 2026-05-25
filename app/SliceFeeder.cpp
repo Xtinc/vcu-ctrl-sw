@@ -190,6 +190,30 @@ bool SliceFeeder::emit_nal(size_t begin, size_t sc_size, size_t end, std::vector
     return true;
 }
 
+bool SliceFeeder::feed_frame(std::ifstream &input_file, std::vector<uint8_t> &frame_out)
+{
+    frame_out.clear();
+
+    if (m_failed)
+        return false;
+
+    std::vector<uint8_t> nal;
+    uint8_t flags = 0;
+
+    while (feed(input_file, nal, flags))
+    {
+        frame_out.insert(frame_out.end(), nal.begin(), nal.end());
+        if (flags & AL_STREAM_BUF_FLAG_ENDOFFRAME)
+            return true;
+    }
+
+    // EOF with remaining non-VCL data (e.g. trailing SEI): treat as last frame.
+    if (!frame_out.empty() && !m_failed)
+        return true;
+
+    return false;
+}
+
 bool SliceFeeder::feed(std::ifstream &input_file, std::vector<uint8_t> &nal_out, uint8_t &flags_out)
 {
     nal_out.clear();

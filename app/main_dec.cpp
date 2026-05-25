@@ -22,15 +22,18 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
+#include <chrono>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static constexpr uint32_t kChunkSize = 512u * 1024u; // 512 KB matches default input_buffer_size
+static constexpr uint32_t kNalChunkSize = 512u * 1024u;  // Max single NAL size for SliceFeeder
+static constexpr uint32_t kFrameBufSize = 4u * 1024u * 1024u; // Decoder input buffer for frame mode
 
 enum class FeedMode
 {
@@ -39,12 +42,18 @@ enum class FeedMode
 };
 
 static bool parse_codec_or_mode(std::string const &token, AL_ECodec &codec, FeedMode &feed_mode,
-                                std::string &drm_device, int &i, int argc, char *argv[])
+                                std::string &drm_device, double &fps, int &i, int argc, char *argv[])
 {
     if (token == "--drm")
     {
         if (i + 1 < argc)
             drm_device = argv[++i];
+        return true;
+    }
+    if (token == "--fps")
+    {
+        if (i + 1 < argc)
+            fps = std::stod(argv[++i]);
         return true;
     }
     if (token == "avc" || token == "h264")
@@ -74,36 +83,15 @@ static bool parse_codec_or_mode(std::string const &token, AL_ECodec &codec, Feed
     return false;
 }
 
-static bool feed_stream_by_chunk(std::ifstream &input_file, RTDecoder &decoder)
-{
-    std::vector<uint8_t> chunk(kChunkSize);
-    while (input_file.good())
-    {
-        input_file.read(reinterpret_cast<char *>(chunk.data()), static_cast<std::streamsize>(kChunkSize));
-        std::streamsize bytes_read = input_file.gcount();
-        if (bytes_read <= 0)
-        {
-            break;
-        }
-
-        if (!decoder.push_stream(chunk.data(), static_cast<size_t>(bytes_read)))
-        {
-            VIDEO_ERROR_PRINT("push_stream failed - decoder has stopped");
-            return false;
-        }
-    }
-
-    return true;
-}
-
 // ---------------------------------------------------------------------------
 static void print_usage(const char *app)
 {
-    VIDEO_ERROR_PRINT("Usage: %s <input.hevc|avc> [hevc|avc] [chunk|slice] [--drm <device>]", app);
+    VIDEO_ERROR_PRINT("Usage: %s <input.hevc|avc> [hevc|avc] [chunk|slice] [--drm <device>] [--fps <rate>]", app);
     VIDEO_ERROR_PRINT("  Reads the compressed bitstream and displays decoded frames on screen.");
     VIDEO_ERROR_PRINT("  codec argument: hevc (default), h265, avc, or h264");
-    VIDEO_ERROR_PRINT("  input mode    : chunk (default) or slice (Annex-B NAL based)");
+    VIDEO_ERROR_PRINT("  input mode    : chunk (default, frame-paced) or slice (Annex-B NAL based)");
     VIDEO_ERROR_PRINT("  --drm device  : DRM device node (default: /dev/dri/card0)");
+    VIDEO_ERROR_PRINT("  --fps rate    : frame delivery rate for chunk mode (default: 30.0)");
 }
 
 // ---------------------------------------------------------------------------
@@ -122,11 +110,12 @@ int main(int argc, char *argv[])
     AL_ECodec codec = AL_CODEC_HEVC;
     FeedMode feed_mode = FeedMode::Chunk;
     std::string drm_device = "/dev/dri/card0";
+    double fps = 30.0;
 
     for (int i = 2; i < argc; ++i)
     {
         const std::string token = argv[i];
-        if (!parse_codec_or_mode(token, codec, feed_mode, drm_device, i, argc, argv))
+        if (!parse_codec_or_mode(token, codec, feed_mode, drm_device, fps, i, argc, argv))
         {
             VIDEO_ERROR_PRINT("Unknown argument '%s'.", token.c_str());
             print_usage(argv[0]);
@@ -145,7 +134,7 @@ int main(int argc, char *argv[])
     // ---- Build decoder config ---------------------------------------------
     DecoderConfig cfg;
     cfg.codec = codec;
-    cfg.input_buffer_size = kChunkSize;
+    cfg.input_buffer_size = (feed_mode == FeedMode::Slice) ? kNalChunkSize : kFrameBufSize;
     cfg.low_delay_mode = (feed_mode == FeedMode::Slice);
 
     // ---- Create display and decoder ---------------------------------------
@@ -189,7 +178,7 @@ int main(int argc, char *argv[])
     // ---- Feed bitstream ---------------------------------------------------
     if (feed_mode == FeedMode::Slice)
     {
-        SliceFeeder feeder(codec, kChunkSize);
+        SliceFeeder feeder(codec, kNalChunkSize);
         std::vector<uint8_t> nal;
         uint8_t flags = 0;
         while (feeder.feed(input_file, nal, flags))
@@ -202,16 +191,34 @@ int main(int argc, char *argv[])
         }
 
         if (feeder.failed())
-        {
             VIDEO_ERROR_PRINT("Slice-mode input failed");
-        }
     }
     else
     {
-        if (!feed_stream_by_chunk(input_file, decoder))
+        // Chunk mode: parse complete frames and deliver at the requested rate.
+        SliceFeeder feeder(codec, kNalChunkSize);
+        std::vector<uint8_t> frame_data;
+        const auto frame_interval =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / fps));
+        auto next_frame_time = std::chrono::steady_clock::now();
+
+        VIDEO_INFO_PRINT("Chunk mode: delivering frames at %.2f fps (interval %.2f ms)", fps,
+                         1000.0 / fps);
+
+        while (feeder.feed_frame(input_file, frame_data))
         {
-            VIDEO_ERROR_PRINT("Chunk-mode input failed");
+            std::this_thread::sleep_until(next_frame_time);
+            next_frame_time += frame_interval;
+
+            if (!decoder.push_stream(frame_data.data(), frame_data.size()))
+            {
+                VIDEO_ERROR_PRINT("push_stream failed in chunk mode - decoder has stopped");
+                break;
+            }
         }
+
+        if (feeder.failed())
+            VIDEO_ERROR_PRINT("Chunk-mode input failed");
     }
 
     // ---- Drain decoder first, then stop display ---------------------------

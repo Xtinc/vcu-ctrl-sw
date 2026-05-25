@@ -75,6 +75,10 @@ static const drmModeModeInfo *select_best_mode(const drmModeConnector *conn, int
     for (int i = 0; i < conn->count_modes; ++i)
     {
         int s = score_drm_mode(&conn->modes[i], desired_width, desired_height, desired_refresh);
+        VIDEO_DEBUG_PRINT(
+            "DRMDisplay: mode[%d] %dx%d@%uHz (clock=%ukHz, type=0x%x) score=%d%s", i, conn->modes[i].hdisplay,
+            conn->modes[i].vdisplay, conn->modes[i].vrefresh, conn->modes[i].clock, conn->modes[i].type, s,
+            s == INT_MIN ? " (filtered)" : (conn->modes[i].type & DRM_MODE_TYPE_PREFERRED ? " [PREFERRED]" : ""));
         if (s > best_score)
         {
             best_score = s;

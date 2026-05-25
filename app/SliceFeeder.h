@@ -17,6 +17,12 @@ class SliceFeeder
     // Returns true when one NAL is produced; false on EOF or parse/read errors.
     bool feed(std::ifstream &input_file, std::vector<uint8_t> &nal_out, uint8_t &flags_out);
 
+    // Reads Annex-B bitstream and accumulates NALs until a frame boundary
+    // (AL_STREAM_BUF_FLAG_ENDOFFRAME) is reached, then returns the complete
+    // concatenated frame data in frame_out.
+    // Returns true when one frame is produced; false on EOF or parse/read errors.
+    bool feed_frame(std::ifstream &input_file, std::vector<uint8_t> &frame_out);
+
     // Returns true if the previous feed() ended due to an error.
     bool failed() const;
 
