@@ -1,17 +1,22 @@
 /**
- * @file main_dec.cpp
- * @brief Decode a compressed bitstream (HEVC or AVC) and display decoded
- *        frames on screen via DRM/KMS zero-copy pipeline using DecMgr.
+ * @file main_dec_file.cpp
+ * @brief Decode a local compressed bitstream (HEVC or AVC) and display decoded
+ *        frames on screen via DRM/KMS zero-copy pipeline.
+ *
+ * Builds the decode+display pipeline directly from RTDecoder + DRMDisplay
+ * without going through DecMgr.  This allows explicit feed-rate control and
+ * is suitable for offline / test use-cases driven by a local bitstream file.
  *
  * Usage:
- *   vcu_dec <input.hevc|avc> [hevc|avc] [chunk|slice] [--drm <device>] [--fps <rate>]
+ *   vcu_dec_file <input.hevc|avc> [hevc|avc] [chunk|slice] [--drm <device>] [--fps <rate>]
  *
  *   codec argument defaults to "hevc" when omitted.
  *   --drm device defaults to /dev/dri/card0 when omitted.
  *   --fps rate defaults to 30.0.
  */
 
-#include "DecMgr.h"
+#include "DRMDisplay.h"
+#include "RTDecoder.h"
 #include "SliceFeeder.h"
 
 extern "C"
@@ -148,16 +153,6 @@ static void print_usage(const char *app)
     VIDEO_ERROR_PRINT("  --fps rate    : frame delivery rate (default: 30.0, applies to both modes)");
 }
 
-static DecMgrConfig make_dec_mgr_config(AppOptions const &options)
-{
-    DecMgrConfig cfg;
-    cfg.dec.codec = options.codec;
-    cfg.dec.input_buffer_size = (options.feed_mode == FeedMode::Slice) ? kNalChunkSize : kFrameBufSize;
-    cfg.dec.low_delay_mode = (options.feed_mode == FeedMode::Slice);
-    cfg.drm.drm_device = options.drm_device;
-    return cfg;
-}
-
 static std::chrono::steady_clock::duration frame_interval_from_fps(double fps)
 {
     return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / fps));
@@ -170,18 +165,16 @@ static void pace_next_frame(std::chrono::steady_clock::time_point &next_frame_ti
     next_frame_time += frame_interval;
 }
 
-static bool push_or_stop(DecMgr &dec_mgr, std::vector<uint8_t> const &data, uint8_t flags, char const *mode_name)
+static bool push_or_stop(RTDecoder &dec, std::vector<uint8_t> const &data, uint8_t flags, char const *mode_name)
 {
-    if (dec_mgr.push_stream(data.data(), data.size(), flags))
-    {
+    if (dec.push_stream(data.data(), data.size(), flags))
         return true;
-    }
 
     VIDEO_ERROR_PRINT("push_stream failed in %s mode - pipeline has stopped", mode_name);
     return false;
 }
 
-static uint32_t feed_slice_mode(std::ifstream &input_file, AppOptions const &options, DecMgr &dec_mgr)
+static uint32_t feed_slice_mode(std::ifstream &input_file, AppOptions const &options, RTDecoder &dec)
 {
     SliceFeeder feeder(options.codec, kNalChunkSize);
     std::vector<uint8_t> nal;
@@ -194,16 +187,14 @@ static uint32_t feed_slice_mode(std::ifstream &input_file, AppOptions const &opt
 
     while (feeder.feed(input_file, nal, flags))
     {
-        if (!push_or_stop(dec_mgr, nal, flags, "slice"))
-        {
+        if (!push_or_stop(dec, nal, flags, "slice"))
             break;
-        }
 
         if (flags & AL_STREAM_BUF_FLAG_ENDOFFRAME)
         {
             ++frames_pushed;
             if (frames_pushed % 100 == 0)
-                VIDEO_INFO_PRINT("Pushed %u frames (%.2f fps)", frames_pushed, dec_mgr.fps());
+                VIDEO_INFO_PRINT("Pushed %u frames", frames_pushed);
 
             pace_next_frame(next_frame_time, frame_interval);
         }
@@ -215,7 +206,7 @@ static uint32_t feed_slice_mode(std::ifstream &input_file, AppOptions const &opt
     return frames_pushed;
 }
 
-static uint32_t feed_chunk_mode(std::ifstream &input_file, AppOptions const &options, DecMgr &dec_mgr)
+static uint32_t feed_chunk_mode(std::ifstream &input_file, AppOptions const &options, RTDecoder &dec)
 {
     SliceFeeder feeder(options.codec, kNalChunkSize);
     std::vector<uint8_t> frame_data;
@@ -229,14 +220,12 @@ static uint32_t feed_chunk_mode(std::ifstream &input_file, AppOptions const &opt
     {
         pace_next_frame(next_frame_time, frame_interval);
 
-        if (!push_or_stop(dec_mgr, frame_data, AL_STREAM_BUF_FLAG_UNKNOWN, "chunk"))
-        {
+        if (!push_or_stop(dec, frame_data, AL_STREAM_BUF_FLAG_UNKNOWN, "chunk"))
             break;
-        }
 
         ++frames_pushed;
         if (frames_pushed % 100 == 0)
-            VIDEO_INFO_PRINT("Pushed %u frames (%.2f fps)", frames_pushed, dec_mgr.fps());
+            VIDEO_INFO_PRINT("Pushed %u frames", frames_pushed);
     }
 
     if (feeder.failed())
@@ -249,6 +238,7 @@ static uint32_t feed_chunk_mode(std::ifstream &input_file, AppOptions const &opt
 int main(int argc, char *argv[])
 {
     message_init();
+
     AppOptions options;
     if (!parse_options(argc, argv, options))
     {
@@ -256,7 +246,6 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    // ---- Open input -------------------------------------------------------
     std::ifstream input_file(options.input_path, std::ios::binary);
     if (!input_file)
     {
@@ -264,29 +253,49 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    // ---- Build DecMgr config ----------------------------------------------
-    DecMgrConfig cfg = make_dec_mgr_config(options);
+    // ---- Build pipeline: DRMDisplay + RTDecoder ---------------------------
+    // DRMDisplay is created first; its release callback captures dec by pointer
+    // (set before any callback fires).
+    std::unique_ptr<RTDecoder> dec;
 
-    // ---- Create DecMgr and start pipeline ---------------------------------
-    DecMgr dec_mgr(cfg);
-    if (!dec_mgr.start())
+    DRMDisplayConfig drm_cfg;
+    drm_cfg.drm_device = options.drm_device;
+
+    DRMDisplay display(drm_cfg, [&dec](AL_TBuffer *f) { dec->return_display_frame(f); });
+
+    DecoderConfig dec_cfg;
+    dec_cfg.codec             = options.codec;
+    dec_cfg.input_buffer_size = (options.feed_mode == FeedMode::Slice) ? kNalChunkSize : kFrameBufSize;
+    dec_cfg.low_delay_mode    = (options.feed_mode == FeedMode::Slice);
+
+    try
     {
-        VIDEO_ERROR_PRINT("Failed to start DecMgr pipeline");
+        dec = std::make_unique<RTDecoder>(dec_cfg,
+                                         [&display](AL_TBuffer *frame, const AL_TInfoDecode &info) {
+                                             display.show(frame, info);
+                                         });
+    }
+    catch (const std::exception &e)
+    {
+        VIDEO_ERROR_PRINT("Failed to create RTDecoder: %s", e.what());
         return EXIT_FAILURE;
     }
 
-    VIDEO_INFO_PRINT("DecMgr started on %s (codec: %s, mode: %s, fps: %.2f)", options.drm_device.c_str(),
-                     codec_name(options.codec), feed_mode_name(options.feed_mode), options.fps);
+    VIDEO_INFO_PRINT("Pipeline started: %s  mode=%s  drm=%s  fps=%.2f",
+                     codec_name(options.codec), feed_mode_name(options.feed_mode),
+                     options.drm_device.c_str(), options.fps);
 
     // ---- Feed bitstream with frame rate control ---------------------------
     const uint32_t frames_pushed = (options.feed_mode == FeedMode::Slice)
-                                       ? feed_slice_mode(input_file, options, dec_mgr)
-                                       : feed_chunk_mode(input_file, options, dec_mgr);
+                                       ? feed_slice_mode(input_file, options, *dec)
+                                       : feed_chunk_mode(input_file, options, *dec);
 
-    // ---- Graceful shutdown: DecMgr.stop() handles all cleanup -------------
-    VIDEO_INFO_PRINT("Stopping pipeline...");
-    dec_mgr.stop();
+    // ---- Graceful shutdown ------------------------------------------------
+    VIDEO_INFO_PRINT("Flushing decoder (%u frames pushed)...", frames_pushed);
+    dec->flush();      // blocks until all decoded frames are delivered to display
+    display.drain();   // blocks until all page-flips complete and buffers are returned
+    display.stop();
 
-    VIDEO_INFO_PRINT("Done. Total frames pushed: %u, decode fps: %.2f", frames_pushed, dec_mgr.fps());
+    VIDEO_INFO_PRINT("Done.");
     return EXIT_SUCCESS;
 }

@@ -104,10 +104,9 @@ struct DecMgrConfig
  * - No modeset or display restart required
  *
  * @par Thread Safety
- * - push_stream() must be called from a single producer thread.
- * - stop() must not overlap with push_stream().
  * - fps() may be called from any thread at any time.
  * - Internal callbacks execute on SDK thread (on_decoded_frame) and DRM event thread (return_frame).
+ * - push_stream() is private; data enters the pipeline only via the internal UDP receiver.
  *
  * @note The class is non-copyable and non-movable.
  * @warning Calling push_stream() concurrently from multiple threads is undefined behavior.
@@ -187,39 +186,6 @@ class DecMgr
     void stop();
 
     /**
-     * @brief Submit compressed bitstream data for decoding.
-     *
-     * Copies the provided data into a DMA buffer and submits it to the
-     * hardware decoder. Decoded frames are automatically forwarded to the
-     * display. If the decoder encounters an error, it is automatically
-     * rebuilt and the operation retried transparently.
-     *
-     * @param data   Pointer to compressed bitstream bytes. Must not be nullptr.
-     * @param size   Number of bytes to push. Must be > 0 and ≤ input_buffer_size.
-     * @param flags  Stream buffer flags (e.g., AL_STREAM_BUF_FLAG_ENDOFSLICE).
-     *               Default: AL_STREAM_BUF_FLAG_UNKNOWN.
-     *
-     * @return true   Data successfully submitted to decoder.
-     * @return false  Pipeline stopped, decoder rebuild failed, or invalid parameters.
-     *
-     * @note This function may block briefly if all input buffers are in use.
-     * @note Must be called from a single producer thread; not thread-safe.
-     * @note On decoder error, rebuilds decoder and retries once before returning false.
-     *
-     * @warning data must remain valid for the duration of this call (synchronous copy).
-     * @warning size must not exceed DecoderConfig::input_buffer_size (default 512 KB).
-     *
-     * @par Error recovery
-     * If the decoder fails (corrupted stream, resource exhaustion):
-     * 1. Current decoder is flushed and destroyed
-     * 2. Display is drained and cached imports for old decoder buffers are released
-     * 3. Fresh decoder is created with same configuration
-     * 4. Push operation is retried automatically
-     * 5. Returns false only if rebuild fails or pipeline is stopped
-     */
-    bool push_stream(const void *data, size_t size, uint8_t flags = AL_STREAM_BUF_FLAG_UNKNOWN);
-
-    /**
      * @brief Get the current decode frame rate.
      *
      * Returns an exponential moving average (EMA, α=0.9) of the decoder's
@@ -234,6 +200,7 @@ class DecMgr
     double fps() const;
 
   private:
+    bool push_stream(const void *data, size_t size, uint8_t flags = AL_STREAM_BUF_FLAG_UNKNOWN);
     void on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info);
     void return_frame(AL_TBuffer *frame);
     bool create_decoder();
