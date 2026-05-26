@@ -685,6 +685,11 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
     }
 }
 
+std::shared_ptr<ReliableUDP> make_reliable_udp(unsigned short local_port)
+{
+    return std::make_shared<ReliableUDP>(IOCService::GetService().executor(), local_port);
+}
+
 void ReliableUDP::generate_uuid()
 {
     auto current_ms = std::chrono::steady_clock::now().time_since_epoch();

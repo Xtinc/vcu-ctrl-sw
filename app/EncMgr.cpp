@@ -1,13 +1,9 @@
 #include "EncMgr.h"
+#include "lib_network/udp_net.h"
 
 extern "C"
 {
 #include "lib_rtos/message.h"
-}
-
-static RTEncoderBase::EncodedFrameCallback make_noop_output_callback()
-{
-    return [](const uint8_t *, size_t, bool) {};
 }
 
 const char *EncMgr::state_to_cstr(State s)
@@ -51,14 +47,28 @@ bool EncMgr::start()
         return false;
     }
 
+    if (!m_cfg.udp_dest_addr.empty())
+    {
+        m_sender = make_reliable_udp(m_cfg.udp_local_port);
+        m_sender->start();
+        if (!m_sender->add_destination(m_cfg.udp_dest_addr, m_cfg.udp_dest_port))
+        {
+            VIDEO_ERROR_PRINT("EncMgr: failed to set UDP destination %s:%u", m_cfg.udp_dest_addr.c_str(),
+                              m_cfg.udp_dest_port);
+            m_sender->stop();
+            m_sender.reset();
+        }
+    }
+
     try
     {
-        m_encoder = std::make_unique<RTEncoderV4L2>(m_cfg.enc, make_noop_output_callback());
+        m_encoder = std::make_unique<RTEncoderV4L2>(m_cfg.enc, make_output_callback());
     }
     catch (const std::exception &e)
     {
         VIDEO_ERROR_PRINT("EncMgr: failed to create encoder: %s", e.what());
         m_running.store(false);
+        m_sender.reset();
         return false;
     }
 
@@ -71,6 +81,7 @@ bool EncMgr::start()
         VIDEO_ERROR_PRINT("EncMgr: failed to create loop thread: %s", e.what());
         m_running.store(false);
         m_encoder.reset();
+        m_sender.reset();
         return false;
     }
     return true;
@@ -84,6 +95,12 @@ void EncMgr::stop()
     if (m_loop_thread.joinable())
     {
         m_loop_thread.join();
+    }
+
+    if (m_sender)
+    {
+        m_sender->stop();
+        m_sender.reset();
     }
 }
 
@@ -218,7 +235,7 @@ bool EncMgr::rebuild_encoder(int width, int height)
     m_encoder.reset(); // release hardware resource before constructing new instance
     try
     {
-        m_encoder = std::make_unique<RTEncoderV4L2>(enc_cfg, make_noop_output_callback());
+        m_encoder = std::make_unique<RTEncoderV4L2>(enc_cfg, make_output_callback());
         return true;
     }
     catch (const std::exception &e)
@@ -255,6 +272,22 @@ bool EncMgr::query_source_resolution(int &width, int &height) const
 
     VIDEO_INFO_PRINT("EncMgr: no active source on %s", m_cfg.v4l2_subdev.c_str());
     return false;
+}
+
+EncodedFrameCallback EncMgr::make_output_callback() const
+{
+    if (!m_sender)
+    {
+        return {};
+    }
+
+    std::weak_ptr<ReliableUDP> weak_udp = m_sender;
+    return [weak_udp](const uint8_t *data, size_t size, bool eof) {
+        if (auto udp = weak_udp.lock())
+        {
+            udp->send(data, size);
+        }
+    };
 }
 
 bool EncMgr::handle_source_change(int &width, int &height)

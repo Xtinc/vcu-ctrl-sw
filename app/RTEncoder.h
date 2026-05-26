@@ -90,11 +90,12 @@ enum class SourceMode
  *   enc.flush(); // blocks until EOS or timeout
  * @endcode
  */
+/// Callback invoked for each encoded NAL unit / AU on the SDK thread.
+using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size, bool eof)>;
+
 class RTEncoderBase
 {
   public:
-    /// Callback invoked for each encoded NAL unit / AU on the SDK thread.
-    using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size, bool eof)>;
     virtual ~RTEncoderBase();
 
     RTEncoderBase(const RTEncoderBase &) = delete;
@@ -273,6 +274,9 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
     void release_sources(AL_TBuffer const *pSrc) override;
 };
 
+/// Callback invoked on the SDK thread when the encoder has finished reading a source buffer.
+using SourceReleaseCallback = std::function<void(AL_TBuffer const *pSrc)>;
+
 /**
  * @brief V4L2 DMABUF source encoder: zero-copy pipeline from V4L2Source to VCU encoder.
  *
@@ -285,9 +289,6 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
 template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
 {
   public:
-    /// Callback invoked on the SDK thread when the encoder has finished reading a source buffer.
-    using SourceReleaseCallback = std::function<void(AL_TBuffer const *pSrc)>;
-
     /**
      * @brief Construct a V4L2 DMABUF-mode encoder.
      * @param cfg Configuration parameters.

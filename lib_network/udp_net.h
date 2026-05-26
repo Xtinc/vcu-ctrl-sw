@@ -356,4 +356,6 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::atomic<uint64_t> lost_packets_;
 };
 
+std::shared_ptr<ReliableUDP> make_reliable_udp(unsigned short local_port);
+
 #endif // RELIABLE_UDP_H

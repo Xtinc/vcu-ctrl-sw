@@ -4,6 +4,8 @@
 #include "RTEncoder.h"
 #include "V4L2Source.h"
 
+class ReliableUDP;
+
 /**
  * @brief EncMgrConfig holds all configuration needed to create an EncMgr instance.
  */
@@ -14,6 +16,10 @@ struct EncMgrConfig
     std::string v4l2_subdev; ///< V4L2 sub-device for source detection and events, e.g. "/dev/v4l-subdev0" (required)
     std::string sync_dev;    ///< Xilinx sync device path (empty = disabled)
     int source_check_interval_ms = 2000; ///< Interval for checking source presence in WaitingSource state
+
+    std::string udp_dest_addr;        ///< UDP destination address (empty = UDP disabled)
+    unsigned short udp_dest_port = 0; ///< UDP destination port
+    unsigned short udp_local_port = 0;///< UDP local bind port (0 = OS-assigned)
 };
 
 /**
@@ -156,6 +162,7 @@ class EncMgr
     bool ensure_encoder_at(int width, int height);
     bool handle_source_change(int &width, int &height);
     bool query_source_resolution(int &width, int &height) const;
+    EncodedFrameCallback make_output_callback() const;
 
     void loop_thread_func();
 
@@ -164,6 +171,7 @@ class EncMgr
 
     std::unique_ptr<RTEncoderV4L2> m_encoder;
     std::shared_ptr<V4L2Source> m_source;
+    std::shared_ptr<ReliableUDP> m_sender;
 
     std::thread m_loop_thread;
     std::atomic<bool> m_running{false};
