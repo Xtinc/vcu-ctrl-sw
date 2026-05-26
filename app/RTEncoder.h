@@ -1,7 +1,7 @@
 #ifndef REALTIME_ENCODER_H
 #define REALTIME_ENCODER_H
 
-#include "DMAFd.h"
+#include "V4L2DMAFd.h"
 #include "MemMgr.h"
 #include <atomic>
 #include <chrono>

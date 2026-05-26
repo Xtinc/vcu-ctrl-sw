@@ -7,7 +7,7 @@ extern "C"
 #include "lib_sync_ip/xvfbsync.h"
 }
 
-#include "DMAFd.h"
+#include "V4L2DMAFd.h"
 
 /**
  * @brief XilinxSyncIP manages Xilinx framebuffer synchronization IP core.

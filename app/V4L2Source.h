@@ -8,7 +8,7 @@
 #include <mutex>
 #include <thread>
 
-#include "DMAFd.h"
+#include "V4L2DMAFd.h"
 
 class XilinxSyncIP;
 
