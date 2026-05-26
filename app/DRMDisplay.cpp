@@ -279,11 +279,33 @@ DRMDisplayBase::~DRMDisplayBase()
 
 void DRMDisplayBase::drain()
 {
+    m_submit_timer.cancel();
+
     std::unique_lock<std::mutex> lk(m_mutex);
-    m_drain_requested = true;
+    auto *pending = slot_by_state_locked(SlotState::PENDING);
+    if (pending)
+    {
+        release_frame(pending->buf);
+        *pending = Slot{};
+    }
+
     m_cv.notify_all();
-    m_cv.wait(lk, [this] { return m_stopped.load(std::memory_order_relaxed) || slots_empty_locked(); });
-    m_drain_requested = false;
+    m_cv.wait(lk, [this] { return m_stopped.load(std::memory_order_relaxed) || !m_in_flight; });
+
+    for (auto &s : m_slots)
+    {
+        if (s.buf)
+        {
+            release_frame(s.buf);
+            s = Slot{};
+        }
+    }
+
+    m_modeset_done = false;
+    m_last_flip_tp = {};
+    m_commit_tp = {};
+    m_wait_phase_adjust = {};
+    m_in_flight_retries = 0;
 }
 
 void DRMDisplayBase::stop()
@@ -620,50 +642,6 @@ bool DRMDisplayBase::schedule_flip_locked()
     return true;
 }
 
-bool DRMDisplayBase::disable_scanout_locked()
-{
-    auto *scanning = slot_by_state_locked(SlotState::SCANNING);
-    if (!scanning)
-    {
-        return false;
-    }
-
-    auto *req = drmModeAtomicAlloc();
-    if (!req)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicAlloc failed (drain disable)");
-        return false;
-    }
-
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, 0);
-    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, 0);
-
-    const int ret = drmModeAtomicCommit(m_drm_fd, req, 0, nullptr);
-    drmModeAtomicFree(req);
-
-    if (ret != 0)
-    {
-        VIDEO_ERROR_PRINT("DRMDisplay: drain disable drmModeAtomicCommit: %s (%d)", ::strerror(errno), errno);
-        return false;
-    }
-
-    release_frame(scanning->buf);
-    *scanning = Slot{};
-    m_last_flip_tp = {};
-    m_commit_tp = {};
-    m_wait_phase_adjust = {};
-    m_in_flight_retries = 0;
-    return true;
-}
-
 ClockEntry::ClockTP DRMDisplayBase::compute_submit_deadline()
 {
     std::lock_guard<std::mutex> lk(m_mutex);
@@ -707,17 +685,21 @@ void DRMDisplayBase::drain_flip_event()
     }
 
     VIDEO_ERROR_PRINT("DRMDisplay: flip event timeout after %d retries, resetting", m_in_flight_retries);
-    std::lock_guard<std::mutex> lk(m_mutex);
-    m_in_flight = false;
-    m_in_flight_retries = 0;
-    m_last_flip_tp = {};
-    m_wait_phase_adjust = {};
-    auto *rel = slot_by_state_locked(SlotState::RELEASING);
-    if (rel)
     {
-        release_frame(rel->buf);
-        *rel = Slot{};
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_in_flight = false;
+        m_in_flight_retries = 0;
+        m_last_flip_tp = {};
+        m_wait_phase_adjust = {};
+        auto *rel = slot_by_state_locked(SlotState::RELEASING);
+        if (rel)
+        {
+            release_frame(rel->buf);
+            *rel = Slot{};
+        }
     }
+    // Wake drain() which may be waiting on !m_in_flight.
+    m_cv.notify_all();
 }
 
 void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
@@ -796,7 +778,7 @@ void DRMDisplayBase::event_thread_fn()
         {
             std::unique_lock<std::mutex> lk(m_mutex);
             m_cv.wait(lk, [this] {
-                return m_stopped.load(std::memory_order_acquire) || m_in_flight || m_drain_requested ||
+                return m_stopped.load(std::memory_order_acquire) || m_in_flight ||
                        slot_by_state_locked(SlotState::PENDING) != nullptr;
             });
         }
@@ -830,7 +812,6 @@ void DRMDisplayBase::event_thread_fn()
             break;
         }
 
-        bool notify_drain_complete = false;
         {
             std::lock_guard<std::mutex> lk(m_mutex);
             auto *pending = slot_by_state_locked(SlotState::PENDING);
@@ -838,20 +819,6 @@ void DRMDisplayBase::event_thread_fn()
             {
                 schedule_flip_locked();
             }
-            else if (!m_in_flight && m_drain_requested)
-            {
-                auto *releasing = slot_by_state_locked(SlotState::RELEASING);
-                auto *scanning = slot_by_state_locked(SlotState::SCANNING);
-                if (!pending && !releasing && scanning && disable_scanout_locked())
-                {
-                    notify_drain_complete = true;
-                }
-            }
-        }
-
-        if (notify_drain_complete)
-        {
-            m_cv.notify_all();
         }
     }
 }
@@ -870,11 +837,6 @@ DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
     {
         return nullptr;
     }
-}
-
-bool DRMDisplayBase::slots_empty_locked() const
-{
-    return m_slots[0].state == SlotState::FREE && m_slots[1].state == SlotState::FREE;
 }
 
 // ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────

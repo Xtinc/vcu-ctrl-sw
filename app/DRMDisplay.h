@@ -108,15 +108,20 @@ class DRMDisplayBase
     DRMDisplayBase &operator=(DRMDisplayBase &&) = delete;
 
     /**
-     * @brief Wait until all held frames have been released via FrameReleaseCallback.
+     * @brief Release all held decoder frame references and reset the display pipeline.
      *
-     * Blocks until both internal slots reach FREE state (all page-flips complete and
-     * all release callbacks have fired).  Does NOT stop the event thread; the display
-     * continues to accept new frames after drain() returns.  Safe to call at any time.
-    * Subclasses may extend this to release resources that are only safe to drop after
-    * all slots are free.
+     * - Any PENDING frame (not yet committed) is released immediately.
+     * - Waits for the in-flight page-flip (if any) to complete via the DRM event.
+     * - Releases the SCANNING slot directly without a DRM commit; the kernel's GEM
+     *   reference keeps the physical buffer alive until the hardware moves on.
+     * - Resets @c m_modeset_done so the next show() performs a full modeset.
+     *
+     * After drain() returns all decoder buffer references have been returned and the
+     * display can be restarted by calling show() again.  Does NOT stop the event
+     * thread.  Subclasses may extend drain() to release per-frame GPU resources
+     * (e.g. cached DRM framebuffer registrations) after the base has finished.
      */
-      virtual void drain();
+    virtual void drain();
 
     /**
      * @brief Drain the event thread and release all held frames via FrameReleaseCallback.
@@ -148,14 +153,12 @@ class DRMDisplayBase
 
     bool do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h);
     bool schedule_flip_locked();
-    bool disable_scanout_locked();
     ClockEntry::ClockTP compute_submit_deadline();
     void drain_flip_event();
     void on_flip_done(unsigned tv_sec, unsigned tv_usec);
     void event_thread_fn();
 
     Slot *slot_by_state_locked(SlotState s);
-    bool slots_empty_locked() const;
 
   protected:
     /**
@@ -180,7 +183,6 @@ class DRMDisplayBase
 
     Slot m_slots[2];
     bool m_in_flight{false};
-    bool m_drain_requested{false};
     std::mutex m_mutex;
     std::condition_variable m_cv;
 
