@@ -190,7 +190,7 @@ int main(int argc, char *argv[])
         cfg.height = cmds.front().height;
         cfg.chroma_mode = (fourcc == FOURCC(NV12)) ? AL_CHROMA_4_2_0 : AL_CHROMA_4_2_2;
 
-        auto encoder = std::make_unique<RTEncoderFile>(cfg, [&](const uint8_t *pData, size_t size) {
+        auto encoder = std::make_unique<RTEncoderFile>(cfg, [&](const uint8_t *pData, size_t size, bool) {
             VIDEO_INFO_PRINT("[%6u] size: %6zu bytes", totalEncodedUnits, size);
             outFile.write(reinterpret_cast<const char *>(pData), size);
             ++totalEncodedUnits;
