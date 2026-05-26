@@ -4,6 +4,8 @@
 #include "DRMDisplay.h"
 #include "RTDecoder.h"
 
+class ReliableUDP;
+
 /**
  * @brief Configuration bundle for DecMgr initialization.
  *
@@ -27,6 +29,8 @@ struct DecMgrConfig
 {
     DecoderConfig dec;    ///< Hardware decoder configuration (codec, device, buffer sizes).
     DRMDisplayConfig drm; ///< DRM/KMS display configuration (device, mode, timing).
+
+    unsigned short udp_local_port = 0; ///< UDP port to receive encoded bitstream on (0 = disabled).
 };
 
 /**
@@ -240,6 +244,7 @@ class DecMgr
     mutable std::mutex m_dec_mutex;
     std::unique_ptr<RTDecoder> m_decoder;
     std::unique_ptr<DRMDisplay> m_display;
+    std::shared_ptr<ReliableUDP> m_receiver;
     std::atomic<bool> m_running{false};
 };
 

@@ -1,4 +1,5 @@
 #include "DecMgr.h"
+#include "lib_network/udp_net.h"
 
 extern "C"
 {
@@ -41,6 +42,13 @@ bool DecMgr::start()
         return false;
     }
 
+    if (m_cfg.udp_local_port != 0)
+    {
+        m_receiver = make_reliable_udp(m_cfg.udp_local_port);
+        m_receiver->set_receive_callback([this](const uint8_t *data, size_t size) { push_stream(data, size); });
+        m_receiver->start();
+    }
+
     return true;
 }
 
@@ -49,17 +57,25 @@ void DecMgr::stop()
     if (!m_running.exchange(false))
         return;
 
-    // Step 1: flush decoder — blocks until all frames are delivered to on_decoded_frame.
+    // Step 1: stop UDP receiver — joins its worker thread so no more push_stream() calls
+    //         can arrive during or after the decoder flush.
+    if (m_receiver)
+    {
+        m_receiver->stop();
+        m_receiver.reset();
+    }
+
+    // Step 2: flush decoder — blocks until all frames are delivered to on_decoded_frame.
     //         No lock: callbacks must be free to acquire m_dec_mutex.
     if (m_decoder && !m_decoder->flush())
         VIDEO_ERROR_PRINT("DecMgr: decoder flush timed out; output may be incomplete");
 
-    // Step 2: drain display — blocks until all held frames are released.
+    // Step 3: drain display — blocks until all held frames are released.
     //         After drain() returns, no more return_frame() calls will occur.
     if (m_display)
         m_display->drain();
 
-    // Step 3 + 4: destroy display, then decoder.  Mutex only protects fps() readers.
+    // Step 4 + 5: destroy display, then decoder.  Mutex only protects fps() readers.
     {
         std::lock_guard<std::mutex> lk(m_dec_mutex);
         m_display.reset();
