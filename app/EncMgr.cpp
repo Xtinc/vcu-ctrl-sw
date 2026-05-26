@@ -7,7 +7,7 @@ extern "C"
 
 static RTEncoderBase::EncodedFrameCallback make_noop_output_callback()
 {
-    return [](const uint8_t *, size_t) {};
+    return [](const uint8_t *, size_t, bool) {};
 }
 
 const char *EncMgr::state_to_cstr(State s)

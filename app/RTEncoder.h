@@ -36,7 +36,7 @@ struct EncoderConfig
     uint32_t num_stream_bufs = 4;                 // Number of output stream buffers
     std::string enc_dev_path = "/dev/allegroIP";  // Encoder device node (e.g., "/dev/allegroIP")
     std::string dma_dev_path = "/dev/dmaproxy";   // DMAProxy device node (e.g., "/dev/dmaproxy")
-    bool low_delay_mode = false;                  // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
+    bool low_delay_mode = false; // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
 };
 
 enum class SourceMode
@@ -94,7 +94,7 @@ class RTEncoderBase
 {
   public:
     /// Callback invoked for each encoded NAL unit / AU on the SDK thread.
-    using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size)>;
+    using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size, bool eof)>;
     virtual ~RTEncoderBase();
 
     RTEncoderBase(const RTEncoderBase &) = delete;

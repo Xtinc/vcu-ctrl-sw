@@ -211,7 +211,6 @@ RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
         init_stream_buf_pool();
         push_stream_buffers();
         set_resolution(m_cfg.width, m_cfg.height);
-
     }
     catch (...)
     {
@@ -515,7 +514,7 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
         {
             try
             {
-                m_callback(pBase, uSize);
+                m_callback(pBase, uSize, eof);
             }
             catch (...)
             {
