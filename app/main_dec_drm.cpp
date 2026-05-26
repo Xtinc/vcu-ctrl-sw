@@ -29,9 +29,6 @@ extern "C"
 #include <string>
 #include <thread>
 
-// ---------------------------------------------------------------------------
-// Signal handling
-// ---------------------------------------------------------------------------
 static volatile sig_atomic_t g_stop = 0;
 
 static void signal_handler(int)
@@ -39,9 +36,6 @@ static void signal_handler(int)
     g_stop = 1;
 }
 
-// ---------------------------------------------------------------------------
-// Options
-// ---------------------------------------------------------------------------
 struct AppOptions
 {
     unsigned short udp_port  = 0;
@@ -125,7 +119,6 @@ static bool parse_options(int argc, char *argv[], AppOptions &options)
     return true;
 }
 
-// ---------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
     message_init();

@@ -8,8 +8,6 @@ extern "C"
 #include <csignal>
 #include <pthread.h>
 
-namespace
-{
 bool block_process_signals(sigset_t &signal_set)
 {
     sigemptyset(&signal_set);
@@ -45,7 +43,6 @@ EncoderConfig make_default_config()
     cfg.height = 2160;
     return cfg;
 }
-} // namespace
 
 int main(int argc, char *argv[])
 {
