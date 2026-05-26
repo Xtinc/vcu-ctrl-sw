@@ -282,7 +282,7 @@ EncodedFrameCallback EncMgr::make_output_callback() const
     }
 
     std::weak_ptr<ReliableUDP> weak_udp = m_sender;
-    return [weak_udp](const uint8_t *data, size_t size, bool eof) {
+    return [weak_udp](const uint8_t *data, size_t size, bool /*eof*/) {
         if (auto udp = weak_udp.lock())
         {
             udp->send(data, size);

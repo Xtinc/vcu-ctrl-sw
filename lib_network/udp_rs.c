@@ -76,7 +76,7 @@ typedef unsigned char gf;
  * Primitive polynomials - see Lin & Costello, Appendix A,
  * and  Lee & Messerschmitt, p. 453.
  */
-static char *allPp[] = {
+static const char *allPp[] = {
     /* GF_BITS  polynomial      */
     NULL,               /*  0   no code         */
     NULL,               /*  1   no code         */
@@ -180,7 +180,7 @@ static void generate_gf(void)
 {
     int i;
     gf mask;
-    char *Pp = allPp[GF_BITS];
+    const char *Pp = allPp[GF_BITS];
 
     mask = 1;            /* x ** 0 = 1 */
     gf_exp[GF_BITS] = 0; /* will be updated at the end of the 1st loop */
@@ -565,6 +565,7 @@ static gf *vandermonde(int nrows, int ncols)
 static gf *sub_matrix(gf *matrix, int rmin, int cmin, int rmax, int cmax, int nrows, int ncols)
 {
     int i, j, ptr = 0;
+    (void)nrows;
     gf *new_m = (gf *)RS_MALLOC((rmax - rmin) * (cmax - cmin));
     if (NULL != new_m)
     {
