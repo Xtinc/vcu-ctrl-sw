@@ -25,10 +25,9 @@ add_executable(vcu_dec_file
     ${APP_DIR}/RTDecoder.cpp
     SliceFeeder.cpp
     main_dec_file.cpp
-    $<TARGET_OBJECTS:lib_network_obj>
 )
 target_include_directories(vcu_dec_file PRIVATE ${APP_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${LIBDRM_INCLUDE_DIRS})
-target_link_libraries(vcu_dec_file PRIVATE liballegro_decode_static ${LIBDRM_LIBRARIES})
+target_link_libraries(vcu_dec_file PRIVATE liballegro_decode_static lib_network_obj ${LIBDRM_LIBRARIES})
 
 # --- DRM dumb-buffer display test ---
 # Exercises DRMDisplayDumb with synthetic solid-colour frames, no external
@@ -37,7 +36,6 @@ add_executable(dumb_test
     ${APP_DIR}/MemMgr.cpp
     ${APP_DIR}/DRMDisplay.cpp
     DRMDumbTest.cpp
-    $<TARGET_OBJECTS:lib_network_obj>
 )
 target_include_directories(dumb_test PRIVATE ${APP_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${LIBDRM_INCLUDE_DIRS})
-target_link_libraries(dumb_test PRIVATE liballegro_decode_static ${LIBDRM_LIBRARIES})
+target_link_libraries(dumb_test PRIVATE liballegro_decode_static lib_network_obj ${LIBDRM_LIBRARIES})

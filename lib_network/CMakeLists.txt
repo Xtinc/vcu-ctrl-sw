@@ -6,4 +6,4 @@ add_library(
     udp_net.cpp
     udp_rs.c)
 
-target_link_libraries(lib_network_obj PRIVATE lib_rtos_obj PUBLIC asio)
+target_link_libraries(lib_network_obj PRIVATE lib_rtos_obj INTERFACE asio)
