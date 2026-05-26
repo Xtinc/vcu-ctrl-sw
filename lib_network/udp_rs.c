@@ -48,7 +48,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rs.h"
+#include "udp_rs.h"
 #include <assert.h>
 
 /*

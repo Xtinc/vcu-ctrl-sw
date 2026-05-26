@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(vcu-ctrl-sw VERSION 0.44.0 LANGUAGES C CXX)
+project(vcu-ctrl-sw VERSION 0.94.0 LANGUAGES C CXX)
 
 # Language standards: gnu11 / gnu++11 (matching -std=gnu11 / -std=gnu++11 in original)
 set(CMAKE_C_STANDARD 11)
@@ -34,6 +34,8 @@ option(ENABLE_ENC_SW_MULTIPASS "Enable encoder software multi-pass" OFF)
 add_compile_definitions(AL_ENABLE_64BIT=1)
 
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBDRM REQUIRED libdrm)
 
 # asio
 add_library(asio INTERFACE)
@@ -69,7 +71,3 @@ add_subdirectory(lib_encode)
 add_subdirectory(lib_decode)
 add_subdirectory(lib_app)
 add_subdirectory(app)
-
-
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBDRM REQUIRED libdrm)
