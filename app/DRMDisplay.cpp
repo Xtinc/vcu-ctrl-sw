@@ -280,12 +280,10 @@ DRMDisplayBase::~DRMDisplayBase()
 void DRMDisplayBase::drain()
 {
     std::unique_lock<std::mutex> lk(m_mutex);
-    m_cv.wait(lk, [this] {
-        return m_stopped.load(std::memory_order_relaxed) ||
-               (!slot_by_state_locked(SlotState::PENDING) &&
-                !slot_by_state_locked(SlotState::SCANNING) &&
-                !slot_by_state_locked(SlotState::RELEASING));
-    });
+    m_drain_requested = true;
+    m_cv.notify_all();
+    m_cv.wait(lk, [this] { return m_stopped.load(std::memory_order_relaxed) || slots_empty_locked(); });
+    m_drain_requested = false;
 }
 
 void DRMDisplayBase::stop()
@@ -340,7 +338,7 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
         target->state = SlotState::PENDING;
     }
 
-    m_cv.notify_one();
+    m_cv.notify_all();
 }
 
 void DRMDisplayBase::init_drm()
@@ -622,6 +620,50 @@ bool DRMDisplayBase::schedule_flip_locked()
     return true;
 }
 
+bool DRMDisplayBase::disable_scanout_locked()
+{
+    auto *scanning = slot_by_state_locked(SlotState::SCANNING);
+    if (!scanning)
+    {
+        return false;
+    }
+
+    auto *req = drmModeAtomicAlloc();
+    if (!req)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: drmModeAtomicAlloc failed (drain disable)");
+        return false;
+    }
+
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.fb_id, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_id, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_w, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.crtc_h, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_x, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_y, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_w, 0);
+    drmModeAtomicAddProperty(req, m_plane_id, m_plane_props.src_h, 0);
+
+    const int ret = drmModeAtomicCommit(m_drm_fd, req, 0, nullptr);
+    drmModeAtomicFree(req);
+
+    if (ret != 0)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: drain disable drmModeAtomicCommit: %s (%d)", ::strerror(errno), errno);
+        return false;
+    }
+
+    release_frame(scanning->buf);
+    *scanning = Slot{};
+    m_last_flip_tp = {};
+    m_commit_tp = {};
+    m_wait_phase_adjust = {};
+    m_in_flight_retries = 0;
+    return true;
+}
+
 ClockEntry::ClockTP DRMDisplayBase::compute_submit_deadline()
 {
     std::lock_guard<std::mutex> lk(m_mutex);
@@ -744,7 +786,7 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
         m_in_flight = false;
     }
 
-    m_cv.notify_one();
+    m_cv.notify_all();
 }
 
 void DRMDisplayBase::event_thread_fn()
@@ -754,7 +796,7 @@ void DRMDisplayBase::event_thread_fn()
         {
             std::unique_lock<std::mutex> lk(m_mutex);
             m_cv.wait(lk, [this] {
-                return m_stopped.load(std::memory_order_acquire) || m_in_flight ||
+                return m_stopped.load(std::memory_order_acquire) || m_in_flight || m_drain_requested ||
                        slot_by_state_locked(SlotState::PENDING) != nullptr;
             });
         }
@@ -788,12 +830,28 @@ void DRMDisplayBase::event_thread_fn()
             break;
         }
 
+        bool notify_drain_complete = false;
         {
             std::lock_guard<std::mutex> lk(m_mutex);
-            if (!m_in_flight && slot_by_state_locked(SlotState::PENDING))
+            auto *pending = slot_by_state_locked(SlotState::PENDING);
+            if (!m_in_flight && pending)
             {
                 schedule_flip_locked();
             }
+            else if (!m_in_flight && m_drain_requested)
+            {
+                auto *releasing = slot_by_state_locked(SlotState::RELEASING);
+                auto *scanning = slot_by_state_locked(SlotState::SCANNING);
+                if (!pending && !releasing && scanning && disable_scanout_locked())
+                {
+                    notify_drain_complete = true;
+                }
+            }
+        }
+
+        if (notify_drain_complete)
+        {
+            m_cv.notify_all();
         }
     }
 }
@@ -812,6 +870,11 @@ DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
     {
         return nullptr;
     }
+}
+
+bool DRMDisplayBase::slots_empty_locked() const
+{
+    return m_slots[0].state == SlotState::FREE && m_slots[1].state == SlotState::FREE;
 }
 
 // ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────

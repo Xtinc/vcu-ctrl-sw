@@ -148,12 +148,14 @@ class DRMDisplayBase
 
     bool do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h);
     bool schedule_flip_locked();
+    bool disable_scanout_locked();
     ClockEntry::ClockTP compute_submit_deadline();
     void drain_flip_event();
     void on_flip_done(unsigned tv_sec, unsigned tv_usec);
     void event_thread_fn();
 
     Slot *slot_by_state_locked(SlotState s);
+    bool slots_empty_locked() const;
 
   protected:
     /**
@@ -178,6 +180,7 @@ class DRMDisplayBase
 
     Slot m_slots[2];
     bool m_in_flight{false};
+    bool m_drain_requested{false};
     std::mutex m_mutex;
     std::condition_variable m_cv;
 
