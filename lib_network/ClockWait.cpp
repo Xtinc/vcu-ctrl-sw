@@ -1,4 +1,4 @@
-#include "clock_wait.h"
+#include "ClockWait.h"
 #include <thread>
 
 #if LINUX_OS_ENVIRONMENT

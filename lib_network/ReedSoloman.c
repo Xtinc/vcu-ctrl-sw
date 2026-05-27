@@ -48,7 +48,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "udp_rs.h"
+#include "ReedSoloman.h"
 #include <assert.h>
 
 /*

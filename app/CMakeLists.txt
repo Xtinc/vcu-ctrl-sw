@@ -1,9 +1,6 @@
-set(APP_COMMMON_SRC 
-    BackGround.cpp
-    MemMgr.cpp)
 # --- Encoder v4l2 app ---
 add_executable(vcu_enc_v4l2
-    ${APP_COMMMON_SRC}
+    MemMgr.cpp
     EncMgr.cpp
     RTEncoder.cpp
     XilinxSyncIP.cpp
@@ -13,7 +10,7 @@ add_executable(vcu_enc_v4l2
 target_link_libraries(vcu_enc_v4l2 PRIVATE liballegro_encode_static lib_network_obj)
 
 add_executable(vcu_dec_drm
-    ${APP_COMMMON_SRC}
+    MemMgr.cpp
     DecMgr.cpp
     DRMDisplay.cpp
     RTDecoder.cpp

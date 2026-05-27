@@ -1,9 +1,9 @@
 #ifndef RELIABLE_UDP_H
 #define RELIABLE_UDP_H
 
+#include "MemPoolUDP.h"
+#include "ReedSoloman.h"
 #include "asio.hpp"
-#include "udp_mem.h"
-#include "udp_rs.h"
 
 #include <array>
 #include <atomic>
@@ -16,6 +16,25 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+void set_current_thread_scheduler_policy();
+
+class BackgroundService
+{
+  public:
+    static BackgroundService &instance();
+    asio::io_context &context();
+
+  private:
+    BackgroundService();
+    ~BackgroundService();
+
+    asio::io_context io_context;
+    std::vector<std::thread> io_thds;
+    asio::executor_work_guard<asio::io_context::executor_type> work_guard;
+};
+
+#define BG_SERVICE (BackgroundService::instance().context())
 
 using RecvCallBack = std::function<void(const uint8_t *data, size_t size)>;
 

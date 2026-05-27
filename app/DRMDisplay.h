@@ -1,7 +1,7 @@
 #ifndef DRM_DISPLAY_H
 #define DRM_DISPLAY_H
 
-#include "lib_network/clock_wait.h"
+#include "lib_network/ClockWait.h"
 #include <xf86drmMode.h>
 
 #include <array>

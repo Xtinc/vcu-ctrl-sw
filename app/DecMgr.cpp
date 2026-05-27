@@ -1,14 +1,5 @@
 #include "DecMgr.h"
-#include "BackGround.h"
-#include "lib_network/udp_net.h"
-
-#include <stdexcept>
-
-extern "C"
-{
-#include "lib_common/BufferAPI.h"
-#include "lib_rtos/message.h"
-}
+#include "lib_network/ReliableUDP.h"
 
 DecMgr::DecMgr(DecMgrConfig cfg) : m_cfg(std::move(cfg))
 {

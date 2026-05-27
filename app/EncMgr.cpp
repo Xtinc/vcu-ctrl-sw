@@ -1,13 +1,5 @@
 #include "EncMgr.h"
-#include "BackGround.h"
-#include "lib_network/udp_net.h"
-
-#include <stdexcept>
-
-extern "C"
-{
-#include "lib_rtos/message.h"
-}
+#include "lib_network/ReliableUDP.h"
 
 const char *EncMgr::state_to_cstr(State s)
 {
