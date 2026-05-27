@@ -1,4 +1,5 @@
 #include "DecMgr.h"
+#include "BackGround.h"
 #include "lib_network/udp_net.h"
 
 extern "C"
@@ -44,7 +45,7 @@ bool DecMgr::start()
 
     if (m_cfg.udp_local_port != 0)
     {
-        m_receiver = make_reliable_udp(m_cfg.udp_local_port);
+        m_receiver = make_reliable_udp(BG_SERVICE, m_cfg.udp_local_port);
         m_receiver->set_receive_callback([this](const uint8_t *data, size_t size) { push_stream(data, size); });
         m_receiver->start();
     }

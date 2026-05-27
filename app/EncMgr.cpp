@@ -1,4 +1,5 @@
 #include "EncMgr.h"
+#include "BackGround.h"
 #include "lib_network/udp_net.h"
 
 extern "C"
@@ -49,7 +50,7 @@ bool EncMgr::start()
 
     if (!m_cfg.udp_dest_addr.empty())
     {
-        m_sender = make_reliable_udp(m_cfg.udp_local_port);
+        m_sender = make_reliable_udp(BG_SERVICE, m_cfg.udp_local_port, default_trx_fec_strategy);
         m_sender->start();
         if (!m_sender->add_destination(m_cfg.udp_dest_addr, m_cfg.udp_dest_port))
         {

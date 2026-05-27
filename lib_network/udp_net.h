@@ -18,6 +18,17 @@
 
 using RecvCallBack = std::function<void(const uint8_t *data, size_t size)>;
 
+enum class TRXFecMode
+{
+    None,
+    Xor,
+    Rs,
+};
+
+using TRXFecStrategy = std::function<TRXFecMode(size_t)>;
+
+TRXFecMode default_trx_fec_strategy(size_t packet_size);
+
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
 constexpr size_t MAX_TRX_UDP_SIZE = 65536;
 constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;
@@ -67,12 +78,12 @@ struct TRXUnit
 
     static bool validate(Header *header)
     {
-        if (header->units_num != MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY &&
+        if (header->units_num != 1 && header->units_num != MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY &&
             header->units_num != MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY)
         {
             return false;
         }
-        if (header->units_idx >= MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY)
+        if (header->units_idx >= header->units_num)
         {
             return false;
         }
@@ -295,6 +306,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
 
   public:
     explicit ReliableUDP(asio::io_context &io_context, unsigned short local_port);
+    explicit ReliableUDP(asio::io_context &io_context, unsigned short local_port, TRXFecStrategy fec_strategy);
     ~ReliableUDP();
 
     void start();
@@ -310,6 +322,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
   private:
     void start_receive();
     void handle_receive(const asio::error_code &error, size_t bytes_transferred);
+    void create_no_fec_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
+                             uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id, uint16_t total_groups);
     std::vector<TRXUnit> create_trx_units(const uint8_t *data, size_t size);
     void create_huge_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
                                uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id,
@@ -323,6 +337,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void assemble_complete_message(uint16_t frame_seq, uint16_t group_num, uint16_t group_seq, uint8_t *data,
                                    size_t size);
     void generate_uuid();
+    TRXFecMode resolve_fec_mode(size_t packet_size) const;
 
   private:
     std::atomic<bool> running_;
@@ -352,10 +367,12 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 
+    TRXFecStrategy fec_strategy_;
     UsrQueue<true> usr_queue_;
     std::atomic<uint64_t> lost_packets_;
 };
 
-std::shared_ptr<ReliableUDP> make_reliable_udp(unsigned short local_port);
+std::shared_ptr<ReliableUDP> make_reliable_udp(asio::io_context &io_context, unsigned short local_port,
+                                               TRXFecStrategy fec_strategy = {});
 
 #endif // RELIABLE_UDP_H
