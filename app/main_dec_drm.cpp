@@ -7,11 +7,10 @@
  * renders the output on-screen via DRM/KMS zero-copy.
  *
  * Usage:
- *   vcu_dec --port <port> [hevc|avc] [--drm <device>]
+ *   vcu_dec --port <port> [--drm <device>]
  *
  *   --port <port>   Local UDP port to receive encoded bitstream on (required).
- *   hevc / h265     Select HEVC codec (default).
- *   avc  / h264     Select AVC codec.
+ *   Codec           Fixed to H265/HEVC.
  *   --drm <device>  DRM device node (default: /dev/dri/card0).
  */
 
@@ -39,8 +38,7 @@ static void signal_handler(int)
 struct AppOptions
 {
     unsigned short udp_port  = 0;
-    AL_ECodec      codec     = AL_CODEC_HEVC;
-    std::string    drm_device = "/dev/dri/card0";
+    std::string drm_device = "/dev/dri/card0";
 };
 
 // 4 MB accommodates large I-frames and high-bitrate streams
@@ -48,10 +46,9 @@ static constexpr uint32_t kInputBufSize = 4u * 1024u * 1024u;
 
 static void print_usage(const char *app)
 {
-    VIDEO_ERROR_PRINT("Usage: %s --port <port> [hevc|avc] [--drm <device>]", app);
+    VIDEO_ERROR_PRINT("Usage: %s --port <port> [--drm <device>]", app);
     VIDEO_ERROR_PRINT("  --port <port>   Local UDP port to receive encoded bitstream on (required).");
-    VIDEO_ERROR_PRINT("  hevc / h265     Select HEVC codec (default).");
-    VIDEO_ERROR_PRINT("  avc  / h264     Select AVC codec.");
+    VIDEO_ERROR_PRINT("  codec           Fixed to H265/HEVC.");
     VIDEO_ERROR_PRINT("  --drm <device>  DRM device node (default: /dev/dri/card0).");
 }
 
@@ -94,18 +91,6 @@ static bool parse_options(int argc, char *argv[], AppOptions &options)
             continue;
         }
 
-        if (token == "avc" || token == "h264")
-        {
-            options.codec = AL_CODEC_AVC;
-            continue;
-        }
-
-        if (token == "hevc" || token == "h265")
-        {
-            options.codec = AL_CODEC_HEVC;
-            continue;
-        }
-
         VIDEO_ERROR_PRINT("Unknown argument '%s'.", token.c_str());
         return false;
     }
@@ -134,7 +119,7 @@ int main(int argc, char *argv[])
     std::signal(SIGTERM, signal_handler);
 
     DecMgrConfig cfg;
-    cfg.dec.codec             = options.codec;
+    cfg.dec.codec             = AL_CODEC_HEVC;
     cfg.dec.input_buffer_size = kInputBufSize;
     cfg.dec.low_delay_mode    = false;
     cfg.drm.drm_device        = options.drm_device;
@@ -147,10 +132,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    VIDEO_INFO_PRINT("Listening on UDP port %u  codec=%s  drm=%s",
-                     options.udp_port,
-                     options.codec == AL_CODEC_HEVC ? "HEVC" : "AVC",
-                     options.drm_device.c_str());
+    VIDEO_INFO_PRINT("Listening on UDP port %u  codec=HEVC  drm=%s", options.udp_port, options.drm_device.c_str());
     VIDEO_INFO_PRINT("Press Ctrl+C to stop.");
 
     while (!g_stop)

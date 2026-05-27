@@ -30,7 +30,7 @@ struct DecMgrConfig
     DecoderConfig dec;    ///< Hardware decoder configuration (codec, device, buffer sizes).
     DRMDisplayConfig drm; ///< DRM/KMS display configuration (device, mode, timing).
 
-    unsigned short udp_local_port = 0; ///< UDP port to receive encoded bitstream on (0 = disabled).
+    unsigned short udp_local_port = 0; ///< UDP port to receive encoded bitstream on (required, must be > 0).
 };
 
 /**

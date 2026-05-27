@@ -17,8 +17,8 @@ struct EncMgrConfig
     std::string sync_dev;    ///< Xilinx sync device path (empty = disabled)
     int source_check_interval_ms = 2000; ///< Interval for checking source presence in WaitingSource state
 
-    std::string udp_dest_addr;         ///< UDP destination address (empty = UDP disabled)
-    unsigned short udp_dest_port = 0;  ///< UDP destination port
+    std::string udp_dest_addr;         ///< UDP destination address (required)
+    unsigned short udp_dest_port = 0;  ///< UDP destination port (required, must be > 0)
     unsigned short udp_local_port = 0; ///< UDP local bind port (0 = OS-assigned)
 };
 

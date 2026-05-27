@@ -2,6 +2,8 @@
 #include "BackGround.h"
 #include "lib_network/udp_net.h"
 
+#include <stdexcept>
+
 extern "C"
 {
 #include "lib_rtos/message.h"
@@ -33,6 +35,10 @@ EncMgr::EncMgr(EncMgrConfig cfg) : m_cfg(std::move(cfg))
         throw std::invalid_argument("EncMgr: v4l2_dev must not be empty");
     if (m_cfg.v4l2_subdev.empty())
         throw std::invalid_argument("EncMgr: v4l2_subdev must not be empty (USB cameras not supported)");
+    if (m_cfg.udp_dest_addr.empty())
+        throw std::invalid_argument("EncMgr: udp_dest_addr must not be empty");
+    if (m_cfg.udp_dest_port == 0)
+        throw std::invalid_argument("EncMgr: udp_dest_port must be > 0");
 }
 
 EncMgr::~EncMgr()
@@ -45,13 +51,6 @@ bool EncMgr::start()
     if (m_running.exchange(true))
     {
         VIDEO_ERROR_PRINT("EncMgr::start() called while already running");
-        return false;
-    }
-
-    if (m_cfg.udp_dest_addr.empty())
-    {
-        VIDEO_INFO_PRINT("EncMgr: UDP output disabled (no destination address)");
-        m_running.store(false);
         return false;
     }
 

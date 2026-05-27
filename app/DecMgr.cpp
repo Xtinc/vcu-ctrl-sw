@@ -29,10 +29,24 @@ bool DecMgr::start()
 
     if (m_cfg.udp_local_port == 0)
     {
-        VIDEO_INFO_PRINT("DecMgr: UDP input disabled (local port is 0)");
+        VIDEO_ERROR_PRINT("DecMgr: invalid UDP local port 0");
         m_running.store(false);
         return false;
     }
+
+    auto cleanup_start_failure = [this]() {
+        if (m_receiver)
+        {
+            m_receiver->stop();
+            m_receiver.reset();
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_dec_mutex);
+            m_decoder.reset();
+        }
+        m_display.reset();
+        m_running.store(false);
+    };
 
     try
     {
@@ -51,18 +65,7 @@ bool DecMgr::start()
     catch (const std::exception &e)
     {
         VIDEO_ERROR_PRINT("DecMgr: start failed: %s", e.what());
-        if (m_receiver)
-        {
-            m_receiver->stop();
-            m_receiver.reset();
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(m_dec_mutex);
-            m_decoder.reset();
-        }
-        m_display.reset();
-        m_running.store(false);
+        cleanup_start_failure();
         return false;
     }
 }
@@ -164,12 +167,14 @@ double DecMgr::fps() const
 
 void DecMgr::on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info)
 {
-    m_display->show(frame, info);
+    if (m_display)
+        m_display->show(frame, info);
 }
 
 void DecMgr::return_frame(AL_TBuffer *frame)
 {
-    m_decoder->return_display_frame(frame);
+    if (m_decoder)
+        m_decoder->return_display_frame(frame);
 }
 
 bool DecMgr::create_decoder()
