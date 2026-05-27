@@ -6,11 +6,12 @@
 #include "udp_rs.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <list>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -21,8 +22,8 @@ using RecvCallBack = std::function<void(const uint8_t *data, size_t size)>;
 enum class TRXFecMode
 {
     None,
-    Xor,
-    Rs,
+    XOR,
+    RS,
 };
 
 TRXFecMode default_trx_fec_strategy(size_t packet_size);
@@ -314,6 +315,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     {
         usr_queue_.start(callback, user_data);
     }
+    double send_rate();
+    double recv_rate();
     double lost_rate();
 
   private:
@@ -364,8 +367,15 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 
-    UsrQueue<true> usr_queue_;
+    UsrQueue<false> usr_queue_;
     std::atomic<uint64_t> lost_packets_;
+    std::atomic<uint64_t> send_bytes_;
+    std::atomic<uint64_t> recv_bytes_;
+    std::mutex rate_mutex_;
+    std::chrono::steady_clock::time_point last_send_rate_time_;
+    std::chrono::steady_clock::time_point last_recv_rate_time_;
+    uint64_t last_send_rate_bytes_;
+    uint64_t last_recv_rate_bytes_;
 };
 
 #endif // RELIABLE_UDP_H

@@ -3,9 +3,6 @@
 #include <chrono>
 #include <cinttypes>
 #include <stdexcept>
-#include <thread>
-
-static std::once_flag fec_init_flag;
 
 struct FECLayout
 {
@@ -14,31 +11,55 @@ struct FECLayout
     uint8_t fec_packets_count;
 };
 
-FECLayout resolve_fec_layout(uint8_t units_num)
+static double calc_rate_bps(std::atomic<uint64_t> &total_bytes, std::mutex &rate_mutex,
+                            std::chrono::steady_clock::time_point &last_time, uint64_t &last_bytes)
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(rate_mutex);
+    const auto elapsed_seconds = std::chrono::duration<double>(now - last_time).count();
+    if (elapsed_seconds <= 0.0)
+    {
+        return 0.0;
+    }
+
+    const auto current_bytes = total_bytes.load(std::memory_order_relaxed);
+    const auto delta_bytes = current_bytes - last_bytes;
+
+    last_time = now;
+    last_bytes = current_bytes;
+
+    return static_cast<double>(delta_bytes) * 8.0 / elapsed_seconds;
+}
+
+static FECLayout resolve_fec_layout(uint8_t units_num)
 {
     switch (units_num)
     {
     case 1:
         return {TRXFecMode::None, 1, 0};
     case 2:
-        return {TRXFecMode::Xor, 1, 1};
+        return {TRXFecMode::XOR, 1, 1};
     case MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY:
-        return {TRXFecMode::Rs, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
+        return {TRXFecMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
     default:
-        return {TRXFecMode::Rs, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
+        return {TRXFecMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
     }
 }
 
-TRXFecMode default_trx_fec_strategy(size_t packet_size)
+static TRXFecMode default_trx_fec_strategy(size_t packet_size)
 {
-    return packet_size < MAX_TRX_UNIT_SIZE ? TRXFecMode::Xor : TRXFecMode::Rs;
+    return packet_size < MAX_TRX_UNIT_SIZE ? TRXFecMode::XOR : TRXFecMode::RS;
 }
+
+static std::once_flag fec_init_flag;
 
 ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port)
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
       send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), destination_set_(false),
       frame_cycle_(1), group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
-      lost_packets_(0)
+      lost_packets_(0), send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
+      last_recv_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0)
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -74,7 +95,7 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
     generate_uuid();
 
     VIDEO_INFO_PRINT("ReliableUDP initialized - receive port: %d, uuid: %u", recv_socket_->local_endpoint().port(),
-                    target_uid_);
+                     target_uid_);
 }
 
 ReliableUDP::~ReliableUDP()
@@ -186,7 +207,7 @@ double ReliableUDP::lost_rate()
         if (real_lost_rate > 0.0)
         {
             VIDEO_INFO_PRINT("Current lost rate: %.2f%% (lost: %" PRIu64 ", recv: %" PRIu64 ")", real_lost_rate * 100.0,
-                            lost_packets, recv_packets);
+                             lost_packets, recv_packets);
         }
 
         recv_packets_.store(0, std::memory_order_relaxed);
@@ -195,6 +216,16 @@ double ReliableUDP::lost_rate()
     }
 
     return real_lost_rate;
+}
+
+double ReliableUDP::send_rate()
+{
+    return calc_rate_bps(send_bytes_, rate_mutex_, last_send_rate_time_, last_send_rate_bytes_);
+}
+
+double ReliableUDP::recv_rate()
+{
+    return calc_rate_bps(recv_bytes_, rate_mutex_, last_recv_rate_time_, last_recv_rate_bytes_);
 }
 
 void ReliableUDP::start_receive()
@@ -224,10 +255,12 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
             if (unit_len == 0 || unit_len > MAX_TRX_DATA_SIZE || payload_len != unit_len)
             {
                 VIDEO_ERROR_PRINT("Invalid payload length: payload=%zu, unit_len=%zu, max=%zu", payload_len, unit_len,
-                                 static_cast<size_t>(MAX_TRX_DATA_SIZE));
+                                  static_cast<size_t>(MAX_TRX_DATA_SIZE));
                 start_receive();
                 return;
             }
+
+            recv_bytes_.fetch_add(static_cast<uint64_t>(bytes_transferred), std::memory_order_relaxed);
 
             unit.data = static_cast<uint8_t *>(recv_pool_.allocate(unit_len, false));
             if (unit.data)
@@ -382,7 +415,7 @@ void ReliableUDP::create_no_fec_group(std::vector<TRXUnit> &all_units, const uin
 
 TRXFecMode ReliableUDP::resolve_fec_mode(size_t packet_size) const
 {
-    return packet_size > MAX_TRX_UNIT_SIZE ? TRXFecMode::Rs : TRXFecMode::Xor;
+    return packet_size > MAX_TRX_UNIT_SIZE ? TRXFecMode::RS : TRXFecMode::XOR;
 }
 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
@@ -407,11 +440,11 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
             create_no_fec_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                 static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
-        case TRXFecMode::Xor:
+        case TRXFecMode::XOR:
             create_small_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                    static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
-        case TRXFecMode::Rs:
+        case TRXFecMode::RS:
             create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                   static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
@@ -487,7 +520,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
             it->units.push_back(unit);
             auto sentinel = it->units.front();
             sentinel.data = nullptr;
-            if (layout.mode != TRXFecMode::Rs)
+            if (layout.mode != TRXFecMode::RS)
             {
                 assemble_complete_message(unit.head.frame_seq, unit.head.group_num, unit.head.group_seq, unit.data,
                                           unit.head.group_len);
@@ -697,7 +730,7 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
     {
         auto &oldest_frame = receive_frames_.back();
         VIDEO_DEBUG_PRINT("Cleaning up frame (%u,%u) with %zu fragments, expected %u", oldest_frame.frame_cyc,
-                         oldest_frame.frame_seq, oldest_frame.fragments.size(), oldest_frame.group_num);
+                          oldest_frame.frame_seq, oldest_frame.fragments.size(), oldest_frame.group_num);
         for (const auto &frag : oldest_frame.fragments)
         {
             recv_pool_.deallocate(frag.second);
@@ -749,16 +782,22 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
             std::array<asio::const_buffer, 2> buffers = {asio::buffer(&unit.head, TRX_HEADER_SIZE),
                                                          asio::buffer(unit.data, unit.head.units_len)};
             send_socket_->send_to(buffers, target_endpoint_);
+            send_bytes_.fetch_add(static_cast<uint64_t>(TRX_HEADER_SIZE + unit.head.units_len),
+                                  std::memory_order_relaxed);
             send_pool_.deallocate(unit.data);
+            unit.data = nullptr;
         }
         return true;
     }
     catch (const std::exception &e)
     {
-        // Ensure no unsent units leak when send_to throws mid-loop.
         for (auto &unit : units)
         {
-            send_pool_.deallocate(unit.data);
+            if (unit.data)
+            {
+                send_pool_.deallocate(unit.data);
+                unit.data = nullptr;
+            }
         }
         VIDEO_ERROR_PRINT("Error occurred while sending data: %s", e.what());
         return false;
