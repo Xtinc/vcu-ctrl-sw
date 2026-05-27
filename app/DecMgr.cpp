@@ -2,6 +2,8 @@
 #include "BackGround.h"
 #include "lib_network/udp_net.h"
 
+#include <stdexcept>
+
 extern "C"
 {
 #include "lib_common/BufferAPI.h"
@@ -25,32 +27,44 @@ bool DecMgr::start()
         return false;
     }
 
-    try
+    if (m_cfg.udp_local_port == 0)
     {
-        m_display = std::make_unique<DRMDisplay>(m_cfg.drm, [this](AL_TBuffer *f) { return_frame(f); });
-    }
-    catch (const std::exception &e)
-    {
-        VIDEO_ERROR_PRINT("DecMgr: failed to create DRMDisplay: %s", e.what());
+        VIDEO_INFO_PRINT("DecMgr: UDP input disabled (local port is 0)");
         m_running.store(false);
         return false;
     }
 
-    if (!create_decoder())
+    try
     {
+        m_display = std::make_unique<DRMDisplay>(m_cfg.drm, [this](AL_TBuffer *f) { return_frame(f); });
+
+        if (!create_decoder())
+        {
+            throw std::runtime_error("DecMgr: create_decoder failed");
+        }
+
+        m_receiver = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
+        m_receiver->set_receive_callback([this](const uint8_t *data, size_t size) { push_stream(data, size); });
+        m_receiver->start();
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        VIDEO_ERROR_PRINT("DecMgr: start failed: %s", e.what());
+        if (m_receiver)
+        {
+            m_receiver->stop();
+            m_receiver.reset();
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_dec_mutex);
+            m_decoder.reset();
+        }
         m_display.reset();
         m_running.store(false);
         return false;
     }
-
-    if (m_cfg.udp_local_port != 0)
-    {
-        m_receiver = make_reliable_udp(BG_SERVICE, m_cfg.udp_local_port);
-        m_receiver->set_receive_callback([this](const uint8_t *data, size_t size) { push_stream(data, size); });
-        m_receiver->start();
-    }
-
-    return true;
 }
 
 void DecMgr::stop()

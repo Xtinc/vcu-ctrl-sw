@@ -2,20 +2,19 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <stdexcept>
 #include <thread>
 
 static std::once_flag fec_init_flag;
 
-namespace
-{
-struct FecLayout
+struct FECLayout
 {
     TRXFecMode mode;
     uint8_t data_packets_count;
     uint8_t fec_packets_count;
 };
 
-FecLayout resolve_fec_layout(uint8_t units_num)
+FECLayout resolve_fec_layout(uint8_t units_num)
 {
     switch (units_num)
     {
@@ -30,100 +29,52 @@ FecLayout resolve_fec_layout(uint8_t units_num)
     }
 }
 
-bool validate_payload_consistency(const TRXUnit::Header &header, size_t payload_size)
-{
-    if (header.units_len == 0 || header.units_len > MAX_TRX_DATA_SIZE)
-    {
-        return false;
-    }
-
-    if (payload_size != header.units_len)
-    {
-        return false;
-    }
-
-    if ((header.units_num == 1 || header.units_num == MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY) &&
-        header.group_len != header.units_len)
-    {
-        return false;
-    }
-
-    if (header.units_num == MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY)
-    {
-        size_t max_group_len = MAX_RS_PACKET_NUM_PER_GROUP * header.units_len;
-        if (header.group_len == 0 || header.group_len > max_group_len)
-        {
-            return false;
-        }
-    }
-
-    return true;
-}
-} // namespace
-
 TRXFecMode default_trx_fec_strategy(size_t packet_size)
 {
     return packet_size < MAX_TRX_UNIT_SIZE ? TRXFecMode::Xor : TRXFecMode::Rs;
 }
 
 ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port)
-    : ReliableUDP(io_context, local_port, {})
-{
-}
-
-ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port, TRXFecStrategy fec_strategy)
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
       send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), destination_set_(false),
       frame_cycle_(1), group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
-      fec_strategy_(std::move(fec_strategy)), lost_packets_(0)
+      lost_packets_(0)
 {
-    try
+    // Create receive socket and bind to specific port
+    recv_socket_ = std::make_unique<udp::socket>(io_context_);
+    recv_socket_->open(udp::v4());
+
+    asio::socket_base::receive_buffer_size option_recv(3 * 1024 * 1024); // 3MB
+    asio::error_code ec;
+    recv_socket_->set_option(option_recv, ec);
+    recv_socket_->set_option(asio::socket_base::reuse_address(true), ec);
+
+    recv_socket_->bind(udp::endpoint(udp::v4(), local_port), ec);
+    if (ec)
     {
-        // Create receive socket and bind to specific port
-        recv_socket_ = std::make_unique<udp::socket>(io_context_);
-        recv_socket_->open(udp::v4());
-
-        asio::socket_base::receive_buffer_size option_recv(3 * 1024 * 1024); // 3MB
-        asio::error_code ec;
-        recv_socket_->set_option(option_recv, ec);
-        recv_socket_->set_option(asio::socket_base::reuse_address(true), ec);
-
-        recv_socket_->bind(udp::endpoint(udp::v4(), local_port), ec);
-        if (ec)
-        {
-            RUDP_ERROR_PRINT("Failed to bind receive socket on port %d: %s", local_port, ec.message().c_str());
-        }
-
-        // Create send socket without binding to specific port
-        send_socket_ = std::make_unique<udp::socket>(io_context_);
-        send_socket_->open(udp::v4());
-
-        asio::socket_base::send_buffer_size option_send(3 * 1024 * 1024); // 3MB
-        send_socket_->set_option(option_send, ec);
-        send_socket_->set_option(asio::socket_base::reuse_address(true), ec);
-
-        std::call_once(fec_init_flag, []() { fec_init(); });
-
-        if (!fec_strategy_)
-        {
-            fec_strategy_ = default_trx_fec_strategy;
-        }
-
-        rs_ = reed_solomon_new(MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY);
-        if (!rs_)
-        {
-            RUDP_ERROR_PRINT("Failed to create Reed-Solomon encoder");
-        }
-
-        generate_uuid();
-
-        RUDP_INFO_PRINT("ReliableUDP initialized - receive port: %d, uuid: %u", recv_socket_->local_endpoint().port(),
-                        target_uid_);
+        throw std::runtime_error("ReliableUDP bind failed: " + ec.message());
     }
-    catch (const std::exception &e)
+
+    // Create send socket without binding to specific port
+    send_socket_ = std::make_unique<udp::socket>(io_context_);
+    send_socket_->open(udp::v4());
+
+    asio::socket_base::send_buffer_size option_send(3 * 1024 * 1024); // 3MB
+    send_socket_->set_option(option_send, ec);
+    send_socket_->set_option(asio::socket_base::reuse_address(true), ec);
+
+    std::call_once(fec_init_flag, []() { fec_init(); });
+
+    rs_ = reed_solomon_new(MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY);
+    if (!rs_)
     {
-        RUDP_ERROR_PRINT("Failed to create ReliableUDP: %s", e.what());
+        throw std::runtime_error("Failed to create Reed-Solomon encoder");
     }
+
+    generate_uuid();
+
+    RUDP_INFO_PRINT("ReliableUDP initialized - receive port: %d, uuid: %u", recv_socket_->local_endpoint().port(),
+                    target_uid_);
 }
 
 ReliableUDP::~ReliableUDP()
@@ -268,10 +219,24 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
         std::memcpy(&unit.head, receive_buffer_, TRX_HEADER_SIZE);
         if (TRXUnit::validate(&unit.head))
         {
-            unit.data = static_cast<uint8_t *>(recv_pool_.allocate(MAX_TRX_DATA_SIZE, false));
+            const auto payload_len = bytes_transferred - TRX_HEADER_SIZE;
+            const auto unit_len = static_cast<size_t>(unit.head.units_len);
+            if (unit_len == 0 || unit_len > MAX_TRX_DATA_SIZE || payload_len != unit_len)
+            {
+                RUDP_ERROR_PRINT("Invalid payload length: payload=%zu, unit_len=%zu, max=%zu", payload_len, unit_len,
+                                 static_cast<size_t>(MAX_TRX_DATA_SIZE));
+                start_receive();
+                return;
+            }
+
+            unit.data = static_cast<uint8_t *>(recv_pool_.allocate(unit_len, false));
             if (unit.data)
             {
-                std::memcpy(unit.data, receive_buffer_ + TRX_HEADER_SIZE, bytes_transferred - TRX_HEADER_SIZE);
+                std::memcpy(unit.data, receive_buffer_ + TRX_HEADER_SIZE, unit_len);
+            }
+            else
+            {
+                RUDP_ERROR_PRINT("Failed to allocate receive buffer of %zu bytes", unit_len);
             }
             process_received_unit(unit);
         }
@@ -417,64 +382,40 @@ void ReliableUDP::create_no_fec_group(std::vector<TRXUnit> &all_units, const uin
 
 TRXFecMode ReliableUDP::resolve_fec_mode(size_t packet_size) const
 {
-    return fec_strategy_ ? fec_strategy_(packet_size) : default_trx_fec_strategy(packet_size);
+    return packet_size > MAX_TRX_UNIT_SIZE ? TRXFecMode::Rs : TRXFecMode::Xor;
 }
 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
 {
-    std::vector<TRXUnit> all_units;
-    uint16_t current_frame_id = next_frame_id_++;
-    uint16_t current_group_id = (next_group_id_ >= 0xffffu - MAX_GROUP_NUM_PER_FRAME) ? 0 : next_group_id_;
-
-    TRXFecMode fec_mode = resolve_fec_mode(size);
-
-    if (fec_mode == TRXFecMode::None)
-    {
-        size_t total_groups = (size + MAX_TRX_DATA_SIZE - 1) / MAX_TRX_DATA_SIZE;
-        all_units.reserve(total_groups);
-
-        size_t offset = 0;
-        for (size_t group_idx = 0; group_idx < total_groups; ++group_idx)
-        {
-            size_t remaining_size = size - offset;
-            size_t current_group_size = std::min(remaining_size, MAX_TRX_DATA_SIZE);
-            create_no_fec_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
-                                static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
-            offset += current_group_size;
-            current_group_id++;
-        }
-
-        next_group_id_ = current_group_id;
-        return all_units;
-    }
-
-    if (fec_mode == TRXFecMode::Xor)
-    {
-        if (size > MAX_TRX_DATA_SIZE)
-        {
-            RUDP_ERROR_PRINT("Xor mode only supports payload <= %zu, got %zu", MAX_TRX_DATA_SIZE, size);
-            return all_units;
-        }
-
-        all_units.reserve(2);
-        create_small_rtx_group(all_units, data, size, current_group_id, target_uid_, static_cast<uint16_t>(current_frame_id),
-                               1);
-        next_group_id_ = static_cast<uint16_t>(current_group_id + 1);
-        return all_units;
-    }
-
-    size_t max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
+    constexpr size_t max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
     size_t total_groups = (size + max_group_data_size - 1) / max_group_data_size;
-    all_units.reserve(total_groups * (MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY));
+
+    std::vector<TRXUnit> all_units;
 
     size_t offset = 0;
+    uint16_t current_frame_id = next_frame_id_++;
+    uint16_t current_group_id = (next_group_id_ >= 0xffffu - MAX_GROUP_NUM_PER_FRAME) ? 0 : next_group_id_;
 
     for (size_t group_idx = 0; group_idx < total_groups; ++group_idx)
     {
         size_t remaining_size = size - offset;
         size_t current_group_size = std::min(remaining_size, max_group_data_size);
-        create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
-                              static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+
+        switch (resolve_fec_mode(current_group_size))
+        {
+        case TRXFecMode::None:
+            create_no_fec_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
+                                static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+            break;
+        case TRXFecMode::Xor:
+            create_small_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
+                                   static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+            break;
+        case TRXFecMode::Rs:
+            create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
+                                  static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+            break;
+        }
 
         offset += current_group_size;
         current_group_id++;
@@ -573,12 +514,13 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         {
             auto &oldest_group = receive_groups_.back();
             auto recv_cnt = oldest_group.received_cnt();
-            auto oldest_units_num = oldest_group.units.empty() ? static_cast<uint8_t>(0)
-                                                               : static_cast<uint8_t>(oldest_group.units.front().head.units_num);
+            auto oldest_units_num = oldest_group.units.empty()
+                                        ? static_cast<uint8_t>(0)
+                                        : static_cast<uint8_t>(oldest_group.units.front().head.units_num);
             auto oldest_layout = resolve_fec_layout(oldest_units_num);
 
-            lost_packets_ += static_cast<uint64_t>(oldest_layout.data_packets_count + oldest_layout.fec_packets_count -
-                                                   recv_cnt);
+            lost_packets_ +=
+                static_cast<uint64_t>(oldest_layout.data_packets_count + oldest_layout.fec_packets_count - recv_cnt);
 
             for (auto &u : oldest_group.units)
             {
@@ -764,12 +706,6 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
     }
 }
 
-std::shared_ptr<ReliableUDP> make_reliable_udp(asio::io_context &io_context, unsigned short local_port,
-                                               TRXFecStrategy fec_strategy)
-{
-    return std::make_shared<ReliableUDP>(io_context, local_port, std::move(fec_strategy));
-}
-
 void ReliableUDP::generate_uuid()
 {
     auto current_ms = std::chrono::steady_clock::now().time_since_epoch();
@@ -799,16 +735,16 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
         }
     }
 
+    auto units = create_trx_units(data, size);
+    if (units.empty())
+    {
+        RUDP_ERROR_PRINT("Failed to create TRX units for payload size %zu", size);
+        return false;
+    }
+
     try
     {
-        auto units = create_trx_units(data, size);
-        if (units.empty())
-        {
-            RUDP_ERROR_PRINT("Failed to create TRX units for payload size %zu", size);
-            return false;
-        }
-
-        for (const auto &unit : units)
+        for (auto &unit : units)
         {
             std::array<asio::const_buffer, 2> buffers = {asio::buffer(&unit.head, TRX_HEADER_SIZE),
                                                          asio::buffer(unit.data, unit.head.units_len)};
@@ -819,6 +755,11 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
     }
     catch (const std::exception &e)
     {
+        // Ensure no unsent units leak when send_to throws mid-loop.
+        for (auto &unit : units)
+        {
+            send_pool_.deallocate(unit.data);
+        }
         RUDP_ERROR_PRINT("Error occurred while sending data: %s", e.what());
         return false;
     }

@@ -48,44 +48,43 @@ bool EncMgr::start()
         return false;
     }
 
-    if (!m_cfg.udp_dest_addr.empty())
+    if (m_cfg.udp_dest_addr.empty())
     {
-        m_sender = make_reliable_udp(BG_SERVICE, m_cfg.udp_local_port, default_trx_fec_strategy);
+        VIDEO_INFO_PRINT("EncMgr: UDP output disabled (no destination address)");
+        m_running.store(false);
+        return false;
+    }
+
+    try
+    {
+        m_sender = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
         m_sender->start();
+
         if (!m_sender->add_destination(m_cfg.udp_dest_addr, m_cfg.udp_dest_port))
         {
             VIDEO_ERROR_PRINT("EncMgr: failed to set UDP destination %s:%u", m_cfg.udp_dest_addr.c_str(),
                               m_cfg.udp_dest_port);
+            throw std::runtime_error("EncMgr: add_destination failed");
+        }
+
+        m_encoder = std::make_unique<RTEncoderV4L2>(m_cfg.enc, make_output_callback());
+        m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        VIDEO_ERROR_PRINT("EncMgr: start failed: %s", e.what());
+        m_running.store(false);
+
+        if (m_sender)
+        {
             m_sender->stop();
             m_sender.reset();
         }
-    }
 
-    try
-    {
-        m_encoder = std::make_unique<RTEncoderV4L2>(m_cfg.enc, make_output_callback());
-    }
-    catch (const std::exception &e)
-    {
-        VIDEO_ERROR_PRINT("EncMgr: failed to create encoder: %s", e.what());
-        m_running.store(false);
-        m_sender.reset();
-        return false;
-    }
-
-    try
-    {
-        m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
-    }
-    catch (const std::exception &e)
-    {
-        VIDEO_ERROR_PRINT("EncMgr: failed to create loop thread: %s", e.what());
-        m_running.store(false);
         m_encoder.reset();
-        m_sender.reset();
         return false;
     }
-    return true;
 }
 
 void EncMgr::stop()

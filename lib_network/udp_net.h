@@ -25,8 +25,6 @@ enum class TRXFecMode
     Rs,
 };
 
-using TRXFecStrategy = std::function<TRXFecMode(size_t)>;
-
 TRXFecMode default_trx_fec_strategy(size_t packet_size);
 
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
@@ -306,7 +304,6 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
 
   public:
     explicit ReliableUDP(asio::io_context &io_context, unsigned short local_port);
-    explicit ReliableUDP(asio::io_context &io_context, unsigned short local_port, TRXFecStrategy fec_strategy);
     ~ReliableUDP();
 
     void start();
@@ -367,12 +364,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 
-    TRXFecStrategy fec_strategy_;
     UsrQueue<true> usr_queue_;
     std::atomic<uint64_t> lost_packets_;
 };
-
-std::shared_ptr<ReliableUDP> make_reliable_udp(asio::io_context &io_context, unsigned short local_port,
-                                               TRXFecStrategy fec_strategy = {});
 
 #endif // RELIABLE_UDP_H
