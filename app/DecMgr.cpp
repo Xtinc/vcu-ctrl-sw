@@ -51,6 +51,16 @@ bool DecMgr::start()
         m_receiver = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
         m_receiver->set_receive_callback([this](const uint8_t *data, size_t size) { push_stream(data, size); });
         m_receiver->start();
+
+        if (!m_cfg.udp_reply_addr.empty() && m_cfg.udp_reply_port > 0)
+        {
+            if (!m_receiver->add_destination(m_cfg.udp_reply_addr, m_cfg.udp_reply_port))
+            {
+                VIDEO_ERROR_PRINT("DecMgr: failed to set RTT reply destination %s:%u",
+                                  m_cfg.udp_reply_addr.c_str(), m_cfg.udp_reply_port);
+            }
+        }
+
         return true;
     }
     catch (const std::exception &e)

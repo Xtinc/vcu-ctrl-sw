@@ -166,6 +166,30 @@ double EncMgr::send_rate() const
     return sender->send_rate();
 }
 
+int64_t EncMgr::rtt_ms() const
+{
+    if (!m_running.load())
+        return -1;
+
+    auto sender = m_sender;
+    if (!sender)
+        return -1;
+
+    return sender->rtt_ms();
+}
+
+int64_t EncMgr::offset_ms() const
+{
+    if (!m_running.load())
+        return 0;
+
+    auto sender = m_sender;
+    if (!sender)
+        return 0;
+
+    return sender->offset_ms();
+}
+
 bool EncMgr::open_source(int width, int height)
 {
     const size_t num_bufs = m_cfg.enc.num_src_bufs;

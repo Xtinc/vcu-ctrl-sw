@@ -31,6 +31,9 @@ struct DecMgrConfig
     DRMDisplayConfig drm; ///< DRM/KMS display configuration (device, mode, timing).
 
     unsigned short udp_local_port = 0; ///< UDP port to receive encoded bitstream on (required, must be > 0).
+
+    std::string udp_reply_addr;         ///< Address of the sender to reply RTT probes to (optional).
+    unsigned short udp_reply_port = 0;  ///< Port of the sender to reply RTT probes to (optional, must be > 0 to enable).
 };
 
 /**

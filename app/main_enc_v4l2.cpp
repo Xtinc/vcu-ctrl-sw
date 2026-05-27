@@ -7,6 +7,7 @@ extern "C"
 
 #include <csignal>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdlib>
 #include <pthread.h>
 #include <stdexcept>
@@ -126,8 +127,18 @@ int main(int argc, char *argv[])
             {
                 const auto stats = mgr.fps();
                 const double send_bps = mgr.send_rate();
-                VIDEO_INFO_PRINT("Enc stats: fps=%.2f, bps=%.0f, send_bps=%.0f", stats.first, stats.second,
-                                 send_bps);
+                const int64_t rtt = mgr.rtt_ms();
+                const int64_t offset = mgr.offset_ms();
+                if (rtt >= 0)
+                {
+                    VIDEO_INFO_PRINT("Enc stats: fps=%.2f, bps=%.0f, send_bps=%.0f, rtt=%" PRId64 "ms, offset=%" PRId64 "ms",
+                                     stats.first, stats.second, send_bps, rtt, offset);
+                }
+                else
+                {
+                    VIDEO_INFO_PRINT("Enc stats: fps=%.2f, bps=%.0f, send_bps=%.0f, rtt=N/A",
+                                     stats.first, stats.second, send_bps);
+                }
                 continue;
             }
 

@@ -151,6 +151,12 @@ class EncMgr
     /** @brief Return current UDP send bitrate in bps. */
     double send_rate() const;
 
+    /** @brief Return latest round-trip time in ms, or -1 if not yet measured. */
+    int64_t rtt_ms() const;
+
+    /** @brief Return latest clock offset relative to receiver in ms (valid only when rtt_ms() >= 0). */
+    int64_t offset_ms() const;
+
   private:
     State on_opening(int &width, int &height);
     State on_streaming();
