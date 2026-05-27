@@ -45,6 +45,7 @@ enum class TRXFecMode
     RS,
 };
 
+constexpr uint8_t MAGIC_TRX_PROBE_NUMBER = 0xA5;
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
 constexpr size_t MAX_TRX_UDP_SIZE = 65536;
 constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;
@@ -55,23 +56,33 @@ constexpr size_t MAX_TRX_RECEIVE_FRAMES = 20;
 constexpr size_t MAX_GROUP_NUM_PER_FRAME = MAX_TRX_UDP_SIZE / (MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_UNIT_SIZE);
 static_assert(MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
 
-using asio::ip::udp;
+struct TRXProbe
+{
+    uint8_t magic;       ///< Always MAGIC_TRX_PROBE_NUMBER (0xA5).
+    uint8_t type;        ///< Packet type: 0 = ping, 1 = pong.
+    uint8_t seq;         ///< Sequence number, wraps at 256.
+    uint8_t pad;         ///< Reserved, set to 0.
+    uint32_t t1_ms;      ///< ping: sender wall-clock time (ms mod 2^32); pong: echoed from ping.
+    int32_t t2_delta_ms; ///< pong: (int32_t)(receiver_time - t1_ms), range ±2^31 ms; ping: 0.
+};
 
+/// @brief Transmission unit (UDP payload): a fixed-length Header followed by a variable-length data block.
 struct TRXUnit
 {
+    /// @brief Fixed per-packet header, TRX_HEADER_SIZE bytes in total.
     struct Header
     {
-        uint16_t frame_seq; // 2字节 - 帧序列号
-        uint16_t group_seq; // 2字节 - 组序列号
-        uint16_t group_len; // 2字节 - 组总长度
+        uint16_t frame_seq;      // 2 B - frame sequence number
+        uint16_t group_seq;      // 2 B - group sequence number within a session
+        uint16_t group_len;      // 2 B - total payload bytes in this group
 
-        uint16_t group_num : 8; // 8位 (0-255) - 帧中组数量
-        uint16_t units_idx : 4; // 4位 (0-15) - 组内单元索引
-        uint16_t units_num : 4; // 4位 (0-15) - 组内单元总数
+        uint16_t group_num : 8;  // 8 b (0-255) - number of groups in this frame
+        uint16_t units_idx : 4;  // 4 b (0-15)  - index of this unit within the group
+        uint16_t units_num : 4;  // 4 b (0-15)  - total units in the group (data + FEC)
 
-        uint32_t units_len : 12; // 12位 - 单元实际长度
-        uint32_t conn_uuid : 12; // 12位 - 连接UUID
-        uint32_t check_sum : 8;  // 8位 - 校验和
+        uint32_t units_len : 12; // 12 b - payload length of this unit
+        uint32_t conn_uuid : 12; // 12 b - connection UUID
+        uint32_t check_sum : 8;  //  8 b - Adler-8 checksum over the preceding header bytes
     } head;
     uint8_t *data;
 
@@ -108,6 +119,8 @@ struct TRXUnit
     }
 };
 
+/// @brief Receiver-side context that accumulates units belonging to the same group,
+///        tracking a received-unit bitmap and a stale-group timeout timestamp.
 struct TRXGroup
 {
     uint16_t trxunit_cycle;
@@ -143,6 +156,8 @@ struct TRXGroup
     }
 };
 
+/// @brief Receiver-side context that collects reassembled groups belonging to the same frame;
+///        assembles the complete frame once all groups have arrived.
 struct TRXFrame
 {
     using Fragment = std::pair<uint64_t, uint8_t *>;
@@ -316,9 +331,37 @@ template <> class UsrQueue<false>
     void *user_data_;
 };
 
+/**
+ * @brief UDP-based reliable transport layer with integrated FEC error correction
+ *        and NTP-style clock synchronisation.
+ *
+ * ### Framing and FEC rules
+ * Each send() call corresponds to one frame.  The frame is split into one or more
+ * **groups** of at most `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes;
+ * each group independently selects its error-correction mode based on its size:
+ *
+ * | Group size                    | Mode | Data pkts | Redundancy pkts | Recoverable losses |
+ * |-------------------------------|------|-----------|-----------------|--------------------|
+ * | <= MAX_TRX_UNIT_SIZE (1200 B) | XOR  | 1         | 1 (full copy)   | 1                  |
+ * | >  MAX_TRX_UNIT_SIZE          | RS   | 12        | 3               | up to 3            |
+ *
+ * RS mode uses Reed-Solomon(12, 3): any 12 received packets (data or parity)
+ * are sufficient to reconstruct the full group.
+ *
+ * ### RTT and clock offset
+ * Uses a simplified NTP four-timestamp model where T3 ≈ T2 (pong is sent
+ * immediately upon receiving the ping):
+ * @code
+ *   RTT    = T4 - T1
+ *   offset = (T2 - T1) - RTT / 2   // (T2 - T1) == TRXProbe::t2_delta_ms
+ * @endcode
+ * A TRXProbe ping is sent every 5 seconds; statistics are updated when the pong
+ * is received.  A positive offset means the remote clock is ahead of the local
+ * clock; a negative offset means the local clock is ahead.
+ */
 class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
 {
-    using udp_socket_ptr = std::unique_ptr<udp::socket>;
+    using udp_socket_ptr = std::unique_ptr<asio::ip::udp::socket>;
 
   public:
     explicit ReliableUDP(asio::io_context &io_context, unsigned short local_port);
@@ -335,6 +378,10 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     double send_rate();
     double recv_rate();
     double lost_rate();
+
+    int64_t rtt_ms() const;
+    int64_t offset_ms() const;
+    bool is_time_synced() const;
 
   private:
     void start_receive();
@@ -356,13 +403,18 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void generate_uuid();
     TRXFecMode resolve_fec_mode(size_t packet_size) const;
 
+    void schedule_probe();
+    void send_probe();
+    void handle_probe_packet(const TRXProbe &pkt);
+    static uint32_t get_time_ms();
+
   private:
     std::atomic<bool> running_;
     asio::io_context &io_context_;
     asio::io_context::strand strand_;
     udp_socket_ptr recv_socket_;
     udp_socket_ptr send_socket_;
-    udp::endpoint remote_endpoint_;
+    asio::ip::udp::endpoint remote_endpoint_;
     uint8_t *receive_buffer_;
     MemPool<6, 16> send_pool_;
     MemPool<6, 16> recv_pool_;
@@ -370,7 +422,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
 
     reed_solomon *rs_;
 
-    udp::endpoint target_endpoint_;
+    asio::ip::udp::endpoint target_endpoint_;
     uint16_t target_uid_;
     bool destination_set_;
     std::mutex target_mutex_;
@@ -393,6 +445,12 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::chrono::steady_clock::time_point last_recv_rate_time_;
     uint64_t last_send_rate_bytes_;
     uint64_t last_recv_rate_bytes_;
+
+    asio::steady_timer probe_timer_;
+    std::atomic<int64_t> rtt_ms_;
+    std::atomic<int64_t> offset_ms_;
+    std::atomic<bool> time_synced_;
+    uint8_t probe_seq_;
 };
 
 #endif // RELIABLE_UDP_H

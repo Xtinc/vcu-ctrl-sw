@@ -1,9 +1,8 @@
 #include "ReliableUDP.h"
 #include <algorithm>
-#include <chrono>
-#include <cinttypes>
 #include <pthread.h>
-#include <stdexcept>
+
+using asio::ip::udp;
 
 static std::once_flag fec_init_flag;
 
@@ -104,7 +103,8 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
       send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), destination_set_(false),
       frame_cycle_(1), group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
       lost_packets_(0), send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
-      last_recv_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0)
+      last_recv_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
+      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0)
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -206,6 +206,12 @@ bool ReliableUDP::add_destination(const std::string &address, unsigned short por
     }
 
     VIDEO_INFO_PRINT("Destination set to %s:%u", endpoint.address().to_string().c_str(), endpoint.port());
+
+    asio::post(strand_, [self = shared_from_this()]() {
+        self->send_probe();
+        self->schedule_probe();
+    });
+
     return true;
 }
 
@@ -231,6 +237,7 @@ void ReliableUDP::stop()
         VIDEO_ERROR_PRINT("Failed to cancel send socket: %s", ec.message().c_str());
     }
 
+    probe_timer_.cancel();
     usr_queue_.stop();
 }
 
@@ -263,6 +270,21 @@ double ReliableUDP::lost_rate()
     return real_lost_rate;
 }
 
+int64_t ReliableUDP::rtt_ms() const
+{
+    return rtt_ms_.load(std::memory_order_relaxed);
+}
+
+int64_t ReliableUDP::offset_ms() const
+{
+    return offset_ms_.load(std::memory_order_relaxed);
+}
+
+bool ReliableUDP::is_time_synced() const
+{
+    return time_synced_.load(std::memory_order_relaxed);
+}
+
 double ReliableUDP::send_rate()
 {
     return calc_rate_bps(send_bytes_, rate_mutex_, last_send_rate_time_, last_send_rate_bytes_);
@@ -289,7 +311,7 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
         return;
     }
 
-    if (!error && bytes_transferred >= TRX_HEADER_SIZE)
+    if (!error && bytes_transferred > TRX_HEADER_SIZE)
     {
         TRXUnit unit;
         std::memcpy(&unit.head, receive_buffer_, TRX_HEADER_SIZE);
@@ -321,6 +343,15 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
         else
         {
             VIDEO_ERROR_PRINT("TRXUnit validation failed");
+        }
+    }
+    else if (!error && bytes_transferred == TRX_HEADER_SIZE)
+    {
+        TRXProbe pkt;
+        std::memcpy(&pkt, receive_buffer_, sizeof(TRXProbe));
+        if (pkt.magic == MAGIC_TRX_PROBE_NUMBER && (pkt.type == 0 || pkt.type == 1))
+        {
+            handle_probe_packet(pkt);
         }
     }
 
@@ -846,5 +877,102 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
         }
         VIDEO_ERROR_PRINT("Error occurred while sending data: %s", e.what());
         return false;
+    }
+}
+
+uint32_t ReliableUDP::get_time_ms()
+{
+    using namespace std::chrono;
+    return static_cast<uint32_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+void ReliableUDP::send_probe()
+{
+    udp::endpoint target;
+    {
+        std::lock_guard<std::mutex> lock(target_mutex_);
+        if (!destination_set_)
+        {
+            return;
+        }
+        target = target_endpoint_;
+    }
+
+    TRXProbe pkt{};
+    pkt.magic = MAGIC_TRX_PROBE_NUMBER;
+    pkt.type = 0;
+    pkt.seq = probe_seq_++;
+    pkt.t1_ms = get_time_ms();
+
+    auto buf = std::make_shared<TRXProbe>(pkt);
+    send_socket_->async_send_to(asio::buffer(buf.get(), sizeof(TRXProbe)), target,
+                                [buf](const asio::error_code &ec, size_t) {
+                                    if (ec)
+                                    {
+                                        VIDEO_ERROR_PRINT("[Probe] Failed to send ping: %s", ec.message().c_str());
+                                    }
+                                });
+}
+
+void ReliableUDP::schedule_probe()
+{
+    probe_timer_.expires_after(std::chrono::seconds(5));
+    probe_timer_.async_wait(strand_.wrap([self = shared_from_this()](const asio::error_code &ec) {
+        if (!ec)
+        {
+            self->send_probe();
+            self->schedule_probe();
+        }
+    }));
+}
+
+void ReliableUDP::handle_probe_packet(const TRXProbe &pkt)
+{
+    if (pkt.type == 0)
+    {
+        // Ping received — reply with a pong using the stored destination.
+        udp::endpoint target;
+        {
+            std::lock_guard<std::mutex> lock(target_mutex_);
+            if (!destination_set_)
+            {
+                return;
+            }
+            target = target_endpoint_;
+        }
+
+        TRXProbe pong{};
+        pong.magic = MAGIC_TRX_PROBE_NUMBER;
+        pong.type = 1;
+        pong.seq = pkt.seq;
+        pong.t1_ms = pkt.t1_ms;
+        pong.t2_delta_ms = static_cast<int32_t>(get_time_ms() - pkt.t1_ms);
+
+        auto buf = std::make_shared<TRXProbe>(pong);
+        send_socket_->async_send_to(asio::buffer(buf.get(), sizeof(TRXProbe)), target,
+                                    [buf](const asio::error_code &ec, size_t) {
+                                        if (ec)
+                                        {
+                                            VIDEO_ERROR_PRINT("[Probe] Failed to send pong: %s", ec.message().c_str());
+                                        }
+                                    });
+    }
+    else if (pkt.type == 1)
+    {
+        // Pong received — compute RTT and clock offset.
+        // Simplified NTP (T3 ≈ T2 because pong is sent immediately):
+        //   RTT    = T4 - T1
+        //   offset = T2_delta - RTT/2
+        uint32_t t4_ms = get_time_ms();
+        int32_t rtt = static_cast<int32_t>(t4_ms - pkt.t1_ms);
+        int32_t offset = pkt.t2_delta_ms - rtt / 2;
+
+        if (rtt >= 0)
+        {
+            rtt_ms_.store(static_cast<int64_t>(rtt), std::memory_order_relaxed);
+            offset_ms_.store(static_cast<int64_t>(offset), std::memory_order_relaxed);
+            time_synced_.store(true, std::memory_order_relaxed);
+            VIDEO_INFO_PRINT("[Probe] RTT: %d ms, Clock offset: %d ms", rtt, offset);
+        }
     }
 }
