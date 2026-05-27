@@ -148,6 +148,9 @@ class EncMgr
      */
     std::pair<double, double> fps() const;
 
+    /** @brief Return current UDP send bitrate in bps. */
+    double send_rate() const;
+
   private:
     State on_opening(int &width, int &height);
     State on_streaming();

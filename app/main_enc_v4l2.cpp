@@ -6,6 +6,7 @@ extern "C"
 }
 
 #include <csignal>
+#include <cerrno>
 #include <cstdlib>
 #include <pthread.h>
 #include <stdexcept>
@@ -108,15 +109,30 @@ int main(int argc, char *argv[])
         }
 
         VIDEO_INFO_PRINT("V4L2 encoding started. Press Ctrl+C to stop.");
-        int signo = 0;
-        const int rc = sigwait(&signal_set, &signo);
-        if (rc != 0)
+        for (;;)
         {
-            VIDEO_ERROR_PRINT("sigwait failed (rc=%d), stopping encoder", rc);
-        }
-        else
-        {
-            VIDEO_INFO_PRINT("Signal %d received", signo);
+            timespec timeout;
+            timeout.tv_sec = 10;
+            timeout.tv_nsec = 0;
+
+            const int signo = sigtimedwait(&signal_set, nullptr, &timeout);
+            if (signo > 0)
+            {
+                VIDEO_INFO_PRINT("Signal %d received", signo);
+                break;
+            }
+
+            if (errno == EAGAIN)
+            {
+                const auto stats = mgr.fps();
+                const double send_bps = mgr.send_rate();
+                VIDEO_INFO_PRINT("Enc stats: fps=%.2f, bps=%.0f, send_bps=%.0f", stats.first, stats.second,
+                                 send_bps);
+                continue;
+            }
+
+            VIDEO_ERROR_PRINT("sigtimedwait failed (errno=%d), stopping encoder", errno);
+            break;
         }
 
         VIDEO_INFO_PRINT("Signal received, stopping encoder...");

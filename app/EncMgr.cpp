@@ -162,6 +162,18 @@ std::pair<double, double> EncMgr::fps() const
     return m_encoder->fps();
 }
 
+double EncMgr::send_rate() const
+{
+    if (!m_running.load())
+        return 0.0;
+
+    auto sender = m_sender;
+    if (!sender)
+        return 0.0;
+
+    return sender->send_rate();
+}
+
 bool EncMgr::open_source(int width, int height)
 {
     const size_t num_bufs = m_cfg.enc.num_src_bufs;
