@@ -26,8 +26,6 @@ enum class TRXFecMode
     RS,
 };
 
-TRXFecMode default_trx_fec_strategy(size_t packet_size);
-
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
 constexpr size_t MAX_TRX_UDP_SIZE = 65536;
 constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;

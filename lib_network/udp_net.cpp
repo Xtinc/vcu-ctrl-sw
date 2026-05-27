@@ -47,11 +47,6 @@ static FECLayout resolve_fec_layout(uint8_t units_num)
     }
 }
 
-static TRXFecMode default_trx_fec_strategy(size_t packet_size)
-{
-    return packet_size < MAX_TRX_UNIT_SIZE ? TRXFecMode::XOR : TRXFecMode::RS;
-}
-
 static std::once_flag fec_init_flag;
 
 ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port)

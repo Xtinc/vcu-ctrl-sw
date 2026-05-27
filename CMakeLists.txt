@@ -66,9 +66,7 @@ add_subdirectory(lib_network)
 # ---------- Batch 2: app-facing deliverables ----------
 # User app layer + final SDK libraries consumed by applications.
 
-add_subdirectory(lib_conv_yuv)
 add_subdirectory(lib_encode)
 add_subdirectory(lib_decode)
-add_subdirectory(lib_app)
 add_subdirectory(app)
 add_subdirectory(tests)

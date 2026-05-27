@@ -1,4 +1,4 @@
-#include "Background.h"
+#include "BackGround.h"
 
 extern "C"
 {
@@ -31,7 +31,7 @@ BackgroundService::BackgroundService() : work_guard(asio::make_work_guard(io_con
         });
     }
 
-    AUDIO_INFO_PRINT("VideoDriver compiled on %s at %s", __DATE__, __TIME__);
+    VIDEO_INFO_PRINT("VideoDriver compiled on %s at %s", __DATE__, __TIME__);
 }
 
 BackgroundService::~BackgroundService()
