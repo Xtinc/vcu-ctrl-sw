@@ -73,7 +73,7 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
 
     generate_uuid();
 
-    RUDP_INFO_PRINT("ReliableUDP initialized - receive port: %d, uuid: %u", recv_socket_->local_endpoint().port(),
+    VIDEO_INFO_PRINT("ReliableUDP initialized - receive port: %d, uuid: %u", recv_socket_->local_endpoint().port(),
                     target_uid_);
 }
 
@@ -86,14 +86,14 @@ ReliableUDP::~ReliableUDP()
 
     if (ec)
     {
-        RUDP_ERROR_PRINT("Failed to close receive socket: %s", ec.message().c_str());
+        VIDEO_ERROR_PRINT("Failed to close receive socket: %s", ec.message().c_str());
     }
 
     send_socket_->close(ec);
 
     if (ec)
     {
-        RUDP_ERROR_PRINT("Failed to close send socket: %s", ec.message().c_str());
+        VIDEO_ERROR_PRINT("Failed to close send socket: %s", ec.message().c_str());
     }
 
     reed_solomon_release(rs_);
@@ -114,7 +114,7 @@ bool ReliableUDP::add_destination(const std::string &address, unsigned short por
 {
     if (!running_)
     {
-        RUDP_ERROR_PRINT("ReliableUDP is not running");
+        VIDEO_ERROR_PRINT("ReliableUDP is not running");
         return false;
     }
     udp::endpoint endpoint;
@@ -124,7 +124,7 @@ bool ReliableUDP::add_destination(const std::string &address, unsigned short por
     }
     catch (const std::exception &e)
     {
-        RUDP_ERROR_PRINT("Invalid address or port: %s", e.what());
+        VIDEO_ERROR_PRINT("Invalid address or port: %s", e.what());
         return false;
     }
 
@@ -132,14 +132,14 @@ bool ReliableUDP::add_destination(const std::string &address, unsigned short por
         std::lock_guard<std::mutex> lock(target_mutex_);
         if (destination_set_)
         {
-            RUDP_ERROR_PRINT("Destination is already set");
+            VIDEO_ERROR_PRINT("Destination is already set");
             return false;
         }
         target_endpoint_ = endpoint;
         destination_set_ = true;
     }
 
-    RUDP_INFO_PRINT("Destination set to %s:%u", endpoint.address().to_string().c_str(), endpoint.port());
+    VIDEO_INFO_PRINT("Destination set to %s:%u", endpoint.address().to_string().c_str(), endpoint.port());
     return true;
 }
 
@@ -155,14 +155,14 @@ void ReliableUDP::stop()
 
     if (ec)
     {
-        RUDP_ERROR_PRINT("Failed to cancel receive socket: %s", ec.message().c_str());
+        VIDEO_ERROR_PRINT("Failed to cancel receive socket: %s", ec.message().c_str());
     }
 
     send_socket_->cancel(ec);
 
     if (ec)
     {
-        RUDP_ERROR_PRINT("Failed to cancel send socket: %s", ec.message().c_str());
+        VIDEO_ERROR_PRINT("Failed to cancel send socket: %s", ec.message().c_str());
     }
 
     usr_queue_.stop();
@@ -185,7 +185,7 @@ double ReliableUDP::lost_rate()
     {
         if (real_lost_rate > 0.0)
         {
-            RUDP_INFO_PRINT("Current lost rate: %.2f%% (lost: %" PRIu64 ", recv: %" PRIu64 ")", real_lost_rate * 100.0,
+            VIDEO_INFO_PRINT("Current lost rate: %.2f%% (lost: %" PRIu64 ", recv: %" PRIu64 ")", real_lost_rate * 100.0,
                             lost_packets, recv_packets);
         }
 
@@ -223,7 +223,7 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
             const auto unit_len = static_cast<size_t>(unit.head.units_len);
             if (unit_len == 0 || unit_len > MAX_TRX_DATA_SIZE || payload_len != unit_len)
             {
-                RUDP_ERROR_PRINT("Invalid payload length: payload=%zu, unit_len=%zu, max=%zu", payload_len, unit_len,
+                VIDEO_ERROR_PRINT("Invalid payload length: payload=%zu, unit_len=%zu, max=%zu", payload_len, unit_len,
                                  static_cast<size_t>(MAX_TRX_DATA_SIZE));
                 start_receive();
                 return;
@@ -236,13 +236,13 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
             }
             else
             {
-                RUDP_ERROR_PRINT("Failed to allocate receive buffer of %zu bytes", unit_len);
+                VIDEO_ERROR_PRINT("Failed to allocate receive buffer of %zu bytes", unit_len);
             }
             process_received_unit(unit);
         }
         else
         {
-            RUDP_ERROR_PRINT("TRXUnit validation failed");
+            VIDEO_ERROR_PRINT("TRXUnit validation failed");
         }
     }
 
@@ -256,7 +256,7 @@ void ReliableUDP::create_huge_rtx_group(std::vector<TRXUnit> &all_units, const u
     size_t packet_size = (current_group_size + MAX_RS_PACKET_NUM_PER_GROUP - 1) / MAX_RS_PACKET_NUM_PER_GROUP;
     if (packet_size > MAX_TRX_DATA_SIZE)
     {
-        RUDP_ERROR_PRINT("Packet size %zu exceeds MAX_DATA_SIZE %zu", packet_size, MAX_TRX_DATA_SIZE);
+        VIDEO_ERROR_PRINT("Packet size %zu exceeds MAX_DATA_SIZE %zu", packet_size, MAX_TRX_DATA_SIZE);
         return;
     }
 
@@ -322,7 +322,7 @@ void ReliableUDP::create_huge_rtx_group(std::vector<TRXUnit> &all_units, const u
 
     if (encode_result != 0)
     {
-        RUDP_ERROR_PRINT("Reed-Solomon encoding failed for group %u", current_group_id);
+        VIDEO_ERROR_PRINT("Reed-Solomon encoding failed for group %u", current_group_id);
         for (auto &unit : all_units)
         {
             send_pool_.deallocate(unit.data);
@@ -467,7 +467,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
 
         if (!it->units.empty() && units_num != static_cast<uint8_t>(unit.head.units_num))
         {
-            RUDP_ERROR_PRINT("Inconsistent units_num for group (%u,%u)", it->trxunit_cycle, it->trxunit_group);
+            VIDEO_ERROR_PRINT("Inconsistent units_num for group (%u,%u)", it->trxunit_cycle, it->trxunit_group);
             recv_pool_.deallocate(unit.data);
             return;
         }
@@ -600,7 +600,7 @@ void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_pa
 
         if (erasure_count > TRX_RS_FEC_REDUNDANCY)
         {
-            RUDP_ERROR_PRINT("Too many missing packets (%d), cannot recover", erasure_count);
+            VIDEO_ERROR_PRINT("Too many missing packets (%d), cannot recover", erasure_count);
             cleanup();
             return;
         }
@@ -608,7 +608,7 @@ void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_pa
         if (reed_solomon_decode(rs_, data_blocks, static_cast<int>(packet_size), fec_blocks, fec_block_pos, erasures,
                                 erasure_count) != 0)
         {
-            RUDP_ERROR_PRINT("Reed-Solomon decoding failed");
+            VIDEO_ERROR_PRINT("Reed-Solomon decoding failed");
             cleanup();
             return;
         }
@@ -640,7 +640,7 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
     if (last_frame_id_ > 3 * 0xffffu / 4 && frame_seq < 0xffffu / 4)
     {
         frame_cycle_++;
-        RUDP_DEBUG_PRINT("Frame wrap around detected: %u -> %u", last_frame_id_, frame_seq);
+        VIDEO_DEBUG_PRINT("Frame wrap around detected: %u -> %u", last_frame_id_, frame_seq);
     }
     last_frame_id_ = frame_seq;
 
@@ -686,7 +686,7 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
 
         if (!usr_queue_.enqueue(complete_message, total_length))
         {
-            RUDP_ERROR_PRINT("Failed to enqueue received message");
+            VIDEO_ERROR_PRINT("Failed to enqueue received message");
         }
 
         recv_pool_.deallocate(complete_message);
@@ -696,7 +696,7 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
     if (receive_frames_.size() > MAX_TRX_RECEIVE_FRAMES)
     {
         auto &oldest_frame = receive_frames_.back();
-        RUDP_DEBUG_PRINT("Cleaning up frame (%u,%u) with %zu fragments, expected %u", oldest_frame.frame_cyc,
+        VIDEO_DEBUG_PRINT("Cleaning up frame (%u,%u) with %zu fragments, expected %u", oldest_frame.frame_cyc,
                          oldest_frame.frame_seq, oldest_frame.fragments.size(), oldest_frame.group_num);
         for (const auto &frag : oldest_frame.fragments)
         {
@@ -722,7 +722,7 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
 
     if (!data || size == 0 || size > MAX_TRX_UDP_SIZE)
     {
-        RUDP_ERROR_PRINT("Invalid data or size for sending");
+        VIDEO_ERROR_PRINT("Invalid data or size for sending");
         return false;
     }
 
@@ -730,7 +730,7 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
         std::lock_guard<std::mutex> lock(target_mutex_);
         if (!destination_set_)
         {
-            RUDP_ERROR_PRINT("No destination set. need negotiate first");
+            VIDEO_ERROR_PRINT("No destination set. need negotiate first");
             return false;
         }
     }
@@ -738,7 +738,7 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
     auto units = create_trx_units(data, size);
     if (units.empty())
     {
-        RUDP_ERROR_PRINT("Failed to create TRX units for payload size %zu", size);
+        VIDEO_ERROR_PRINT("Failed to create TRX units for payload size %zu", size);
         return false;
     }
 
@@ -760,7 +760,7 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
         {
             send_pool_.deallocate(unit.data);
         }
-        RUDP_ERROR_PRINT("Error occurred while sending data: %s", e.what());
+        VIDEO_ERROR_PRINT("Error occurred while sending data: %s", e.what());
         return false;
     }
 }

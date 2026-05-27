@@ -9,10 +9,10 @@
 #include <mutex>
 #include <vector>
 
-#define RUDP_INFO_PRINT(fmt, ...) printf("[INF] %s(%d): " fmt "\n", __FUNCTION__, __LINE__, ##__VA_ARGS__)
-#define RUDP_ERROR_PRINT(fmt, ...) printf("[ERR] %s(%d): " fmt "\n", __FUNCTION__, __LINE__, ##__VA_ARGS__)
-#define RUDP_DEBUG_PRINT(fmt, ...) printf("[DEB] %s(%d): " fmt "\n", __FUNCTION__, __LINE__, ##__VA_ARGS__)
-// #define RUDP_DEBUG_PRINT(...)
+extern "C"
+{
+#include "lib_rtos/message.h"
+}
 
 template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
 {
@@ -53,7 +53,7 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
 
         if (ord > CHUNK_MAX_ORD)
         {
-            RUDP_ERROR_PRINT("Requested size %zu exceeds maximum manageable size", size);
+            VIDEO_ERROR_PRINT("Requested size %zu exceeds maximum manageable size", size);
             return nullptr;
         }
 
@@ -66,7 +66,7 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
             }
 
             expand_memory((static_cast<size_t>(1) << ord) + sizeof(size_t), 25, chunk_idx);
-            RUDP_DEBUG_PRINT("Expanded memory chunk %.2f MB", static_cast<double>(current_size) / (1024.0 * 1024.0));
+            VIDEO_DEBUG_PRINT("Expanded memory chunk %.2f MB", static_cast<double>(current_size) / (1024.0 * 1024.0));
         }
 
         uint8_t *block = chunks_[chunk_idx].front();
@@ -93,7 +93,7 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
 
         if (ord > CHUNK_MAX_ORD)
         {
-            RUDP_ERROR_PRINT("Invalid block size during deallocation: %zu", block_size);
+            VIDEO_ERROR_PRINT("Invalid block size during deallocation: %zu", block_size);
             return;
         }
 
