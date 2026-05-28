@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <condition_variable>
 
 class RTEncoderV4L2;
 class V4L2Source;
