@@ -1,7 +1,7 @@
 #include "ReliableUDP.h"
 #include <algorithm>
-#include <pthread.h>
 #include <cinttypes>
+#include <pthread.h>
 
 using asio::ip::udp;
 
@@ -497,8 +497,22 @@ TRXFecMode ReliableUDP::resolve_fec_mode(size_t packet_size) const
 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
 {
-    constexpr size_t max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
-    size_t total_groups = (size + max_group_data_size - 1) / max_group_data_size;
+    const TRXFecMode fec_mode = resolve_fec_mode(size);
+
+    size_t max_group_data_size;
+    switch (fec_mode)
+    {
+    case TRXFecMode::RS:
+        max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
+        break;
+    case TRXFecMode::XOR:
+    case TRXFecMode::None:
+    default:
+        max_group_data_size = MAX_TRX_DATA_SIZE;
+        break;
+    }
+
+    const size_t total_groups = (size + max_group_data_size - 1) / max_group_data_size;
 
     std::vector<TRXUnit> all_units;
 
@@ -511,19 +525,20 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
         size_t remaining_size = size - offset;
         size_t current_group_size = std::min(remaining_size, max_group_data_size);
 
-        switch (resolve_fec_mode(current_group_size))
+        switch (fec_mode)
         {
-        case TRXFecMode::None:
-            create_no_fec_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
-                                static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+        case TRXFecMode::RS:
+            create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
+                                  static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
         case TRXFecMode::XOR:
             create_small_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                    static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
-        case TRXFecMode::RS:
-            create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
-                                  static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+        case TRXFecMode::None:
+        default:
+            create_no_fec_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
+                                static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
         }
 
