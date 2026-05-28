@@ -39,3 +39,16 @@ add_executable(dumb_test
 )
 target_include_directories(dumb_test PRIVATE ${APP_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${LIBDRM_INCLUDE_DIRS})
 target_link_libraries(dumb_test PRIVATE liballegro_decode_static lib_network_obj ${LIBDRM_LIBRARIES})
+
+# --- ReliableUDP loopback + FEC unit test ---
+# Sends random-sized messages through a configurable lossy UDP proxy to a
+# local receiver and verifies every delivered message passes an Adler-32
+# integrity check.  No external hardware or Allegro SDK required.
+#
+# Usage:
+#   ./test_reliable_udp [--min-bytes N] [--max-bytes N]
+#                       [--rate-mbps F] [--loss-min F] [--loss-max F]
+#                       [--duration N]
+add_executable(test_reliable_udp
+    test_reliable_udp.cpp)
+target_link_libraries(test_reliable_udp PRIVATE lib_network_obj Threads::Threads)
