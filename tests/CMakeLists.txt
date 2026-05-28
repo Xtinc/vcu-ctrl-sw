@@ -51,4 +51,4 @@ target_link_libraries(dumb_test PRIVATE liballegro_decode_static lib_network_obj
 #                       [--duration N]
 add_executable(test_reliable_udp
     test_reliable_udp.cpp)
-target_link_libraries(test_reliable_udp PRIVATE lib_network_obj Threads::Threads)
+target_link_libraries(test_reliable_udp PRIVATE lib_network_obj lib_rtos_obj Threads::Threads)
