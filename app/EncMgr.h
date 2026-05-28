@@ -1,9 +1,17 @@
 #ifndef ENC_MGR_H
 #define ENC_MGR_H
 
-#include "RTEncoder.h"
-#include "V4L2Source.h"
+#include "VideoTypes.h"
 
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+
+class RTEncoderV4L2;
+class V4L2Source;
 class ReliableUDP;
 
 /**
@@ -11,15 +19,26 @@ class ReliableUDP;
  */
 struct EncMgrConfig
 {
-    EncoderConfig enc;       ///< Encoder parameters (width/height are initial fallback values)
-    std::string v4l2_dev;    ///< V4L2 capture device path, e.g. "/dev/video0" (required)
-    std::string v4l2_subdev; ///< V4L2 sub-device for source detection and events, e.g. "/dev/v4l-subdev0" (required)
-    std::string sync_dev;    ///< Xilinx sync device path (empty = disabled)
-    int source_check_interval_ms = 2000; ///< Interval for checking source presence in WaitingSource state
-
-    std::string udp_dest_addr;         ///< UDP destination address (required)
-    unsigned short udp_dest_port = 0;  ///< UDP destination port (required, must be > 0)
-    unsigned short udp_local_port = 0; ///< UDP local bind port (0 = OS-assigned)
+    std::string v4l2_dev;                   ///< V4L2 capture device path, e.g. "/dev/video0" (required)
+    std::string v4l2_subdev;                ///< V4L2 sub-device for source detection and events (required)
+    std::string sync_dev;                   ///< Xilinx sync device path (empty = disabled)
+    int source_check_interval_ms = 2000;    ///< Interval for checking source in WaitingSource state
+    VideoCodec codec = VideoCodec::HEVC;    ///< Codec selection
+    RateControl rc_mode = RateControl::CBR; ///< Rate-control mode
+    uint16_t width = 3840;                  ///< Initial/fallback frame width
+    uint16_t height = 2160;                 ///< Initial/fallback frame height
+    uint32_t target_bitrate = 25'000'000;   ///< Target bitrate in bps
+    uint32_t max_bitrate = 0;               ///< VBR peak bitrate in bps (0 = same as target)
+    uint16_t framerate = 60;                ///< Frame rate numerator
+    uint16_t clk_ratio = 1000;              ///< Frame rate denominator (fps = framerate*1000/clk_ratio)
+    uint16_t gop_length = 60;               ///< Frames between IDR/I frames
+    uint8_t num_b = 0;                      ///< B-frames per GOP (ignored in low_delay_mode)
+    bool low_delay_mode = false;            ///< True = low-latency all-P GOP
+    std::string enc_dev = "/dev/allegroIP"; ///< Encoder device node
+    std::string dma_dev = "/dev/dmaproxy";  ///< DMAProxy device node
+    std::string udp_dest_addr;              ///< UDP destination address (required)
+    uint16_t udp_dest_port = 0;             ///< UDP destination port (required, must be > 0)
+    uint16_t udp_local_port = 0;            ///< UDP local bind port (0 = OS-assigned)
 };
 
 /**
@@ -171,7 +190,6 @@ class EncMgr
     bool ensure_encoder_at(int width, int height);
     bool handle_source_change(int &width, int &height);
     bool query_source_resolution(int &width, int &height) const;
-    EncodedFrameCallback make_output_callback() const;
 
     void loop_thread_func();
 

@@ -35,7 +35,7 @@ static sigset_t g_signal_set;
 
 struct AppOptions
 {
-    unsigned short udp_port  = 0;
+    unsigned short udp_port = 0;
     std::string drm_device = "/dev/dri/card0";
     std::string reply_addr;
     unsigned short reply_port = 0;
@@ -156,13 +156,13 @@ int main(int argc, char *argv[])
     pthread_sigmask(SIG_BLOCK, &g_signal_set, nullptr);
 
     DecMgrConfig cfg;
-    cfg.dec.codec             = AL_CODEC_HEVC;
-    cfg.dec.input_buffer_size = kInputBufSize;
-    cfg.dec.low_delay_mode    = false;
-    cfg.drm.drm_device        = options.drm_device;
-    cfg.udp_local_port        = options.udp_port;
-    cfg.udp_reply_addr        = options.reply_addr;
-    cfg.udp_reply_port        = options.reply_port;
+    cfg.codec = VideoCodec::HEVC;
+    cfg.input_buffer_size = kInputBufSize;
+    cfg.low_delay_mode = false;
+    cfg.drm_device = options.drm_device;
+    cfg.udp_local_port = options.udp_port;
+    cfg.udp_reply_addr = options.reply_addr;
+    cfg.udp_reply_port = options.reply_port;
 
     DecMgr dec_mgr(cfg);
     if (!dec_mgr.start())
@@ -177,7 +177,7 @@ int main(int argc, char *argv[])
     for (;;)
     {
         timespec timeout;
-        timeout.tv_sec  = 10;
+        timeout.tv_sec = 10;
         timeout.tv_nsec = 0;
 
         const int signo = sigtimedwait(&g_signal_set, nullptr, &timeout);
@@ -189,19 +189,18 @@ int main(int argc, char *argv[])
 
         if (errno == EAGAIN)
         {
-            const double dec_fps    = dec_mgr.fps();
-            const double recv_bps   = dec_mgr.recv_rate();
-            const int64_t rtt       = dec_mgr.rtt_ms();
-            const int64_t offset    = dec_mgr.offset_ms();
+            const double dec_fps = dec_mgr.fps();
+            const double recv_bps = dec_mgr.recv_rate();
+            const int64_t rtt = dec_mgr.rtt_ms();
+            const int64_t offset = dec_mgr.offset_ms();
             if (rtt >= 0)
             {
-                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, rtt=%" PRId64 "ms, offset=%" PRId64 "ms",
-                                 dec_fps, recv_bps, rtt, offset);
+                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, rtt=%" PRId64 "ms, offset=%" PRId64 "ms", dec_fps,
+                                 recv_bps, rtt, offset);
             }
             else
             {
-                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, rtt=N/A",
-                                 dec_fps, recv_bps);
+                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, rtt=N/A", dec_fps, recv_bps);
             }
             continue;
         }

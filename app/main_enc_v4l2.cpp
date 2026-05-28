@@ -33,22 +33,6 @@ void print_usage(const char *app)
     VIDEO_ERROR_PRINT("Usage: %s <video_device> <v4l2_subdev> <udp_dest_addr> <udp_dest_port> [udp_local_port]", app);
 }
 
-EncoderConfig make_default_config()
-{
-    EncoderConfig cfg{};
-    cfg.rc_mode = AL_RC_CBR;
-    cfg.profile = AL_PROFILE_HEVC_MAIN;
-    cfg.target_bitrate = 8000000;
-    cfg.framerate = 60;
-    cfg.clk_ratio = 1000;
-    cfg.gop_length = 30;
-    cfg.num_b = 0;
-    cfg.low_delay_mode = true;
-    cfg.width = 3840;
-    cfg.height = 2160;
-    return cfg;
-}
-
 int main(int argc, char *argv[])
 {
     message_init();
@@ -65,10 +49,19 @@ int main(int argc, char *argv[])
     }
 
     EncMgrConfig mgr_cfg;
-    mgr_cfg.enc = make_default_config();
-    mgr_cfg.v4l2_dev = argv[1];
-    mgr_cfg.v4l2_subdev = argv[2];
-    mgr_cfg.udp_dest_addr = argv[3];
+    mgr_cfg.codec          = VideoCodec::HEVC;
+    mgr_cfg.rc_mode        = RateControl::CBR;
+    mgr_cfg.target_bitrate = 8'000'000;
+    mgr_cfg.framerate      = 60;
+    mgr_cfg.clk_ratio      = 1000;
+    mgr_cfg.gop_length     = 30;
+    mgr_cfg.num_b          = 0;
+    mgr_cfg.low_delay_mode = true;
+    mgr_cfg.width          = 3840;
+    mgr_cfg.height         = 2160;
+    mgr_cfg.v4l2_dev       = argv[1];
+    mgr_cfg.v4l2_subdev    = argv[2];
+    mgr_cfg.udp_dest_addr  = argv[3];
 
     try
     {
@@ -96,7 +89,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    mgr_cfg.sync_dev = mgr_cfg.enc.low_delay_mode ? "/dev/xlnxsync0" : "";
+    mgr_cfg.sync_dev = mgr_cfg.low_delay_mode ? "/dev/xlnxsync0" : "";
     mgr_cfg.source_check_interval_ms = 2000;
 
     try

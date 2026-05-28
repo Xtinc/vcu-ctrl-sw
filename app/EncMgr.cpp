@@ -1,8 +1,61 @@
 #include "EncMgr.h"
+#include "RTEncoder.h"
+#include "V4L2Source.h"
 #include "lib_network/ReliableUDP.h"
 
-static constexpr uint8_t WIRE_FLAG_ENDOFSLICE = 0x2;
-static constexpr uint8_t WIRE_FLAG_ENDOFFRAME = 0x4;
+static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> weak_udp)
+{
+    if (weak_udp.expired())
+    {
+        return {};
+    }
+
+    auto send_buf = std::make_shared<std::vector<uint8_t>>();
+    send_buf->reserve(MAX_TRX_UDP_SIZE + 1);
+
+    return [weak_udp, send_buf](const uint8_t *data, size_t size, bool eof) {
+        auto udp = weak_udp.lock();
+        if (!udp)
+        {
+            return;
+        }
+
+        send_buf->resize(1 + size);
+        (*send_buf)[0] = static_cast<uint8_t>(eof ? StreamFlags::EndOfFrame : StreamFlags::EndOfSlice);
+        std::memcpy(send_buf->data() + 1, data, size);
+        udp->send(send_buf->data(), send_buf->size());
+    };
+}
+
+static EncoderConfig to_encoder_config(const EncMgrConfig &cfg)
+{
+    EncoderConfig enc{};
+    enc.profile = (cfg.codec == VideoCodec::AVC) ? AL_PROFILE_AVC_MAIN : AL_PROFILE_HEVC_MAIN;
+    enc.level = 51;
+    enc.tier = 0;
+    enc.width = cfg.width;
+    enc.height = cfg.height;
+    enc.chroma_mode = AL_CHROMA_4_2_0;
+    enc.bit_depth = 8;
+    enc.rc_mode = (cfg.rc_mode == RateControl::VBR)   ? AL_RC_VBR
+                  : (cfg.rc_mode == RateControl::CQP) ? AL_RC_CONST_QP
+                                                      : AL_RC_CBR;
+    enc.target_bitrate = cfg.target_bitrate;
+    enc.max_bitrate = cfg.max_bitrate;
+    enc.framerate = cfg.framerate;
+    enc.clk_ratio = cfg.clk_ratio;
+    enc.gop_length = cfg.gop_length;
+    enc.num_b = cfg.num_b;
+    enc.low_delay_mode = cfg.low_delay_mode;
+    enc.enc_dev_path = cfg.enc_dev;
+    enc.dma_dev_path = cfg.dma_dev;
+
+    enc.initial_qp = 35;
+    enc.freq_idr = 240;
+    enc.num_src_bufs = 5;
+    enc.num_stream_bufs = 5;
+    return enc;
+}
 
 const char *EncMgr::state_to_cstr(State s)
 {
@@ -61,7 +114,7 @@ bool EncMgr::start()
             throw std::runtime_error("EncMgr: add_destination failed");
         }
 
-        m_encoder = std::make_unique<RTEncoderV4L2>(m_cfg.enc, make_output_callback());
+        m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(m_cfg), make_enc_output_callback(m_sender));
         m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
         return true;
     }
@@ -112,8 +165,8 @@ bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
     {
         return false;
     }
-    m_cfg.enc.target_bitrate = target;
-    m_cfg.enc.max_bitrate = (max > 0) ? max : target;
+    m_cfg.target_bitrate = target;
+    m_cfg.max_bitrate = (max > 0) ? max : target;
     return true;
 }
 
@@ -131,8 +184,8 @@ bool EncMgr::set_framerate(uint32_t fps, uint32_t clk)
     {
         return false;
     }
-    m_cfg.enc.framerate = static_cast<uint16_t>(fps);
-    m_cfg.enc.clk_ratio = static_cast<uint16_t>(clk);
+    m_cfg.framerate = static_cast<uint16_t>(fps);
+    m_cfg.clk_ratio = static_cast<uint16_t>(clk);
     return true;
 }
 
@@ -195,7 +248,7 @@ int64_t EncMgr::offset_ms() const
 
 bool EncMgr::open_source(int width, int height)
 {
-    const size_t num_bufs = m_cfg.enc.num_src_bufs;
+    constexpr size_t num_bufs = 4;
 
     std::shared_ptr<V4L2Source> src;
     try
@@ -259,13 +312,13 @@ void EncMgr::close_source()
 bool EncMgr::rebuild_encoder(int width, int height)
 {
     std::lock_guard<std::mutex> lock(m_enc_mutex);
-    EncoderConfig enc_cfg = m_cfg.enc;
-    enc_cfg.width = static_cast<uint16_t>(width);
-    enc_cfg.height = static_cast<uint16_t>(height);
+    EncMgrConfig tmp = m_cfg;
+    tmp.width = static_cast<uint16_t>(width);
+    tmp.height = static_cast<uint16_t>(height);
     m_encoder.reset(); // release hardware resource before constructing new instance
     try
     {
-        m_encoder = std::make_unique<RTEncoderV4L2>(enc_cfg, make_output_callback());
+        m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(tmp), make_enc_output_callback(m_sender));
         return true;
     }
     catch (const std::exception &e)
@@ -304,31 +357,6 @@ bool EncMgr::query_source_resolution(int &width, int &height) const
     return false;
 }
 
-EncodedFrameCallback EncMgr::make_output_callback() const
-{
-    if (!m_sender)
-    {
-        return {};
-    }
-
-    // Pre-allocate once; reused on every callback (single SDK encoder thread).
-    auto send_buf = std::make_shared<std::vector<uint8_t>>();
-    send_buf->reserve(MAX_TRX_UDP_SIZE + 1);
-
-    std::weak_ptr<ReliableUDP> weak_udp = m_sender;
-    return [weak_udp, send_buf](const uint8_t *data, size_t size, bool eof) {
-        auto udp = weak_udp.lock();
-        if (!udp)
-            return;
-
-        // Prepend 1-byte flag; resize never reallocates while size+1 <= reserved capacity.
-        send_buf->resize(1 + size);
-        (*send_buf)[0] = eof ? WIRE_FLAG_ENDOFFRAME : WIRE_FLAG_ENDOFSLICE;
-        std::memcpy(send_buf->data() + 1, data, size);
-        udp->send(send_buf->data(), send_buf->size());
-    };
-}
-
 bool EncMgr::handle_source_change(int &width, int &height)
 {
     auto new_w = width;
@@ -359,7 +387,6 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
         return State::Stopping;
     }
 
-    // Query actual source resolution from sub-device
     auto detected_w = width;
     auto detected_h = height;
     if (!query_source_resolution(detected_w, detected_h))
@@ -478,8 +505,8 @@ EncMgr::State EncMgr::on_waiting_source()
 
 void EncMgr::loop_thread_func()
 {
-    int width = static_cast<int>(m_cfg.enc.width);
-    int height = static_cast<int>(m_cfg.enc.height);
+    int width = static_cast<int>(m_cfg.width);
+    int height = static_cast<int>(m_cfg.height);
     State state = State::Opening;
 
     VIDEO_INFO_PRINT("EncMgr: loop thread started, initial state=%s", state_to_cstr(state));

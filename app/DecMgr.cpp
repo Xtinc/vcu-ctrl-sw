@@ -1,5 +1,32 @@
 #include "DecMgr.h"
+#include "DRMDisplay.h"
+#include "RTDecoder.h"
 #include "lib_network/ReliableUDP.h"
+
+static DecoderConfig to_decoder_config(const DecMgrConfig &cfg)
+{
+    DecoderConfig dec{};
+    dec.codec = (cfg.codec == VideoCodec::AVC) ? AL_CODEC_AVC : AL_CODEC_HEVC;
+    dec.input_buffer_size = cfg.input_buffer_size;
+    dec.low_delay_mode = cfg.low_delay_mode;
+    dec.dec_dev_path = cfg.dec_dev;
+    dec.input_buffer_num = 4;
+    dec.flush_timeout_ms = 5000;
+    return dec;
+}
+
+static DRMDisplayConfig to_drm_config(const DecMgrConfig &cfg)
+{
+    DRMDisplayConfig drm{};
+    drm.drm_device = cfg.drm_device;
+    drm.desired_width = cfg.desired_width;
+    drm.desired_height = cfg.desired_height;
+    drm.desired_refresh = cfg.desired_refresh;
+    drm.connector_id = -1;
+    drm.crtc_id = -1;
+    drm.plane_id = -1;
+    return drm;
+}
 
 DecMgr::DecMgr(DecMgrConfig cfg) : m_cfg(std::move(cfg))
 {
@@ -41,7 +68,7 @@ bool DecMgr::start()
 
     try
     {
-        m_display = std::make_unique<DRMDisplay>(m_cfg.drm, [this](AL_TBuffer *f) { return_frame(f); });
+        m_display = std::make_unique<DRMDisplay>(to_drm_config(m_cfg), [this](AL_TBuffer *f) { return_frame(f); });
 
         if (!create_decoder())
         {
@@ -54,7 +81,7 @@ bool DecMgr::start()
             {
                 return;
             }
-            push_stream(data + 1, size - 1, data[0]);
+            push_stream(data + 1, size - 1, static_cast<StreamFlags>(data[0]));
         });
         m_receiver->start();
 
@@ -82,25 +109,22 @@ void DecMgr::stop()
     if (!m_running.exchange(false))
         return;
 
-    // Step 1: stop UDP receiver — joins its worker thread so no more push_stream() calls
-    //         can arrive during or after the decoder flush.
+    // Stop receiver — no more push_stream() after this point.
     if (m_receiver)
     {
         m_receiver->stop();
         m_receiver.reset();
     }
 
-    // Step 2: flush decoder — blocks until all frames are delivered to on_decoded_frame.
-    //         No lock: callbacks must be free to acquire m_dec_mutex.
+    // Flush decoder; no lock — callbacks need m_dec_mutex.
     if (m_decoder && !m_decoder->flush())
         VIDEO_ERROR_PRINT("DecMgr: decoder flush timed out; output may be incomplete");
 
-    // Step 3: drain display — blocks until all held frames are released.
-    //         After drain() returns, no more return_frame() calls will occur.
+    // Drain display — after this no more return_frame() calls.
     if (m_display)
         m_display->drain();
 
-    // Step 4 + 5: destroy display, then decoder.  Mutex only protects fps() readers.
+    // Destroy display then decoder (display first to maintain lifetime order).
     {
         std::lock_guard<std::mutex> lk(m_dec_mutex);
         m_display.reset();
@@ -108,20 +132,22 @@ void DecMgr::stop()
     }
 }
 
-bool DecMgr::push_stream(const void *data, size_t size, uint8_t flags)
+bool DecMgr::push_stream(const void *data, size_t size, StreamFlags flags)
 {
     if (!m_running.load(std::memory_order_acquire))
         return false;
 
-    if ((!data && size > 0) || size > m_cfg.dec.input_buffer_size)
+    const auto sdk_flags = static_cast<uint8_t>(flags);
+
+    if ((!data && size > 0) || size > m_cfg.input_buffer_size)
     {
         VIDEO_ERROR_PRINT("DecMgr: invalid stream buffer (data=%p, size=%zu, capacity=%u)", data, size,
-                          m_cfg.dec.input_buffer_size);
+                          m_cfg.input_buffer_size);
         return false;
     }
 
     // Fast path.  Single producer thread; no concurrent mutation of m_decoder.
-    if (m_decoder && m_decoder->push_stream(data, size, flags))
+    if (m_decoder && m_decoder->push_stream(data, size, sdk_flags))
         return true;
 
     // Decoder failed or unavailable — rebuild and retry.
@@ -129,28 +155,22 @@ bool DecMgr::push_stream(const void *data, size_t size, uint8_t flags)
     if (!do_rebuild())
         return false;
 
-    return m_decoder && m_decoder->push_stream(data, size, flags);
+    return m_decoder && m_decoder->push_stream(data, size, sdk_flags);
 }
 
 bool DecMgr::do_rebuild()
 {
-    // Step 1: flush old decoder (likely already Done; returns immediately).
     if (m_decoder)
         m_decoder->flush();
 
-    // Step 2: drain display — blocks until all DRM slots are FREE.
-    //         After drain() returns, all return_frame() callbacks have completed
-    //         and framebuffer imports for old decoder buffers have been released.
     if (m_display)
         m_display->drain();
 
-    // Step 3: destroy old decoder — safe; all frames returned and display imports released.
     {
         std::lock_guard<std::mutex> lk(m_dec_mutex);
         m_decoder.reset();
     }
 
-    // Step 4: create fresh decoder.
     if (!create_decoder())
     {
         VIDEO_ERROR_PRINT("DecMgr: decoder rebuild failed — pipeline stopped");
@@ -226,7 +246,8 @@ bool DecMgr::create_decoder()
     try
     {
         new_dec = std::make_unique<RTDecoder>(
-            m_cfg.dec, [this](AL_TBuffer *frame, const AL_TInfoDecode &info) { on_decoded_frame(frame, info); });
+            to_decoder_config(m_cfg),
+            [this](AL_TBuffer *frame, const AL_TInfoDecode &info) { on_decoded_frame(frame, info); });
     }
     catch (const std::exception &e)
     {

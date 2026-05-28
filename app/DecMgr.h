@@ -1,39 +1,52 @@
 #ifndef DEC_MGR_H
 #define DEC_MGR_H
 
-#include "DRMDisplay.h"
-#include "RTDecoder.h"
+#include "VideoTypes.h"
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+
+class RTDecoder;
+class DRMDisplay;
 class ReliableUDP;
+
+struct AL_TBuffer;
+struct AL_TInfoDecode;
 
 /**
  * @brief Configuration bundle for DecMgr initialization.
  *
- * Holds all parameters needed to create and configure the decode+display pipeline.
- * Pass this struct to DecMgr's constructor.
+ * Only standard C++ types are exposed here; internal SDK and DRM types are
+ * hidden inside DecMgr.cpp.
  *
  * @par Example
  * @code
  *   DecMgrConfig cfg;
- *   cfg.dec.codec = AL_CODEC_HEVC;
- *   cfg.dec.dec_dev_path = "/dev/allegroDecodeIP";
- *   cfg.dec.input_buffer_size = 1024 * 1024;  // 1 MB
- *   cfg.drm.drm_device = "/dev/dri/card0";
- *   cfg.drm.desired_width = 1920;
- *   cfg.drm.desired_height = 1080;
+ *   cfg.codec = VideoCodec::HEVC;
+ *   cfg.drm_device = "/dev/dri/card0";
+ *   cfg.desired_width  = 1920;
+ *   cfg.desired_height = 1080;
+ *   cfg.udp_local_port = 5004;
  *
  *   DecMgr mgr(cfg);
  * @endcode
  */
 struct DecMgrConfig
 {
-    DecoderConfig dec;    ///< Hardware decoder configuration (codec, device, buffer sizes).
-    DRMDisplayConfig drm; ///< DRM/KMS display configuration (device, mode, timing).
-
-    unsigned short udp_local_port = 0; ///< UDP port to receive encoded bitstream on (required, must be > 0).
-
-    std::string udp_reply_addr;         ///< Address of the sender to reply RTT probes to (optional).
-    unsigned short udp_reply_port = 0;  ///< Port of the sender to reply RTT probes to (optional, must be > 0 to enable).
+    VideoCodec codec = VideoCodec::HEVC;             ///< Video codec
+    bool low_delay_mode = false;                     ///< Low-latency decode profile
+    uint32_t input_buffer_size = 4u * 1024u * 1024u; ///< Bytes per input stream buffer
+    std::string dec_dev = "/dev/allegroDecodeIP";    ///< VCU decoder device
+    std::string drm_device = "/dev/dri/card0";       ///< DRM device node
+    int desired_width = 0;                           ///< Preferred display width  (0 = no preference)
+    int desired_height = 0;                          ///< Preferred display height (0 = no preference)
+    int desired_refresh = 0;                         ///< Preferred refresh rate in Hz (0 = auto)
+    uint16_t udp_local_port = 0;                     ///< Local UDP port to receive bitstream on (required, > 0)
+    std::string udp_reply_addr;                      ///< Encoder address for RTT probes (optional)
+    uint16_t udp_reply_port = 0;                     ///< Encoder UDP port for RTT probes (0 = disabled)
 };
 
 /**
@@ -46,8 +59,8 @@ struct DecMgrConfig
  * @par Typical Usage
  * @code
  *   DecMgrConfig cfg;
- *   cfg.dec.codec = AL_CODEC_HEVC;
- *   cfg.drm.drm_device = "/dev/dri/card0";
+ *   cfg.codec = VideoCodec::HEVC;
+ *   cfg.drm_device = "/dev/dri/card0";
  *
  *   DecMgr mgr(cfg);
  *   if (!mgr.start()) {
@@ -129,15 +142,6 @@ class DecMgr
      * @note Constructor never throws; all initialization happens in start().
      */
     explicit DecMgr(DecMgrConfig cfg);
-
-    /**
-     * @brief Destructor.
-     *
-     * Automatically calls stop() if the pipeline is still running,
-     * ensuring graceful shutdown and resource cleanup.
-     *
-     * @note Blocks until all frames are displayed and resources released.
-     */
     ~DecMgr();
 
     DecMgr(const DecMgr &) = delete;
@@ -194,7 +198,7 @@ class DecMgr
     int64_t offset_ms() const;
 
   private:
-    bool push_stream(const void *data, size_t size, uint8_t flags = AL_STREAM_BUF_FLAG_UNKNOWN);
+    bool push_stream(const void *data, size_t size, StreamFlags flags = StreamFlags::Unknown);
     void on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info);
     void return_frame(AL_TBuffer *frame);
     bool create_decoder();
