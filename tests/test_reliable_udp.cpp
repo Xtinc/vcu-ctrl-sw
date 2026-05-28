@@ -262,6 +262,19 @@ static void print_results(const TestConfig &cfg, const TestState &state, uint64_
     std::cout << "  UDP pkts forwarded: " << forwarded << "\n";
     std::cout << "  UDP pkts dropped  : " << dropped << "  (" << udp_loss_pct << "%)\n";
     print_divider();
+    // FEC recovery analysis
+    // If FEC did nothing:  message_loss ≈ udp_loss
+    // FEC recovery rate = udp_loss - message_loss  (both in %)
+    // i.e. what fraction of the originally-lost UDP traffic the codec rescued.
+    double fec_recovered_pct = udp_loss_pct - msg_loss_pct;
+    if (fec_recovered_pct < 0.0) fec_recovered_pct = 0.0;
+    double fec_efficiency_pct =
+        udp_loss_pct > 0.0 ? 100.0 * fec_recovered_pct / udp_loss_pct : 100.0;
+    std::cout << "  UDP pkt loss      : " << udp_loss_pct << "%\n";
+    std::cout << "  Message loss      : " << msg_loss_pct << "%\n";
+    std::cout << "  FEC recovered     : " << fec_recovered_pct
+              << "% of traffic  (efficiency: " << fec_efficiency_pct << "%)\n";
+    print_divider();
 
     const bool pass = (errors == 0 && dups == 0);
     if (pass)
