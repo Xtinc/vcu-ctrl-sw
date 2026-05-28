@@ -188,19 +188,10 @@ class DecMgr
      */
     void stop();
 
-    /**
-     * @brief Get the current decode frame rate.
-     *
-     * Returns an exponential moving average (EMA, α=0.9) of the decoder's
-     * output frame rate. The rate is computed every 100 frames.
-     *
-     * @return Decode frame rate in frames per second (fps).
-     * @retval 0.0  Pipeline stopped, or fewer than 100 frames decoded.
-     *
-     * @note Thread-safe; may be called from any thread at any time.
-     * @note Only counts main/postproc output frames, not auxiliary outputs.
-     */
     double fps() const;
+    double recv_rate() const;
+    int64_t rtt_ms() const;
+    int64_t offset_ms() const;
 
   private:
     bool push_stream(const void *data, size_t size, uint8_t flags = AL_STREAM_BUF_FLAG_UNKNOWN);

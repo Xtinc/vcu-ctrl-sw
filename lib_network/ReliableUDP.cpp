@@ -988,7 +988,6 @@ void ReliableUDP::handle_probe_packet(const TRXProbe &pkt)
             rtt_ms_.store(static_cast<int64_t>(rtt), std::memory_order_relaxed);
             offset_ms_.store(static_cast<int64_t>(offset), std::memory_order_relaxed);
             time_synced_.store(true, std::memory_order_relaxed);
-            VIDEO_INFO_PRINT("[Probe] RTT: %d ms, Clock offset: %d ms", rtt, offset);
         }
     }
 }

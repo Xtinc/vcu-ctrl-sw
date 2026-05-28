@@ -21,19 +21,17 @@ extern "C"
 #include "lib_rtos/message.h"
 }
 
+#include <cerrno>
 #include <chrono>
+#include <cinttypes>
 #include <csignal>
 #include <cstdlib>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
-static volatile sig_atomic_t g_stop = 0;
-
-static void signal_handler(int)
-{
-    g_stop = 1;
-}
+static sigset_t g_signal_set;
 
 struct AppOptions
 {
@@ -152,8 +150,10 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    std::signal(SIGINT,  signal_handler);
-    std::signal(SIGTERM, signal_handler);
+    sigemptyset(&g_signal_set);
+    sigaddset(&g_signal_set, SIGINT);
+    sigaddset(&g_signal_set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &g_signal_set, nullptr);
 
     DecMgrConfig cfg;
     cfg.dec.codec             = AL_CODEC_HEVC;
@@ -174,8 +174,41 @@ int main(int argc, char *argv[])
     VIDEO_INFO_PRINT("Listening on UDP port %u  codec=HEVC  drm=%s", options.udp_port, options.drm_device.c_str());
     VIDEO_INFO_PRINT("Press Ctrl+C to stop.");
 
-    while (!g_stop)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (;;)
+    {
+        timespec timeout;
+        timeout.tv_sec  = 10;
+        timeout.tv_nsec = 0;
+
+        const int signo = sigtimedwait(&g_signal_set, nullptr, &timeout);
+        if (signo > 0)
+        {
+            VIDEO_INFO_PRINT("Signal %d received", signo);
+            break;
+        }
+
+        if (errno == EAGAIN)
+        {
+            const double dec_fps    = dec_mgr.fps();
+            const double recv_bps   = dec_mgr.recv_rate();
+            const int64_t rtt       = dec_mgr.rtt_ms();
+            const int64_t offset    = dec_mgr.offset_ms();
+            if (rtt >= 0)
+            {
+                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, rtt=%" PRId64 "ms, offset=%" PRId64 "ms",
+                                 dec_fps, recv_bps, rtt, offset);
+            }
+            else
+            {
+                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, rtt=N/A",
+                                 dec_fps, recv_bps);
+            }
+            continue;
+        }
+
+        VIDEO_ERROR_PRINT("sigtimedwait failed (errno=%d), stopping decoder", errno);
+        break;
+    }
 
     VIDEO_INFO_PRINT("Stopping pipeline (decode fps: %.2f)...", dec_mgr.fps());
     dec_mgr.stop();

@@ -172,6 +172,42 @@ double DecMgr::fps() const
     return m_decoder ? m_decoder->fps() : 0.0;
 }
 
+double DecMgr::recv_rate() const
+{
+    if (!m_running.load(std::memory_order_acquire))
+        return 0.0;
+
+    auto receiver = m_receiver;
+    if (!receiver)
+        return 0.0;
+
+    return receiver->recv_rate();
+}
+
+int64_t DecMgr::rtt_ms() const
+{
+    if (!m_running.load(std::memory_order_acquire))
+        return -1;
+
+    auto receiver = m_receiver;
+    if (!receiver)
+        return -1;
+
+    return receiver->rtt_ms();
+}
+
+int64_t DecMgr::offset_ms() const
+{
+    if (!m_running.load(std::memory_order_acquire))
+        return 0;
+
+    auto receiver = m_receiver;
+    if (!receiver)
+        return 0;
+
+    return receiver->offset_ms();
+}
+
 void DecMgr::on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info)
 {
     if (m_display)

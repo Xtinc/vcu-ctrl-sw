@@ -47,7 +47,7 @@ enum class TRXFECMode
 
 constexpr uint8_t MAGIC_TRX_PROBE_NUMBER = 0xA5;
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
-constexpr size_t MAX_TRX_UDP_SIZE = 65536;
+constexpr size_t MAX_TRX_UDP_SIZE = 131072;
 constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;
 constexpr size_t TRX_RS_FEC_REDUNDANCY = 3;
 constexpr size_t MAX_XOR_PACKET_NUM_PER_GROUP = 1;

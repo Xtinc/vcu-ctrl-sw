@@ -313,7 +313,7 @@ EncodedFrameCallback EncMgr::make_output_callback() const
 
     // Pre-allocate once; reused on every callback (single SDK encoder thread).
     auto send_buf = std::make_shared<std::vector<uint8_t>>();
-    send_buf->reserve(MAX_TRX_UDP_SIZE);
+    send_buf->reserve(MAX_TRX_UDP_SIZE + 1);
 
     std::weak_ptr<ReliableUDP> weak_udp = m_sender;
     return [weak_udp, send_buf](const uint8_t *data, size_t size, bool eof) {
