@@ -724,12 +724,12 @@ void RTEncoderBase::push_stream_buffers()
 }
 
 // Implementation for FILE source mode
-RTEncoder<SourceMode::FILE>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
+RTEncoderFile::RTEncoderFile(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : RTEncoderBase(cfg, std::move(cb))
 {
 }
 
-AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
+AL_TBuffer *RTEncoderFile::acquire_source_buffer()
 {
     if (m_state.load() != State::Running)
     {
@@ -747,7 +747,7 @@ AL_TBuffer *RTEncoder<SourceMode::FILE>::acquire_source_buffer()
     return pBuf;
 }
 
-bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
+bool RTEncoderFile::submit_source_buffer(AL_TBuffer *pBuf)
 {
     if (!pBuf)
     {
@@ -770,7 +770,7 @@ bool RTEncoder<SourceMode::FILE>::submit_source_buffer(AL_TBuffer *pBuf)
     return true;
 }
 
-void RTEncoder<SourceMode::FILE>::release_sources(AL_TBuffer const * /*pSrc*/)
+void RTEncoderFile::release_sources(AL_TBuffer const * /*pSrc*/)
 {
     // File mode source buffers are owned by the encoder; nothing to do on source-release callback.
 }
@@ -835,12 +835,12 @@ DMAFd &DMAFd::operator=(DMAFd &&other) noexcept
 }
 
 // Implementation for V4L2_DMABUF source mode
-RTEncoder<SourceMode::V4L2>::RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb)
+RTEncoderV4L2::RTEncoderV4L2(const EncoderConfig &cfg, EncodedFrameCallback cb)
     : RTEncoderBase(cfg, std::move(cb))
 {
 }
 
-RTEncoder<SourceMode::V4L2>::~RTEncoder()
+RTEncoderV4L2::~RTEncoderV4L2()
 {
     // Derived destructor runs before base destructor: flush here
     try
@@ -855,13 +855,13 @@ RTEncoder<SourceMode::V4L2>::~RTEncoder()
     m_release_cb = nullptr;
 }
 
-void RTEncoder<SourceMode::V4L2>::set_release_callback(SourceReleaseCallback releaseCb)
+void RTEncoderV4L2::set_release_callback(SourceReleaseCallback releaseCb)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_release_cb = std::move(releaseCb);
 }
 
-DMAFdArray RTEncoder<SourceMode::V4L2>::acquire_dma_buffers(unsigned int count)
+DMAFdArray RTEncoderV4L2::acquire_dma_buffers(unsigned int count)
 {
     auto available_cnt = m_source_buf_pool->available_count();
     if (count > available_cnt)
@@ -918,7 +918,7 @@ DMAFdArray RTEncoder<SourceMode::V4L2>::acquire_dma_buffers(unsigned int count)
     return ok ? std::move(descs) : DMAFdArray{};
 }
 
-bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
+bool RTEncoderV4L2::submit_source_buffer(AL_TBuffer *pBuf)
 {
     if (m_state.load() != State::Running || !pBuf)
     {
@@ -936,7 +936,7 @@ bool RTEncoder<SourceMode::V4L2>::submit_source_buffer(AL_TBuffer *pBuf)
     return true;
 }
 
-void RTEncoder<SourceMode::V4L2>::release_sources(AL_TBuffer const *pSrc)
+void RTEncoderV4L2::release_sources(AL_TBuffer const *pSrc)
 {
     SourceReleaseCallback release_cb;
     {

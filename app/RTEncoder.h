@@ -39,18 +39,14 @@ struct EncoderConfig
     bool low_delay_mode = false; // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
 };
 
-enum class SourceMode
-{
-    FILE,
-    V4L2
-};
+
 
 /**
  * @brief RTEncoderBase is a hardware-accelerated video encoder wrapper for the Allegro DVT VCU SDK.
  *
  * This class manages the full encoder lifecycle: SDK initialization, DMA allocator and MCU scheduler
  * creation, source/stream buffer pool management, GOP and rate-control parameter application, and
- * thread-safe state transitions. Concrete subclasses (RTEncoder<FILE> and RTEncoder<V4L2>) provide
+ * thread-safe state transitions. Concrete subclasses (RTEncoderFile and RTEncoderV4L2) provide
  * source-buffer acquisition and release strategies.
  *
  * Lifecycle state machine (single atomic state):
@@ -227,10 +223,6 @@ class RTEncoderBase
     bool m_lib_initialized;
 };
 
-template <SourceMode mode> class RTEncoder;
-using RTEncoderFile = RTEncoder<SourceMode::FILE>;
-using RTEncoderV4L2 = RTEncoder<SourceMode::V4L2>;
-
 /**
  * @brief File/software source encoder: the caller owns the source buffer lifecycle.
  *
@@ -238,7 +230,7 @@ using RTEncoderV4L2 = RTEncoder<SourceMode::V4L2>;
  * then hands it back via submit_source_buffer(). Ownership transfers to the encoder on submit;
  * the buffer is automatically returned to the pool via the source-release callback.
  */
-template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
+class RTEncoderFile : public RTEncoderBase
 {
   public:
     /**
@@ -247,8 +239,8 @@ template <> class RTEncoder<SourceMode::FILE> : public RTEncoderBase
      * @param cb  Encoded data callback.
      * @throw std::runtime_error on initialization failure.
      */
-    RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
-    ~RTEncoder() override = default;
+    RTEncoderFile(const EncoderConfig &cfg, EncodedFrameCallback cb);
+    ~RTEncoderFile() override = default;
 
     /**
      * @brief Acquire an idle source buffer from the pool.
@@ -286,7 +278,7 @@ using SourceReleaseCallback = std::function<void(AL_TBuffer const *pSrc)>;
  * When the SDK is done with the buffer the registered SourceReleaseCallback fires so the caller
  * can requeue it back to V4L2.
  */
-template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
+class RTEncoderV4L2 : public RTEncoderBase
 {
   public:
     /**
@@ -295,8 +287,8 @@ template <> class RTEncoder<SourceMode::V4L2> : public RTEncoderBase
      * @param cb  Encoded data callback.
      * @throw std::runtime_error on initialization failure.
      */
-    RTEncoder(const EncoderConfig &cfg, EncodedFrameCallback cb);
-    ~RTEncoder() override;
+    RTEncoderV4L2(const EncoderConfig &cfg, EncodedFrameCallback cb);
+    ~RTEncoderV4L2() override;
 
     /**
      * @brief Register the callback invoked when the SDK releases a source buffer.
