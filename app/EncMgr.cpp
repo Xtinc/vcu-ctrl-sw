@@ -1,6 +1,9 @@
 #include "EncMgr.h"
 #include "lib_network/ReliableUDP.h"
 
+static constexpr uint8_t WIRE_FLAG_ENDOFSLICE = 0x2;
+static constexpr uint8_t WIRE_FLAG_ENDOFFRAME = 0x4;
+
 const char *EncMgr::state_to_cstr(State s)
 {
     switch (s)
@@ -308,12 +311,21 @@ EncodedFrameCallback EncMgr::make_output_callback() const
         return {};
     }
 
+    // Pre-allocate once; reused on every callback (single SDK encoder thread).
+    auto send_buf = std::make_shared<std::vector<uint8_t>>();
+    send_buf->reserve(MAX_TRX_UDP_SIZE);
+
     std::weak_ptr<ReliableUDP> weak_udp = m_sender;
-    return [weak_udp](const uint8_t *data, size_t size, bool /*eof*/) {
-        if (auto udp = weak_udp.lock())
-        {
-            udp->send(data, size);
-        }
+    return [weak_udp, send_buf](const uint8_t *data, size_t size, bool eof) {
+        auto udp = weak_udp.lock();
+        if (!udp)
+            return;
+
+        // Prepend 1-byte flag; resize never reallocates while size+1 <= reserved capacity.
+        send_buf->resize(1 + size);
+        (*send_buf)[0] = eof ? WIRE_FLAG_ENDOFFRAME : WIRE_FLAG_ENDOFSLICE;
+        std::memcpy(send_buf->data() + 1, data, size);
+        udp->send(send_buf->data(), send_buf->size());
     };
 }
 

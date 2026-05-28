@@ -9,7 +9,7 @@ static std::once_flag fec_init_flag;
 
 struct FECLayout
 {
-    TRXFecMode mode;
+    TRXFECMode mode;
     uint8_t data_packets_count;
     uint8_t fec_packets_count;
 };
@@ -40,13 +40,13 @@ static FECLayout resolve_fec_layout(uint8_t units_num)
     switch (units_num)
     {
     case 1:
-        return {TRXFecMode::None, 1, 0};
+        return {TRXFECMode::None, 1, 0};
     case 2:
-        return {TRXFecMode::XOR, 1, 1};
+        return {TRXFECMode::XOR, 1, 1};
     case MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY:
-        return {TRXFecMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
+        return {TRXFECMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
     default:
-        return {TRXFecMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
+        return {TRXFECMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
     }
 }
 
@@ -490,23 +490,23 @@ void ReliableUDP::create_no_fec_group(std::vector<TRXUnit> &all_units, const uin
     all_units.push_back(unit);
 }
 
-TRXFecMode ReliableUDP::resolve_fec_mode(size_t packet_size) const
+TRXFECMode ReliableUDP::resolve_fec_mode(size_t packet_size) const
 {
-    return packet_size > MAX_TRX_UNIT_SIZE ? TRXFecMode::RS : TRXFecMode::XOR;
+    return packet_size > MAX_TRX_DATA_SIZE ? TRXFECMode::RS : TRXFECMode::XOR;
 }
 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
 {
-    const TRXFecMode fec_mode = resolve_fec_mode(size);
+    const TRXFECMode fec_mode = resolve_fec_mode(size);
 
     size_t max_group_data_size;
     switch (fec_mode)
     {
-    case TRXFecMode::RS:
+    case TRXFECMode::RS:
         max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
         break;
-    case TRXFecMode::XOR:
-    case TRXFecMode::None:
+    case TRXFECMode::XOR:
+    case TRXFECMode::None:
     default:
         max_group_data_size = MAX_TRX_DATA_SIZE;
         break;
@@ -527,15 +527,15 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
 
         switch (fec_mode)
         {
-        case TRXFecMode::RS:
+        case TRXFECMode::RS:
             create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                   static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
-        case TRXFecMode::XOR:
+        case TRXFECMode::XOR:
             create_small_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                    static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
             break;
-        case TRXFecMode::None:
+        case TRXFECMode::None:
         default:
             create_no_fec_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                 static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
@@ -612,7 +612,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
             it->units.push_back(unit);
             auto sentinel = it->units.front();
             sentinel.data = nullptr;
-            if (layout.mode != TRXFecMode::RS)
+            if (layout.mode != TRXFECMode::RS)
             {
                 assemble_complete_message(unit.head.frame_seq, unit.head.group_num, unit.head.group_seq, unit.data,
                                           unit.head.group_len);

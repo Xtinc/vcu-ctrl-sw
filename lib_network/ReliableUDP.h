@@ -38,7 +38,7 @@ class BackgroundService
 
 using RecvCallBack = std::function<void(const uint8_t *data, size_t size)>;
 
-enum class TRXFecMode
+enum class TRXFECMode
 {
     None,
     XOR,
@@ -401,7 +401,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void assemble_complete_message(uint16_t frame_seq, uint16_t group_num, uint16_t group_seq, uint8_t *data,
                                    size_t size);
     void generate_uuid();
-    TRXFecMode resolve_fec_mode(size_t packet_size) const;
+    TRXFECMode resolve_fec_mode(size_t packet_size) const;
 
     void schedule_probe();
     void send_probe();
