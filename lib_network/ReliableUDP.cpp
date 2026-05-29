@@ -139,6 +139,7 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
     }
 
     generate_uuid();
+    usr_queue_.set_owner(this);
 
     VIDEO_INFO_PRINT("ReliableUDP initialized - receive port: %d, uuid: %u", recv_socket_->local_endpoint().port(),
                      target_uid_);
@@ -809,12 +810,12 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
             recv_pool_.deallocate(frag.second);
         }
 
-        if (!usr_queue_.enqueue(complete_message, total_length))
+        uint32_t abs_seq = (static_cast<uint32_t>(frame_cycle_) << 16) | frame_seq;
+        if (!usr_queue_.enqueue(complete_message, total_length, abs_seq))
         {
             VIDEO_ERROR_PRINT("Failed to enqueue received message");
+            recv_pool_.deallocate(complete_message); // queue refused — release here
         }
-
-        recv_pool_.deallocate(complete_message);
         receive_frames_.erase(it);
     }
 
@@ -829,6 +830,11 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
         }
         receive_frames_.pop_back();
     }
+}
+
+void ReliableUDP::release_recv_buf(uint8_t *p)
+{
+    recv_pool_.deallocate(p);
 }
 
 void ReliableUDP::generate_uuid()

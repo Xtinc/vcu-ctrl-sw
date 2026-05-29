@@ -1,6 +1,7 @@
 #ifndef RELIABLE_UDP_H
 #define RELIABLE_UDP_H
 
+#include "ClockWait.h"
 #include "MemPoolUDP.h"
 #include "ReedSoloman.h"
 #include "asio.hpp"
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -75,11 +77,9 @@ struct TRXUnit
         uint16_t frame_seq;      // 2 B - frame sequence number
         uint16_t group_seq;      // 2 B - group sequence number within a session
         uint16_t group_len;      // 2 B - total payload bytes in this group
-
         uint16_t group_num : 8;  // 8 b (0-255) - number of groups in this frame
         uint16_t units_idx : 4;  // 4 b (0-15)  - index of this unit within the group
         uint16_t units_num : 4;  // 4 b (0-15)  - total units in the group (data + FEC)
-
         uint32_t units_len : 12; // 12 b - payload length of this unit
         uint32_t conn_uuid : 12; // 12 b - connection UUID
         uint32_t check_sum : 8;  //  8 b - Adler-8 checksum over the preceding header bytes
@@ -189,38 +189,42 @@ struct TRXFrame
 constexpr size_t TRX_HEADER_SIZE = sizeof(TRXUnit::Header);
 constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
 
+class ReliableUDP;
 template <bool ASYNC> class UsrQueue;
 
 template <> class UsrQueue<true>
 {
-    using cb_data = std::pair<uint8_t *, size_t>;
+    struct cb_data
+    {
+        uint8_t *data;
+        size_t size;
+        uint32_t seq;
+    };
+
+    static constexpr size_t MAX_JITTER_DEPTH = 8;
+    static constexpr size_t MAX_REORDER_BUF = MAX_JITTER_DEPTH * 4;
+    static constexpr std::chrono::milliseconds FLUSH_TIMEOUT{200};
 
   public:
-    UsrQueue() : running_(false), write_idx_(0), read_idx_(0)
+    UsrQueue() : owner_(nullptr), running_(false), next_deliver_seq_(0), target_depth_(0)
     {
-        for (auto &p : queue_)
-        {
-            p.first = new uint8_t[MAX_TRX_UDP_SIZE];
-            p.second = 0;
-        }
     }
 
     ~UsrQueue()
     {
         stop();
-        for (auto &p : queue_)
-        {
-            delete[] p.first;
-        }
+    }
+
+    void set_owner(ReliableUDP *owner)
+    {
+        owner_ = owner;
     }
 
     void start(RecvCallBack callback, void *user_data)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (running_)
-        {
             return;
-        }
 
         receive_callback_ = callback;
         user_data_ = user_data;
@@ -236,73 +240,150 @@ template <> class UsrQueue<true>
         }
         cond_.notify_all();
         if (thread_.joinable())
-        {
             thread_.join();
-        }
     }
 
-    bool enqueue(const uint8_t *data, size_t size)
+    bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     {
         if (size > MAX_TRX_UDP_SIZE || data == nullptr)
-        {
             return false;
-        }
 
         std::lock_guard<std::mutex> lock(mutex_);
 
-        size_t next_write = (write_idx_ + 1) % queue_.size();
-        if (next_write == read_idx_)
-        {
+        if (reorder_buf_.size() >= MAX_REORDER_BUF)
             return false;
-        }
 
-        std::memcpy(queue_[write_idx_].first, data, size);
-        queue_[write_idx_].second = size;
-        write_idx_ = next_write;
+        auto result = reorder_buf_.emplace(abs_seq, cb_data{data, size, abs_seq});
+        if (!result.second)
+            return false; // duplicate seq
+
+        // Disorder metric: 0-based position of this frame in the sorted buffer
+        // at insertion time.  Position 0 = arrived in order; position k = k
+        // earlier frames are already buffered.
+        double pos = static_cast<double>(std::distance(reorder_buf_.begin(), result.first));
+        disorder_hist_.add(pos);
 
         cond_.notify_one();
         return true;
     }
 
-  private:
-    void worker_thread()
+    /// Returns the current adaptive jitter buffer depth (in frames).
+    size_t target_depth() const
     {
-        while (true)
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cond_.wait(lock, [this] { return !running_ || read_idx_ != write_idx_; });
+        return target_depth_.load(std::memory_order_relaxed);
+    }
 
-            if (!running_ && read_idx_ == write_idx_)
-            {
-                break;
-            }
-
-            if (read_idx_ != write_idx_)
-            {
-                cb_data data = queue_[read_idx_];
-                read_idx_ = (read_idx_ + 1) % queue_.size();
-                lock.unlock();
-                receive_callback_(data.first, data.second);
-            }
-        }
+    /// Returns the raw P90 disorder quantile (in frames).
+    /// Returns NaN when no samples have been collected yet (boot_n == 0).
+    double disorder_p90() const
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return disorder_hist_.quantile(0.90);
     }
 
   private:
+    void worker_thread()
+    {
+        using clock = std::chrono::steady_clock;
+        auto flush_at = clock::time_point::max();
+
+        while (true)
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+
+            if (flush_at == clock::time_point::max())
+                cond_.wait(lock, [this] { return !running_ || !reorder_buf_.empty(); });
+            else
+                cond_.wait_until(lock, flush_at, [this] { return !running_ || !reorder_buf_.empty(); });
+
+            if (!running_ && reorder_buf_.empty())
+                break;
+
+            bool force = (!reorder_buf_.empty() && clock::now() >= flush_at);
+            bool delivered = try_deliver_locked(lock, force);
+
+            if (delivered)
+                flush_at = clock::time_point::max();
+            else if (!reorder_buf_.empty() && flush_at == clock::time_point::max())
+                flush_at = clock::now() + FLUSH_TIMEOUT;
+        }
+    }
+
+    bool try_deliver_locked(std::unique_lock<std::mutex> &lock, bool force)
+    {
+        bool any = false;
+        while (!reorder_buf_.empty())
+        {
+            auto front_it = reorder_buf_.begin();
+            bool in_order = (front_it->first == next_deliver_seq_);
+            bool depth_reached = (reorder_buf_.size() > target_depth_.load(std::memory_order_relaxed));
+
+            if (!in_order && !depth_reached && !force)
+                break;
+
+            force = false; // only one forced delivery per stall event
+
+            cb_data item = front_it->second;
+
+            // Align next expected seq, skipping any unrecoverable gap
+            if (front_it->first != next_deliver_seq_)
+                next_deliver_seq_ = front_it->first;
+            next_deliver_seq_++;
+            reorder_buf_.erase(front_it);
+
+            // Update target_depth from the P90 of the disorder histogram.
+            // quantile() returns NaN during bootstrap (boot_n == 0); the
+            // >= 0.0 guard safely keeps target_depth_ == 0 in that case.
+            //
+            // Use lround (nearest integer) rather than ceil so the depth can
+            // decrease: P90 < 0.5 maps to 0, 0.5–1.5 maps to 1, etc.
+            // ceil would keep depth at 1 even when p90 ≈ 0.001 (mostly
+            // in-order traffic), preventing the buffer from recovering.
+            double p90 = disorder_hist_.quantile(0.90);
+            if (p90 >= 0.0)
+            {
+                size_t d = static_cast<size_t>(std::lround(p90));
+                target_depth_.store(d > MAX_JITTER_DEPTH ? MAX_JITTER_DEPTH : d, std::memory_order_relaxed);
+            }
+
+            any = true;
+            lock.unlock();
+            receive_callback_(item.data, item.size);
+            if (owner_)
+                owner_->release_recv_buf(item.data);
+            lock.lock();
+        }
+        return any;
+    }
+
+  private:
+    ReliableUDP *owner_;
     RecvCallBack receive_callback_;
     void *user_data_;
 
     std::thread thread_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cond_;
     bool running_;
-    size_t write_idx_;
-    size_t read_idx_;
-    std::array<cb_data, 30> queue_;
+
+    std::map<uint32_t, cb_data> reorder_buf_;
+    uint32_t next_deliver_seq_;
+    std::atomic<size_t> target_depth_;
+    Histogram<32> disorder_hist_;
 };
 
 template <> class UsrQueue<false>
 {
   public:
+    UsrQueue() : owner_(nullptr)
+    {
+    }
+
+    void set_owner(ReliableUDP *owner)
+    {
+        owner_ = owner;
+    }
+
     void start(RecvCallBack callback, void *user_data)
     {
         receive_callback_ = callback;
@@ -315,18 +396,19 @@ template <> class UsrQueue<false>
         user_data_ = nullptr;
     }
 
-    bool enqueue(const uint8_t *data, size_t size)
+    bool enqueue(uint8_t *data, size_t size, uint32_t /*abs_seq*/)
     {
         if (size > MAX_TRX_UDP_SIZE || data == nullptr)
-        {
             return false;
-        }
 
         receive_callback_(data, size);
+        if (owner_)
+            owner_->release_recv_buf(data);
         return true;
     }
 
   private:
+    ReliableUDP *owner_;
     RecvCallBack receive_callback_;
     void *user_data_;
 };
@@ -375,6 +457,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     {
         usr_queue_.start(callback, user_data);
     }
+    void release_recv_buf(uint8_t *p);
     double send_rate();
     double recv_rate();
     double lost_rate();
@@ -436,7 +519,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 
-    UsrQueue<false> usr_queue_;
+    UsrQueue<true> usr_queue_;
     std::atomic<uint64_t> lost_packets_;
     std::atomic<uint64_t> send_bytes_;
     std::atomic<uint64_t> recv_bytes_;

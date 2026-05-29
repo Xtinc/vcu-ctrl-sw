@@ -29,12 +29,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -300,6 +302,245 @@ static void print_results(const TestConfig &cfg, const TestState &state, uint64_
 
 // ─── Core test runner ─────────────────────────────────────────────────────────
 
+// ─── Jitter buffer unit tests ─────────────────────────────────────────────────
+
+// Deliver 50 in-order frames; verify all are received in ascending order.
+static bool test_jitter_inorder()
+{
+    constexpr uint32_t N = 50;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<uint32_t> received;
+    std::mutex            mtx;
+    std::condition_variable cv;
+
+    UsrQueue<true> q;
+    q.start(
+        [&](const uint8_t *data, size_t) {
+            uint32_t v;
+            std::memcpy(&v, data, 4);
+            std::lock_guard<std::mutex> lk(mtx);
+            received.push_back(v);
+            cv.notify_one();
+        },
+        nullptr);
+
+    for (uint32_t i = 0; i < N; i++)
+        q.enqueue(bufs[i].data(), 4, i);
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(2), [&] { return received.size() >= N; });
+    }
+    q.stop();
+
+    if (received.size() != N)
+        return false;
+    for (size_t i = 1; i < received.size(); i++)
+        if (received[i] < received[i - 1])
+            return false;
+    return true;
+}
+
+// Deliver 50 frames with pairwise-swap reorder (1,0,3,2,...) and verify
+// every sequence number is received exactly once.
+static bool test_jitter_reorder_complete()
+{
+    constexpr uint32_t N = 50;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<uint32_t> received;
+    std::mutex            mtx;
+    std::condition_variable cv;
+
+    UsrQueue<true> q;
+    q.start(
+        [&](const uint8_t *data, size_t) {
+            uint32_t v;
+            std::memcpy(&v, data, 4);
+            std::lock_guard<std::mutex> lk(mtx);
+            received.push_back(v);
+            cv.notify_one();
+        },
+        nullptr);
+
+    for (uint32_t i = 0; i < N; i += 2)
+    {
+        q.enqueue(bufs[i + 1].data(), 4, i + 1);
+        q.enqueue(bufs[i].data(), 4, i);
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(2), [&] { return received.size() >= N; });
+    }
+    q.stop();
+
+    if (received.size() != N)
+        return false;
+    std::set<uint32_t> recv_set(received.begin(), received.end());
+    for (uint32_t i = 0; i < N; i++)
+        if (!recv_set.count(i))
+            return false;
+    return true;
+}
+
+// No duplicate deliveries: enqueue each frame twice; only one delivery per seq.
+static bool test_jitter_no_duplicates()
+{
+    constexpr uint32_t N = 20;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<uint32_t> received;
+    std::mutex            mtx;
+    std::condition_variable cv;
+
+    UsrQueue<true> q;
+    q.start(
+        [&](const uint8_t *data, size_t) {
+            uint32_t v;
+            std::memcpy(&v, data, 4);
+            std::lock_guard<std::mutex> lk(mtx);
+            received.push_back(v);
+            cv.notify_one();
+        },
+        nullptr);
+
+    for (uint32_t i = 0; i < N; i++)
+    {
+        q.enqueue(bufs[i].data(), 4, i);
+        q.enqueue(bufs[i].data(), 4, i); // duplicate — must be silently dropped
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(2), [&] { return received.size() >= N; });
+    }
+    q.stop();
+
+    if (received.size() != N)
+        return false;
+    std::set<uint32_t> recv_set(received.begin(), received.end());
+    return recv_set.size() == N; // each seq appears exactly once
+}
+
+// disorder_p90() returns NaN before any frame is enqueued.
+static bool test_jitter_p90_empty()
+{
+    UsrQueue<true> q;
+    return std::isnan(q.disorder_p90());
+}
+
+// disorder_p90() returns a valid non-negative number after >= 32 samples.
+// Frames are enqueued without starting the worker so they accumulate
+// simultaneously, giving the histogram a non-trivial dataset.
+static bool test_jitter_p90_valid()
+{
+    UsrQueue<true> q;
+    static uint8_t dummy[4] = {};
+    // 64 in-order frames all buffered at once → disorder positions 0,1,...,63
+    for (uint32_t i = 0; i < 64; i++)
+        q.enqueue(dummy, 4, i);
+
+    double p90 = q.disorder_p90();
+    return !std::isnan(p90) && p90 >= 0.0;
+}
+
+// After sustained in-order traffic (well past bootstrap) target_depth must
+// converge to 0, confirming the depth can decrease.
+static bool test_jitter_depth_recovers()
+{
+    constexpr uint32_t N = 200;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t delivered = 0;
+
+    UsrQueue<true> q;
+    q.start(
+        [&](const uint8_t *, size_t) {
+            std::lock_guard<std::mutex> lk(mtx);
+            ++delivered;
+            cv.notify_one();
+        },
+        nullptr);
+
+    // Phase 1: 100 pairwise-swapped frames to push disorder up.
+    constexpr uint32_t PHASE1 = 100;
+    for (uint32_t i = 0; i < PHASE1; i += 2)
+    {
+        q.enqueue(bufs[i + 1].data(), 4, i + 1);
+        q.enqueue(bufs[i].data(), 4, i);
+    }
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(2), [&] { return delivered >= PHASE1; });
+    }
+
+    // Phase 2: 100 strictly in-order frames to let EMA decay disorder back to 0.
+    for (uint32_t i = PHASE1; i < N; i++)
+        q.enqueue(bufs[i].data(), 4, i);
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(2), [&] { return delivered >= N; });
+    }
+    q.stop();
+
+    if (delivered < N)
+        return false;
+    // After 100 in-order frames (EMA window ≈ 100) depth must have come back down.
+    return q.target_depth() == 0;
+}
+
+static int run_jitter_unit_tests()
+{
+    struct Test
+    {
+        const char *name;
+        bool (*fn)();
+    };
+
+    const Test tests[] = {
+        {"in-order delivery preserves order   ", test_jitter_inorder},
+        {"reorder: all frames received        ", test_jitter_reorder_complete},
+        {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
+        {"disorder_p90() = NaN before samples ", test_jitter_p90_empty},
+        {"disorder_p90() valid after bootstrap", test_jitter_p90_valid},
+        {"target_depth recovers after reorder ", test_jitter_depth_recovers},
+    };
+
+    std::cout << "\nJitter buffer unit tests\n";
+    print_divider();
+
+    int failures = 0;
+    for (const auto &t : tests)
+    {
+        bool ok = t.fn();
+        std::cout << "  " << (ok ? "PASS" : "FAIL") << "  " << t.name << '\n';
+        if (!ok)
+            ++failures;
+    }
+
+    print_divider();
+    if (failures == 0)
+        std::cout << "  All unit tests passed.\n";
+    else
+        std::cout << "  " << failures << " unit test(s) FAILED.\n";
+    print_divider();
+    std::cout << '\n';
+
+    return failures == 0 ? 0 : 1;
+}
+
 static void run_test(const TestConfig &cfg)
 {
     auto &ioc = BG_SERVICE;
@@ -515,7 +756,9 @@ int main(int argc, char *argv[])
     std::cout << "  Rate     : " << std::fixed << std::setprecision(2) << cfg.target_rate_bps / 1e6 << " Mbps\n";
     std::cout << "  Loss     : " << cfg.loss_rate_min * 100.0 << "% – " << cfg.loss_rate_max * 100.0 << "%\n";
     std::cout << "  Duration : " << cfg.duration_sec << " s\n\n";
-
+    int unit_rc = run_jitter_unit_tests();
+    if (unit_rc != 0)
+        return unit_rc;
     try
     {
         run_test(cfg);
