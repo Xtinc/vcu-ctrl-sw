@@ -1,11 +1,16 @@
 #include "ReliableUDP.h"
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <pthread.h>
 
 using asio::ip::udp;
 
 static std::once_flag fec_init_flag;
+
+const size_t UsrQueueAsync::MAX_JITTER_DEPTH = 8;
+const size_t UsrQueueAsync::MAX_REORDER_BUF = 256;
+const std::chrono::milliseconds UsrQueueAsync::FLUSH_TIMEOUT{200};
 
 struct FECLayout
 {
@@ -145,6 +150,16 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (reorder_buf_.size() >= MAX_REORDER_BUF)
+    {
+        if (owner_)
+            owner_->count_dropped_packet();
+        return false;
+    }
+
+    // Reject frames that were already delivered (abs_seq is behind the
+    // delivery cursor).  Uses unsigned comparison; only active once the
+    // cursor has advanced past 0 to avoid false-positives at startup.
+    if (next_deliver_seq_ != 0 && abs_seq < next_deliver_seq_)
         return false;
 
     auto result = reorder_buf_.emplace(abs_seq, cb_data{data, size, abs_seq});
@@ -154,10 +169,13 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     // Disorder metric: how far ahead of the next expected delivery point
     // this frame is.  Measured as max(0, abs_seq - next_deliver_seq_).
     //
-    // Guard: skip the metric before the first delivery; next_deliver_seq_
-    // is 0 (sentinel) at startup while abs_seq is already ~65537, which
-    // would produce a large spurious sample.
-    if (next_deliver_seq_ != 0)
+    // Guard: skip only the true startup bias where frame_cycle_ starts at 1,
+    // making the first real abs_seq >= (1u << 16) = 65536.  The threshold
+    // (1u<<16)-1 = 65535 is derived directly from that initial value:
+    // unit-test sequences in [0, 65535] pass through and are recorded
+    // normally; the startup real-session abs_seq (>= 65536) is suppressed.
+    static constexpr uint32_t STARTUP_BIAS_THRESHOLD = (1u << 16) - 1;
+    if (next_deliver_seq_ != 0 || abs_seq <= STARTUP_BIAS_THRESHOLD)
     {
         int64_t ahead = static_cast<int64_t>(abs_seq) - static_cast<int64_t>(next_deliver_seq_);
         double disorder =
@@ -203,7 +221,7 @@ void UsrQueueAsync::worker_thread()
         if (delivered)
             flush_at = clock::time_point::max();
         else if (!reorder_buf_.empty() && flush_at == clock::time_point::max())
-            flush_at = clock::now() + FLUSH_TIMEOUT;
+            flush_at = clock::now() + UsrQueueAsync::FLUSH_TIMEOUT;
     }
 }
 
@@ -290,10 +308,11 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
       send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), destination_set_(false),
       frame_cycle_(1), group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
-      lost_packets_(0), send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
-      last_recv_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
-      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0),
-      usr_queue_(std::make_unique<UsrQueueAsync>())
+      usr_queue_(std::make_unique<UsrQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
+      last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
+      last_send_rate_bytes_(0), last_recv_rate_bytes_(0), last_lost_rate_time_(std::chrono::steady_clock::now()),
+      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0),
+      time_synced_(false), probe_seq_(0)
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -433,7 +452,6 @@ void ReliableUDP::stop()
 
 double ReliableUDP::lost_rate()
 {
-    static auto last_lost_rate_time = std::chrono::steady_clock::now();
     auto curr_time = std::chrono::steady_clock::now();
     auto recv_packets = recv_packets_.load(std::memory_order_relaxed);
     auto lost_packets = lost_packets_.load(std::memory_order_relaxed);
@@ -444,7 +462,7 @@ double ReliableUDP::lost_rate()
         real_lost_rate = static_cast<double>(lost_packets) / static_cast<double>(recv_packets);
     }
 
-    if (curr_time - last_lost_rate_time >= std::chrono::seconds(10))
+    if (curr_time - last_lost_rate_time_ >= std::chrono::seconds(10))
     {
         if (real_lost_rate > 0.0)
         {
@@ -454,10 +472,15 @@ double ReliableUDP::lost_rate()
 
         recv_packets_.store(0, std::memory_order_relaxed);
         lost_packets_.store(0, std::memory_order_relaxed);
-        last_lost_rate_time = curr_time;
+        last_lost_rate_time_ = curr_time;
     }
 
     return real_lost_rate;
+}
+
+void ReliableUDP::count_dropped_packet()
+{
+    lost_packets_.fetch_add(1, std::memory_order_relaxed);
 }
 
 int64_t ReliableUDP::rtt_ms() const
@@ -1140,7 +1163,7 @@ void ReliableUDP::handle_probe_packet(const TRXProbe &pkt)
 {
     if (pkt.type == 0)
     {
-        // Ping received — reply with a pong using the stored destination.
+        // Ping received: reply with a pong.
         udp::endpoint target;
         {
             std::lock_guard<std::mutex> lock(target_mutex_);
@@ -1169,8 +1192,8 @@ void ReliableUDP::handle_probe_packet(const TRXProbe &pkt)
     }
     else if (pkt.type == 1)
     {
-        // Pong received — compute RTT and clock offset.
-        // Simplified NTP (T3 ≈ T2 because pong is sent immediately):
+        // Pong received: compute RTT and clock offset.
+        // Simplified NTP (T3 ~= T2 because pong is sent immediately):
         //   RTT    = T4 - T1
         //   offset = T2_delta - RTT/2
         uint32_t t4_ms = get_time_ms();

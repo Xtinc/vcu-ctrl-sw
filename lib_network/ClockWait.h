@@ -18,8 +18,8 @@ template <size_t N> class Histogram
     // Collect this many raw samples before switching to EMA mode.
     static constexpr size_t BOOTSTRAP_MIN = (N < 32) ? 32 : N;
 
-    // EMA decay factor. Effective window 1/(1-DECAY) = 100 samples.
-    static constexpr double DECAY = 0.99;
+    // EMA decay factor. Effective window 1/(1-DECAY) ≈ 33 samples.
+    static constexpr double DECAY = 0.97;
 
   public:
     Histogram() : count(0), boot_n(0), observed_min(0.0), observed_max(0.0)

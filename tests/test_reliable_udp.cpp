@@ -46,15 +46,15 @@
 
 struct TestConfig
 {
-    size_t   min_payload_bytes = 64;
-    size_t   max_payload_bytes = 10000;
-    double   target_rate_bps   = 5e6;  ///< bits/s; 0 = unlimited
-    double   loss_rate_min     = 0.0;  ///< fraction [0,1]
-    double   loss_rate_max     = 0.05; ///< fraction [0,1]
-    uint32_t duration_sec      = 10;
-    uint16_t sender_port       = 15001;
-    uint16_t proxy_port        = 15010;
-    uint16_t receiver_port     = 15002;
+    size_t min_payload_bytes = 64;
+    size_t max_payload_bytes = 10000;
+    double target_rate_bps = 5e6; ///< bits/s; 0 = unlimited
+    double loss_rate_min = 0.0;   ///< fraction [0,1]
+    double loss_rate_max = 0.05;  ///< fraction [0,1]
+    uint32_t duration_sec = 10;
+    uint16_t sender_port = 15001;
+    uint16_t proxy_port = 15010;
+    uint16_t receiver_port = 15002;
 };
 
 // ─── Integrity-tagged message header ──────────────────────────────────────────
@@ -95,8 +95,8 @@ class LossyProxy
                double loss_rate_max)
         : socket_(ioc, asio::ip::udp::endpoint(asio::ip::udp::v4(), listen_port)),
           dst_(asio::ip::make_address("127.0.0.1"), dst_port), rng_(std::random_device{}()),
-          rate_dist_(loss_rate_min, loss_rate_max), drop_dist_(0.0, 1.0),
-          buf_(new uint8_t[MAX_TRX_UDP_SIZE]), dropped_(0), forwarded_(0)
+          rate_dist_(loss_rate_min, loss_rate_max), drop_dist_(0.0, 1.0), buf_(new uint8_t[MAX_TRX_UDP_SIZE]),
+          dropped_(0), forwarded_(0)
     {
         do_receive();
     }
@@ -108,7 +108,7 @@ class LossyProxy
         delete[] buf_;
     }
 
-    LossyProxy(const LossyProxy &)            = delete;
+    LossyProxy(const LossyProxy &) = delete;
     LossyProxy &operator=(const LossyProxy &) = delete;
 
     uint64_t dropped() const
@@ -123,61 +123,60 @@ class LossyProxy
   private:
     void do_receive()
     {
-        socket_.async_receive_from(
-            asio::buffer(buf_, MAX_TRX_UDP_SIZE), sender_ep_,
-            [this](const asio::error_code &ec, size_t n) {
-                if (ec == asio::error::operation_aborted)
-                {
-                    return;
-                }
-                if (!ec && n > 0)
-                {
-                    double loss_prob;
-                    double draw;
-                    {
-                        std::lock_guard<std::mutex> lk(rng_mtx_);
-                        loss_prob = rate_dist_(rng_);
-                        draw      = drop_dist_(rng_);
-                    }
+        socket_.async_receive_from(asio::buffer(buf_, MAX_TRX_UDP_SIZE), sender_ep_,
+                                   [this](const asio::error_code &ec, size_t n) {
+                                       if (ec == asio::error::operation_aborted)
+                                       {
+                                           return;
+                                       }
+                                       if (!ec && n > 0)
+                                       {
+                                           double loss_prob;
+                                           double draw;
+                                           {
+                                               std::lock_guard<std::mutex> lk(rng_mtx_);
+                                               loss_prob = rate_dist_(rng_);
+                                               draw = drop_dist_(rng_);
+                                           }
 
-                    if (draw < loss_prob)
-                    {
-                        dropped_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    else
-                    {
-                        forwarded_.fetch_add(1, std::memory_order_relaxed);
-                        asio::error_code send_ec;
-                        socket_.send_to(asio::buffer(buf_, n), dst_, 0, send_ec);
-                    }
-                }
-                do_receive();
-            });
+                                           if (draw < loss_prob)
+                                           {
+                                               dropped_.fetch_add(1, std::memory_order_relaxed);
+                                           }
+                                           else
+                                           {
+                                               forwarded_.fetch_add(1, std::memory_order_relaxed);
+                                               asio::error_code send_ec;
+                                               socket_.send_to(asio::buffer(buf_, n), dst_, 0, send_ec);
+                                           }
+                                       }
+                                       do_receive();
+                                   });
     }
 
-    asio::ip::udp::socket      socket_;
-    asio::ip::udp::endpoint    sender_ep_;
-    asio::ip::udp::endpoint    dst_;
-    std::mt19937               rng_;
-    std::mutex                 rng_mtx_;
+    asio::ip::udp::socket socket_;
+    asio::ip::udp::endpoint sender_ep_;
+    asio::ip::udp::endpoint dst_;
+    std::mt19937 rng_;
+    std::mutex rng_mtx_;
     std::uniform_real_distribution<double> rate_dist_;
     std::uniform_real_distribution<double> drop_dist_;
-    uint8_t                   *buf_;
-    std::atomic<uint64_t>      dropped_;
-    std::atomic<uint64_t>      forwarded_;
+    uint8_t *buf_;
+    std::atomic<uint64_t> dropped_;
+    std::atomic<uint64_t> forwarded_;
 };
 
 // ─── Receiver-side state ──────────────────────────────────────────────────────
 
 struct TestState
 {
-    std::mutex              recv_mtx;
+    std::mutex recv_mtx;
     std::condition_variable recv_cv;
-    uint64_t                send_count{0};     ///< written only by sender thread before wait
-    std::atomic<uint64_t>   recv_count{0};
-    std::atomic<uint64_t>   recv_errors{0};    ///< integrity failures
-    std::atomic<uint64_t>   recv_dup{0};       ///< duplicate sequence numbers
-    std::vector<bool>       seq_seen;          ///< indexed by seq; resized in run_test
+    uint64_t send_count{0}; ///< written only by sender thread before wait
+    std::atomic<uint64_t> recv_count{0};
+    std::atomic<uint64_t> recv_errors{0}; ///< integrity failures
+    std::atomic<uint64_t> recv_dup{0};    ///< duplicate sequence numbers
+    std::vector<bool> seq_seen;           ///< indexed by seq; resized in run_test
 
     void on_receive(const uint8_t *data, size_t size)
     {
@@ -190,7 +189,7 @@ struct TestState
         TestMsgHdr hdr{};
         std::memcpy(&hdr, data, TEST_HDR_SIZE);
         const uint8_t *payload = data + TEST_HDR_SIZE;
-        const size_t   plen    = size - TEST_HDR_SIZE;
+        const size_t plen = size - TEST_HDR_SIZE;
 
         // Length consistency
         if (plen != hdr.payload_len)
@@ -235,16 +234,14 @@ static void print_divider()
 static void print_results(const TestConfig &cfg, const TestState &state, uint64_t dropped, uint64_t forwarded,
                           double elapsed_sec)
 {
-    auto sent   = state.send_count;
-    auto recvd  = state.recv_count.load();
+    auto sent = state.send_count;
+    auto recvd = state.recv_count.load();
     auto errors = state.recv_errors.load();
-    auto dups   = state.recv_dup.load();
+    auto dups = state.recv_dup.load();
 
-    double msg_loss_pct =
-        sent > 0 ? 100.0 * (1.0 - static_cast<double>(recvd) / static_cast<double>(sent)) : 0.0;
-    uint64_t total_udp  = dropped + forwarded;
-    double   udp_loss_pct = total_udp > 0 ? 100.0 * static_cast<double>(dropped) / static_cast<double>(total_udp)
-                                           : 0.0;
+    double msg_loss_pct = sent > 0 ? 100.0 * (1.0 - static_cast<double>(recvd) / static_cast<double>(sent)) : 0.0;
+    uint64_t total_udp = dropped + forwarded;
+    double udp_loss_pct = total_udp > 0 ? 100.0 * static_cast<double>(dropped) / static_cast<double>(total_udp) : 0.0;
 
     std::cout << '\n';
     print_divider();
@@ -254,8 +251,7 @@ static void print_results(const TestConfig &cfg, const TestState &state, uint64_
     std::cout << "  Duration          : " << elapsed_sec << " s\n";
     std::cout << "  Payload range     : " << cfg.min_payload_bytes << " – " << cfg.max_payload_bytes << " bytes\n";
     std::cout << "  Target rate       : " << cfg.target_rate_bps / 1e6 << " Mbps\n";
-    std::cout << "  Loss range        : " << cfg.loss_rate_min * 100.0 << "% – " << cfg.loss_rate_max * 100.0
-              << "%\n";
+    std::cout << "  Loss range        : " << cfg.loss_rate_min * 100.0 << "% – " << cfg.loss_rate_max * 100.0 << "%\n";
     print_divider();
     std::cout << "  Messages sent     : " << sent << "\n";
     std::cout << "  Messages received : " << recvd << "  (loss: " << msg_loss_pct << "%)\n";
@@ -269,13 +265,13 @@ static void print_results(const TestConfig &cfg, const TestState &state, uint64_
     // FEC recovery rate = udp_loss - message_loss  (both in %)
     // i.e. what fraction of the originally-lost UDP traffic the codec rescued.
     double fec_recovered_pct = udp_loss_pct - msg_loss_pct;
-    if (fec_recovered_pct < 0.0) fec_recovered_pct = 0.0;
-    double fec_efficiency_pct =
-        udp_loss_pct > 0.0 ? 100.0 * fec_recovered_pct / udp_loss_pct : 100.0;
+    if (fec_recovered_pct < 0.0)
+        fec_recovered_pct = 0.0;
+    double fec_efficiency_pct = udp_loss_pct > 0.0 ? 100.0 * fec_recovered_pct / udp_loss_pct : 100.0;
     std::cout << "  UDP pkt loss      : " << udp_loss_pct << "%\n";
     std::cout << "  Message loss      : " << msg_loss_pct << "%\n";
-    std::cout << "  FEC recovered     : " << fec_recovered_pct
-              << "% of traffic  (efficiency: " << fec_efficiency_pct << "%)\n";
+    std::cout << "  FEC recovered     : " << fec_recovered_pct << "% of traffic  (efficiency: " << fec_efficiency_pct
+              << "%)\n";
     print_divider();
 
     const bool pass = (errors == 0 && dups == 0);
@@ -313,7 +309,7 @@ static bool test_jitter_inorder()
         std::memcpy(bufs[i].data(), &i, 4);
 
     std::vector<uint32_t> received;
-    std::mutex            mtx;
+    std::mutex mtx;
     std::condition_variable cv;
 
     UsrQueueAsync q;
@@ -354,7 +350,7 @@ static bool test_jitter_reorder_complete()
         std::memcpy(bufs[i].data(), &i, 4);
 
     std::vector<uint32_t> received;
-    std::mutex            mtx;
+    std::mutex mtx;
     std::condition_variable cv;
 
     UsrQueueAsync q;
@@ -398,7 +394,7 @@ static bool test_jitter_no_duplicates()
         std::memcpy(bufs[i].data(), &i, 4);
 
     std::vector<uint32_t> received;
-    std::mutex            mtx;
+    std::mutex mtx;
     std::condition_variable cv;
 
     UsrQueueAsync q;
@@ -501,6 +497,192 @@ static bool test_jitter_depth_recovers()
     return q.target_depth() == 0;
 }
 
+// ─── Realistic-scenario jitter tests ─────────────────────────────────────────
+
+// Simulate real network jitter via sliding-window shuffle (WINDOW = 6 frames).
+// Frames within each window arrive in a randomised order, as happens when a
+// router has per-packet variable queuing latency.
+//
+// Checks:
+//   1. All N frames are eventually delivered (depth_reached path rescues late arrivals).
+//   2. The delivered sequence is non-decreasing (buffer restores order).
+//   3. disorder_p90() is positive — confirms the histogram is tracking jitter.
+static bool test_jitter_window_shuffle()
+{
+    constexpr uint32_t N = 300;
+    constexpr uint32_t WINDOW = 6;
+
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<uint32_t> received;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    UsrQueueAsync q;
+    q.start(
+        [&](const uint8_t *data, size_t) {
+            uint32_t v;
+            std::memcpy(&v, data, 4);
+            std::lock_guard<std::mutex> lk(mtx);
+            received.push_back(v);
+            cv.notify_one();
+        },
+        nullptr);
+
+    std::mt19937 rng(0xCAFEBEEF);
+    for (uint32_t base = 0; base < N; base += WINDOW)
+    {
+        uint32_t end = std::min(base + WINDOW, N);
+        std::vector<uint32_t> win;
+        for (uint32_t j = base; j < end; j++)
+            win.push_back(j);
+        std::shuffle(win.begin(), win.end(), rng);
+        for (uint32_t seq : win)
+            q.enqueue(bufs[seq].data(), 4, seq);
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(3), [&] { return received.size() >= N; });
+    }
+    q.stop();
+
+    if (received.size() != N)
+        return false;
+    for (size_t i = 1; i < received.size(); i++)
+        if (received[i] < received[i - 1])
+            return false;
+
+    // Jitter-tracking sanity: after window-shuffle traffic the histogram must
+    // have observed non-zero disorder.
+    double p90 = q.disorder_p90();
+    return !std::isnan(p90) && p90 > 0.0;
+}
+
+// Adaptive depth must rise during bursty jitter and fall back to zero once
+// traffic returns to in-order.
+//
+// Phase 1 (200 frames, window-5 shuffle): jitter is injected continuously.
+//   → After all phase-1 frames are delivered, target_depth must be ≥ 1,
+//     confirming the histogram drove the depth upward.
+// Phase 2 (200 frames, strict order): disorder drops to zero.
+//   → After phase-2 drains, target_depth must be 0 (EMA has decayed).
+static bool test_jitter_adapt_up_down()
+{
+    constexpr uint32_t PHASE1 = 200;
+    constexpr uint32_t PHASE2 = 200;
+    constexpr uint32_t TOTAL = PHASE1 + PHASE2;
+    constexpr uint32_t WINDOW = 5;
+
+    std::vector<std::array<uint8_t, 4>> bufs(TOTAL);
+    for (uint32_t i = 0; i < TOTAL; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t delivered = 0;
+
+    UsrQueueAsync q;
+    q.start(
+        [&](const uint8_t *, size_t) {
+            std::lock_guard<std::mutex> lk(mtx);
+            ++delivered;
+            cv.notify_one();
+        },
+        nullptr);
+
+    // Phase 1: window-shuffle disorder.
+    std::mt19937 rng(0xDEADC0DE);
+    for (uint32_t base = 0; base < PHASE1; base += WINDOW)
+    {
+        uint32_t end = std::min(base + WINDOW, PHASE1);
+        std::vector<uint32_t> win;
+        for (uint32_t j = base; j < end; j++)
+            win.push_back(j);
+        std::shuffle(win.begin(), win.end(), rng);
+        for (uint32_t seq : win)
+            q.enqueue(bufs[seq].data(), 4, seq);
+    }
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(3), [&] { return delivered >= PHASE1; });
+    }
+    if (delivered < PHASE1)
+        return false;
+
+    // Sample depth while disorder is sustained.
+    size_t depth_after_phase1 = q.target_depth();
+
+    // Phase 2: strictly in-order frames — let EMA decay disorder to zero.
+    for (uint32_t i = PHASE1; i < TOTAL; i++)
+        q.enqueue(bufs[i].data(), 4, i);
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(3), [&] { return delivered >= TOTAL; });
+    }
+    q.stop();
+
+    if (delivered < TOTAL)
+        return false;
+
+    return depth_after_phase1 >= 1 && q.target_depth() == 0;
+}
+
+// A permanently missing frame (SKIP) must not stall delivery of all subsequent
+// frames.  The jitter buffer must skip the gap (via depth_reached or the
+// 200 ms flush timeout) and deliver every other frame exactly once.
+static bool test_jitter_permanent_gap()
+{
+    constexpr uint32_t N = 20;
+    constexpr uint32_t SKIP = 7; // this seq is never enqueued
+
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<uint32_t> received;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    UsrQueueAsync q;
+    q.start(
+        [&](const uint8_t *data, size_t) {
+            uint32_t v;
+            std::memcpy(&v, data, 4);
+            std::lock_guard<std::mutex> lk(mtx);
+            received.push_back(v);
+            cv.notify_one();
+        },
+        nullptr);
+
+    for (uint32_t i = 0; i < N; i++)
+        if (i != SKIP)
+            q.enqueue(bufs[i].data(), 4, i);
+
+    // Wait up to 2× FLUSH_TIMEOUT (400 ms) for the gap to be skipped.
+    const size_t expected = N - 1;
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::milliseconds(600), [&] { return received.size() >= expected; });
+    }
+    q.stop();
+
+    if (received.size() != expected)
+        return false;
+
+    std::set<uint32_t> recv_set(received.begin(), received.end());
+    if (recv_set.count(SKIP))
+        return false; // lost frame must not be fabricated
+
+    for (uint32_t i = 0; i < N; i++)
+        if (i != SKIP && !recv_set.count(i))
+            return false;
+
+    return true;
+}
+
 static int run_jitter_unit_tests()
 {
     struct Test
@@ -516,6 +698,9 @@ static int run_jitter_unit_tests()
         {"disorder_p90() = NaN before samples ", test_jitter_p90_empty},
         {"disorder_p90() valid after bootstrap", test_jitter_p90_valid},
         {"target_depth recovers after reorder ", test_jitter_depth_recovers},
+        {"window-shuffle: order+p90 tracking  ", test_jitter_window_shuffle},
+        {"adaptive depth rises then falls     ", test_jitter_adapt_up_down},
+        {"permanent gap skipped, rest deliver ", test_jitter_permanent_gap},
     };
 
     std::cout << "\nJitter buffer unit tests\n";
@@ -568,15 +753,15 @@ static void run_test(const TestConfig &cfg)
     }
 
     // ── Send loop ────────────────────────────────────────────────────────────
-    std::mt19937                              rng(0xDEADBEEFu);
-    std::uniform_int_distribution<size_t>     size_dist(cfg.min_payload_bytes, cfg.max_payload_bytes);
+    std::mt19937 rng(0xDEADBEEFu);
+    std::uniform_int_distribution<size_t> size_dist(cfg.min_payload_bytes, cfg.max_payload_bytes);
 
     const double bytes_per_sec = cfg.target_rate_bps > 0.0 ? cfg.target_rate_bps / 8.0 : 0.0;
-    const auto   test_start    = std::chrono::steady_clock::now();
-    const auto   deadline      = test_start + std::chrono::seconds(cfg.duration_sec);
+    const auto test_start = std::chrono::steady_clock::now();
+    const auto deadline = test_start + std::chrono::seconds(cfg.duration_sec);
 
-    double bytes_budget       = bytes_per_sec > 0.0 ? bytes_per_sec : 0.0; // one second of initial credit
-    auto   last_budget_update = test_start;
+    double bytes_budget = bytes_per_sec > 0.0 ? bytes_per_sec : 0.0; // one second of initial credit
+    auto last_budget_update = test_start;
 
     std::vector<uint8_t> msg_buf;
     msg_buf.reserve(cfg.max_payload_bytes + TEST_HDR_SIZE);
@@ -586,13 +771,13 @@ static void run_test(const TestConfig &cfg)
     while (std::chrono::steady_clock::now() < deadline)
     {
         const size_t payload_size = size_dist(rng);
-        const size_t total_size   = payload_size + TEST_HDR_SIZE;
+        const size_t total_size = payload_size + TEST_HDR_SIZE;
 
         // ── Rate limiting ─────────────────────────────────────────────────
         if (bytes_per_sec > 0.0)
         {
-            const auto   now = std::chrono::steady_clock::now();
-            const double dt  = std::chrono::duration<double>(now - last_budget_update).count();
+            const auto now = std::chrono::steady_clock::now();
+            const double dt = std::chrono::duration<double>(now - last_budget_update).count();
             bytes_budget += dt * bytes_per_sec;
             last_budget_update = now;
 
@@ -616,7 +801,7 @@ static void run_test(const TestConfig &cfg)
         }
 
         TestMsgHdr hdr{};
-        hdr.seq         = seq;
+        hdr.seq = seq;
         hdr.payload_len = static_cast<uint32_t>(payload_size);
         hdr.payload_crc = adler32_compute(payload_ptr, payload_size);
         std::memcpy(msg_buf.data(), &hdr, TEST_HDR_SIZE);
@@ -632,12 +817,10 @@ static void run_test(const TestConfig &cfg)
     {
         const auto flush_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         std::unique_lock<std::mutex> lk(state.recv_mtx);
-        state.recv_cv.wait_until(lk, flush_deadline,
-                                 [&state] { return state.recv_count.load() >= state.send_count; });
+        state.recv_cv.wait_until(lk, flush_deadline, [&state] { return state.recv_count.load() >= state.send_count; });
     }
 
-    const double elapsed =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - test_start).count();
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - test_start).count();
 
     sender->stop();
     receiver->stop();

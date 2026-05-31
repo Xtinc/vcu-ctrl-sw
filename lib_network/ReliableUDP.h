@@ -1,6 +1,7 @@
 #ifndef RELIABLE_UDP_H
 #define RELIABLE_UDP_H
 
+#include "ClockWait.h"
 #include "MemPoolUDP.h"
 #include "ReedSoloman.h"
 #include "asio.hpp"
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -234,9 +236,9 @@ class UsrQueueAsync : public UsrQueue
         uint32_t seq;
     };
 
-    static constexpr size_t MAX_JITTER_DEPTH = 8;
-    static constexpr size_t MAX_REORDER_BUF = MAX_JITTER_DEPTH * 4;
-    static constexpr std::chrono::milliseconds FLUSH_TIMEOUT{200};
+    static const size_t MAX_JITTER_DEPTH;
+    static const size_t MAX_REORDER_BUF;
+    static const std::chrono::milliseconds FLUSH_TIMEOUT;
 
   public:
     UsrQueueAsync();
@@ -294,14 +296,15 @@ class UsrQueueSync : public UsrQueue
  *        and NTP-style clock synchronisation.
  *
  * ### Framing and FEC rules
- * Each send() call corresponds to one frame.  The frame is split into one or more
- * **groups** of at most `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes;
- * each group independently selects its error-correction mode based on its size:
+ * Each send() call corresponds to one frame. If the payload fits in one TRX data
+ * packet (`MAX_TRX_DATA_SIZE` bytes), the frame uses XOR redundancy; otherwise it
+ * uses Reed-Solomon for every group in the frame. Large payloads are split into one
+ * or more groups of at most `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes.
  *
- * | Group size                    | Mode | Data pkts | Redundancy pkts | Recoverable losses |
+ * | Frame payload size            | Mode | Data pkts | Redundancy pkts | Recoverable losses |
  * |-------------------------------|------|-----------|-----------------|--------------------|
- * | <= MAX_TRX_UNIT_SIZE (1200 B) | XOR  | 1         | 1 (full copy)   | 1                  |
- * | >  MAX_TRX_UNIT_SIZE          | RS   | 12        | 3               | up to 3            |
+ * | <= MAX_TRX_DATA_SIZE          | XOR  | 1         | 1 (full copy)   | 1                  |
+ * | >  MAX_TRX_DATA_SIZE          | RS   | 12        | 3               | up to 3            |
  *
  * RS mode uses Reed-Solomon(12, 3): any 12 received packets (data or parity)
  * are sufficient to reconstruct the full group.
@@ -337,6 +340,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     double send_rate();
     double recv_rate();
     double lost_rate();
+    void count_dropped_packet();
 
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
@@ -402,6 +406,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::mutex rate_mutex_;
     std::chrono::steady_clock::time_point last_send_rate_time_;
     std::chrono::steady_clock::time_point last_recv_rate_time_;
+    std::chrono::steady_clock::time_point last_lost_rate_time_;
     uint64_t last_send_rate_bytes_;
     uint64_t last_recv_rate_bytes_;
 
