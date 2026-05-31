@@ -310,9 +310,8 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
       frame_cycle_(1), group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
       usr_queue_(std::make_unique<UsrQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
       last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
-      last_send_rate_bytes_(0), last_recv_rate_bytes_(0), last_lost_rate_time_(std::chrono::steady_clock::now()),
-      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0),
-      time_synced_(false), probe_seq_(0)
+      last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
+      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0)
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
