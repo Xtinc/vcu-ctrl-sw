@@ -1,7 +1,6 @@
 #ifndef RELIABLE_UDP_H
 #define RELIABLE_UDP_H
 
-#include "ClockWait.h"
 #include "MemPoolUDP.h"
 #include "ReedSoloman.h"
 #include "asio.hpp"
@@ -13,7 +12,6 @@
 #include <cstring>
 #include <functional>
 #include <list>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -190,9 +188,44 @@ constexpr size_t TRX_HEADER_SIZE = sizeof(TRXUnit::Header);
 constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
 
 class ReliableUDP;
-template <bool ASYNC> class UsrQueue;
 
-template <> class UsrQueue<true>
+/// @brief Abstract base for user delivery queues.
+///
+/// Concrete implementations differ in how they dispatch received frames to the
+/// application callback:
+/// - UsrQueueAsync  — background thread with adaptive jitter/reorder buffer
+/// - UsrQueueSync   — direct call inside the receive path (no buffering)
+class UsrQueue
+{
+  public:
+    virtual ~UsrQueue() = default;
+
+    virtual void set_owner(ReliableUDP *owner) = 0;
+    virtual void start(RecvCallBack callback, void *user_data) = 0;
+    virtual void stop() = 0;
+    virtual bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) = 0;
+
+    /// Returns the current adaptive jitter buffer depth (frames).
+    /// Default implementation for queues without buffering returns 0.
+    virtual size_t target_depth() const
+    {
+        return 0;
+    }
+
+    /// Returns the P90 disorder quantile (frames).
+    /// Default implementation returns NaN (no statistics available).
+    virtual double disorder_p90() const
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+};
+
+/// @brief Asynchronous delivery queue with adaptive jitter/reorder buffer.
+///
+/// Frames are inserted into a sorted reorder buffer on the calling thread and
+/// drained by a dedicated background worker thread.  Target buffer depth is
+/// adapted continuously from a P90 disorder histogram.
+class UsrQueueAsync : public UsrQueue
 {
     struct cb_data
     {
@@ -206,177 +239,20 @@ template <> class UsrQueue<true>
     static constexpr std::chrono::milliseconds FLUSH_TIMEOUT{200};
 
   public:
-    UsrQueue() : owner_(nullptr), running_(false), next_deliver_seq_(0), target_depth_(0)
-    {
-    }
+    UsrQueueAsync();
+    ~UsrQueueAsync() override;
 
-    ~UsrQueue()
-    {
-        stop();
-    }
-
-    void set_owner(ReliableUDP *owner)
-    {
-        owner_ = owner;
-    }
-
-    void start(RecvCallBack callback, void *user_data)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (running_)
-            return;
-
-        receive_callback_ = callback;
-        user_data_ = user_data;
-        running_ = true;
-        thread_ = std::thread(&UsrQueue::worker_thread, this);
-    }
-
-    void stop()
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            running_ = false;
-        }
-        cond_.notify_all();
-        if (thread_.joinable())
-            thread_.join();
-    }
-
-    bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
-    {
-        if (size > MAX_TRX_UDP_SIZE || data == nullptr)
-            return false;
-
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        if (reorder_buf_.size() >= MAX_REORDER_BUF)
-            return false;
-
-        auto result = reorder_buf_.emplace(abs_seq, cb_data{data, size, abs_seq});
-        if (!result.second)
-            return false; // duplicate seq
-
-        // Disorder metric: how far ahead of the next expected delivery point
-        // this frame is.  Measured as max(0, abs_seq - next_deliver_seq_).
-        //
-        // This is the only metric that can break the bootstrapping deadlock:
-        // the old "insertion position in the sorted buffer" metric was always 0
-        // when target_depth_==0 (the initial value), because every frame was
-        // delivered immediately, keeping the buffer empty.  Consequently
-        // target_depth_ could never increase from zero.
-        //
-        // The new metric is non-zero whenever a frame arrives ahead of the
-        // expected sequence, regardless of how many frames are buffered, so
-        // the histogram accumulates real disorder observations even before
-        // target_depth_ has grown.
-        //
-        // Guard: skip the metric before the first delivery; next_deliver_seq_
-        // is 0 (sentinel) at startup while abs_seq is already ~65537, which
-        // would produce a large spurious sample.
-        if (next_deliver_seq_ != 0)
-        {
-            int64_t ahead = static_cast<int64_t>(abs_seq) - static_cast<int64_t>(next_deliver_seq_);
-            double disorder = (ahead > 0) ? std::min(static_cast<double>(ahead),
-                                                     static_cast<double>(MAX_JITTER_DEPTH))
-                                          : 0.0;
-            disorder_hist_.add(disorder);
-        }
-
-        cond_.notify_one();
-        return true;
-    }
-
-    /// Returns the current adaptive jitter buffer depth (in frames).
-    size_t target_depth() const
-    {
-        return target_depth_.load(std::memory_order_relaxed);
-    }
-
-    /// Returns the raw P90 disorder quantile (in frames).
-    /// Returns NaN when no samples have been collected yet (boot_n == 0).
-    double disorder_p90() const
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
-        return disorder_hist_.quantile(0.90);
-    }
+    void set_owner(ReliableUDP *owner) override;
+    void start(RecvCallBack callback, void *user_data) override;
+    void stop() override;
+    bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
+    size_t target_depth() const override;
+    double disorder_p90() const override;
 
   private:
-    void worker_thread()
-    {
-        using clock = std::chrono::steady_clock;
-        auto flush_at = clock::time_point::max();
+    void worker_thread();
+    bool try_deliver_locked(std::unique_lock<std::mutex> &lock, bool force);
 
-        while (true)
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-
-            if (flush_at == clock::time_point::max())
-                cond_.wait(lock, [this] { return !running_ || !reorder_buf_.empty(); });
-            else
-                cond_.wait_until(lock, flush_at, [this] { return !running_ || !reorder_buf_.empty(); });
-
-            if (!running_ && reorder_buf_.empty())
-                break;
-
-            bool force = (!reorder_buf_.empty() && clock::now() >= flush_at);
-            bool delivered = try_deliver_locked(lock, force);
-
-            if (delivered)
-                flush_at = clock::time_point::max();
-            else if (!reorder_buf_.empty() && flush_at == clock::time_point::max())
-                flush_at = clock::now() + FLUSH_TIMEOUT;
-        }
-    }
-
-    bool try_deliver_locked(std::unique_lock<std::mutex> &lock, bool force)
-    {
-        bool any = false;
-        while (!reorder_buf_.empty())
-        {
-            auto front_it = reorder_buf_.begin();
-            bool in_order = (front_it->first == next_deliver_seq_);
-            bool depth_reached = (reorder_buf_.size() > target_depth_.load(std::memory_order_relaxed));
-
-            if (!in_order && !depth_reached && !force)
-                break;
-
-            force = false; // only one forced delivery per stall event
-
-            cb_data item = front_it->second;
-
-            // Align next expected seq, skipping any unrecoverable gap
-            if (front_it->first != next_deliver_seq_)
-                next_deliver_seq_ = front_it->first;
-            next_deliver_seq_++;
-            reorder_buf_.erase(front_it);
-
-            // Update target_depth from the P90 of the disorder histogram.
-            // quantile() returns NaN during bootstrap (boot_n == 0); the
-            // >= 0.0 guard safely keeps target_depth_ == 0 in that case.
-            //
-            // Use lround (nearest integer) rather than ceil so the depth can
-            // decrease: P90 < 0.5 maps to 0, 0.5–1.5 maps to 1, etc.
-            // ceil would keep depth at 1 even when p90 ≈ 0.001 (mostly
-            // in-order traffic), preventing the buffer from recovering.
-            double p90 = disorder_hist_.quantile(0.90);
-            if (p90 >= 0.0)
-            {
-                size_t d = static_cast<size_t>(std::lround(p90));
-                target_depth_.store(d > MAX_JITTER_DEPTH ? MAX_JITTER_DEPTH : d, std::memory_order_relaxed);
-            }
-
-            any = true;
-            lock.unlock();
-            receive_callback_(item.data, item.size);
-            if (owner_)
-                owner_->release_recv_buf(item.data);
-            lock.lock();
-        }
-        return any;
-    }
-
-  private:
     ReliableUDP *owner_;
     RecvCallBack receive_callback_;
     void *user_data_;
@@ -392,40 +268,20 @@ template <> class UsrQueue<true>
     Histogram<32> disorder_hist_;
 };
 
-template <> class UsrQueue<false>
+/// @brief Synchronous delivery queue — no buffering, no background thread.
+///
+/// enqueue() calls the application callback directly on the caller's thread
+/// and releases the buffer immediately after the callback returns.
+class UsrQueueSync : public UsrQueue
 {
   public:
-    UsrQueue() : owner_(nullptr)
-    {
-    }
+    UsrQueueSync();
+    ~UsrQueueSync() override = default;
 
-    void set_owner(ReliableUDP *owner)
-    {
-        owner_ = owner;
-    }
-
-    void start(RecvCallBack callback, void *user_data)
-    {
-        receive_callback_ = callback;
-        user_data_ = user_data;
-    }
-
-    void stop()
-    {
-        receive_callback_ = nullptr;
-        user_data_ = nullptr;
-    }
-
-    bool enqueue(uint8_t *data, size_t size, uint32_t /*abs_seq*/)
-    {
-        if (size > MAX_TRX_UDP_SIZE || data == nullptr)
-            return false;
-
-        receive_callback_(data, size);
-        if (owner_)
-            owner_->release_recv_buf(data);
-        return true;
-    }
+    void set_owner(ReliableUDP *owner) override;
+    void start(RecvCallBack callback, void *user_data) override;
+    void stop() override;
+    bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
 
   private:
     ReliableUDP *owner_;
@@ -475,7 +331,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     bool send(const uint8_t *data, size_t size);
     void set_receive_callback(RecvCallBack callback, void *user_data = nullptr)
     {
-        usr_queue_.start(callback, user_data);
+        usr_queue_->start(callback, user_data);
     }
     void release_recv_buf(uint8_t *p);
     double send_rate();
@@ -539,7 +395,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 
-    UsrQueue<true> usr_queue_;
+    std::unique_ptr<UsrQueue> usr_queue_;
     std::atomic<uint64_t> lost_packets_;
     std::atomic<uint64_t> send_bytes_;
     std::atomic<uint64_t> recv_bytes_;

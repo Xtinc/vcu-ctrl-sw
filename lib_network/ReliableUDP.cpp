@@ -98,6 +98,193 @@ asio::io_context &BackgroundService::context()
     return io_context;
 }
 
+// UsrQueueAsync implementation
+UsrQueueAsync::UsrQueueAsync()
+    : owner_(nullptr), user_data_(nullptr), running_(false), next_deliver_seq_(0), target_depth_(0)
+{
+}
+
+UsrQueueAsync::~UsrQueueAsync()
+{
+    stop();
+}
+
+void UsrQueueAsync::set_owner(ReliableUDP *owner)
+{
+    owner_ = owner;
+}
+
+void UsrQueueAsync::start(RecvCallBack callback, void *user_data)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (running_)
+        return;
+
+    receive_callback_ = callback;
+    user_data_ = user_data;
+    running_ = true;
+    thread_ = std::thread(&UsrQueueAsync::worker_thread, this);
+}
+
+void UsrQueueAsync::stop()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        running_ = false;
+    }
+    cond_.notify_all();
+    if (thread_.joinable())
+        thread_.join();
+}
+
+bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
+{
+    if (size > MAX_TRX_UDP_SIZE || data == nullptr)
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (reorder_buf_.size() >= MAX_REORDER_BUF)
+        return false;
+
+    auto result = reorder_buf_.emplace(abs_seq, cb_data{data, size, abs_seq});
+    if (!result.second)
+        return false; // duplicate seq
+
+    // Disorder metric: how far ahead of the next expected delivery point
+    // this frame is.  Measured as max(0, abs_seq - next_deliver_seq_).
+    //
+    // Guard: skip the metric before the first delivery; next_deliver_seq_
+    // is 0 (sentinel) at startup while abs_seq is already ~65537, which
+    // would produce a large spurious sample.
+    if (next_deliver_seq_ != 0)
+    {
+        int64_t ahead = static_cast<int64_t>(abs_seq) - static_cast<int64_t>(next_deliver_seq_);
+        double disorder =
+            (ahead > 0) ? std::min(static_cast<double>(ahead), static_cast<double>(MAX_JITTER_DEPTH)) : 0.0;
+        disorder_hist_.add(disorder);
+    }
+
+    cond_.notify_one();
+    return true;
+}
+
+size_t UsrQueueAsync::target_depth() const
+{
+    return target_depth_.load(std::memory_order_relaxed);
+}
+
+double UsrQueueAsync::disorder_p90() const
+{
+    std::lock_guard<std::mutex> lk(mutex_);
+    return disorder_hist_.quantile(0.90);
+}
+
+void UsrQueueAsync::worker_thread()
+{
+    using clock = std::chrono::steady_clock;
+    auto flush_at = clock::time_point::max();
+
+    while (true)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (flush_at == clock::time_point::max())
+            cond_.wait(lock, [this] { return !running_ || !reorder_buf_.empty(); });
+        else
+            cond_.wait_until(lock, flush_at, [this] { return !running_ || !reorder_buf_.empty(); });
+
+        if (!running_ && reorder_buf_.empty())
+            break;
+
+        bool force = (!reorder_buf_.empty() && clock::now() >= flush_at);
+        bool delivered = try_deliver_locked(lock, force);
+
+        if (delivered)
+            flush_at = clock::time_point::max();
+        else if (!reorder_buf_.empty() && flush_at == clock::time_point::max())
+            flush_at = clock::now() + FLUSH_TIMEOUT;
+    }
+}
+
+bool UsrQueueAsync::try_deliver_locked(std::unique_lock<std::mutex> &lock, bool force)
+{
+    bool any = false;
+    while (!reorder_buf_.empty())
+    {
+        auto front_it = reorder_buf_.begin();
+        bool in_order = (front_it->first == next_deliver_seq_);
+        bool depth_reached = (reorder_buf_.size() > target_depth_.load(std::memory_order_relaxed));
+
+        if (!in_order && !depth_reached && !force)
+            break;
+
+        force = false; // only one forced delivery per stall event
+
+        cb_data item = front_it->second;
+
+        // Align next expected seq, skipping any unrecoverable gap
+        if (front_it->first != next_deliver_seq_)
+            next_deliver_seq_ = front_it->first;
+        next_deliver_seq_++;
+        reorder_buf_.erase(front_it);
+
+        // Update target_depth from the P90 of the disorder histogram.
+        // quantile() returns NaN during bootstrap (boot_n == 0); the
+        // >= 0.0 guard safely keeps target_depth_ == 0 in that case.
+        //
+        // Use lround (nearest integer) rather than ceil so the depth can
+        // decrease: P90 < 0.5 maps to 0, 0.5-1.5 maps to 1, etc.
+        double p90 = disorder_hist_.quantile(0.90);
+        if (p90 >= 0.0)
+        {
+            size_t d = static_cast<size_t>(std::lround(p90));
+            target_depth_.store(d > MAX_JITTER_DEPTH ? MAX_JITTER_DEPTH : d, std::memory_order_relaxed);
+        }
+
+        any = true;
+        lock.unlock();
+        receive_callback_(item.data, item.size);
+        if (owner_)
+            owner_->release_recv_buf(item.data);
+        lock.lock();
+    }
+    return any;
+}
+
+// UsrQueueSync implementation
+UsrQueueSync::UsrQueueSync() : owner_(nullptr), user_data_(nullptr)
+{
+}
+
+void UsrQueueSync::set_owner(ReliableUDP *owner)
+{
+    owner_ = owner;
+}
+
+void UsrQueueSync::start(RecvCallBack callback, void *user_data)
+{
+    receive_callback_ = callback;
+    user_data_ = user_data;
+}
+
+void UsrQueueSync::stop()
+{
+    receive_callback_ = nullptr;
+    user_data_ = nullptr;
+}
+
+bool UsrQueueSync::enqueue(uint8_t *data, size_t size, uint32_t /*abs_seq*/)
+{
+    if (size > MAX_TRX_UDP_SIZE || data == nullptr)
+        return false;
+
+    receive_callback_(data, size);
+    if (owner_)
+        owner_->release_recv_buf(data);
+    return true;
+}
+
 // ReliableUDP implementation
 ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port)
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
@@ -105,7 +292,8 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
       frame_cycle_(1), group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
       lost_packets_(0), send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
       last_recv_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
-      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0)
+      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0),
+      usr_queue_(std::make_unique<UsrQueueAsync>())
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -139,7 +327,7 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
     }
 
     generate_uuid();
-    usr_queue_.set_owner(this);
+    usr_queue_->set_owner(this);
 
     VIDEO_INFO_PRINT("ReliableUDP initialized - receive port: %d, uuid: %u", recv_socket_->local_endpoint().port(),
                      target_uid_);
@@ -240,7 +428,7 @@ void ReliableUDP::stop()
     }
 
     probe_timer_.cancel();
-    usr_queue_.stop();
+    usr_queue_->stop();
 }
 
 double ReliableUDP::lost_rate()
@@ -811,7 +999,7 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
         }
 
         uint32_t abs_seq = (static_cast<uint32_t>(frame_cycle_) << 16) | frame_seq;
-        if (!usr_queue_.enqueue(complete_message, total_length, abs_seq))
+        if (!usr_queue_->enqueue(complete_message, total_length, abs_seq))
         {
             VIDEO_ERROR_PRINT("Failed to enqueue received message");
             recv_pool_.deallocate(complete_message); // queue refused — release here

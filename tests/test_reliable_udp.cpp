@@ -316,7 +316,7 @@ static bool test_jitter_inorder()
     std::mutex            mtx;
     std::condition_variable cv;
 
-    UsrQueue<true> q;
+    UsrQueueAsync q;
     q.start(
         [&](const uint8_t *data, size_t) {
             uint32_t v;
@@ -357,7 +357,7 @@ static bool test_jitter_reorder_complete()
     std::mutex            mtx;
     std::condition_variable cv;
 
-    UsrQueue<true> q;
+    UsrQueueAsync q;
     q.start(
         [&](const uint8_t *data, size_t) {
             uint32_t v;
@@ -401,7 +401,7 @@ static bool test_jitter_no_duplicates()
     std::mutex            mtx;
     std::condition_variable cv;
 
-    UsrQueue<true> q;
+    UsrQueueAsync q;
     q.start(
         [&](const uint8_t *data, size_t) {
             uint32_t v;
@@ -433,7 +433,7 @@ static bool test_jitter_no_duplicates()
 // disorder_p90() returns NaN before any frame is enqueued.
 static bool test_jitter_p90_empty()
 {
-    UsrQueue<true> q;
+    UsrQueueAsync q;
     return std::isnan(q.disorder_p90());
 }
 
@@ -442,7 +442,7 @@ static bool test_jitter_p90_empty()
 // simultaneously, giving the histogram a non-trivial dataset.
 static bool test_jitter_p90_valid()
 {
-    UsrQueue<true> q;
+    UsrQueueAsync q;
     static uint8_t dummy[4] = {};
     // 64 in-order frames all buffered at once → disorder positions 0,1,...,63
     for (uint32_t i = 0; i < 64; i++)
@@ -465,7 +465,7 @@ static bool test_jitter_depth_recovers()
     std::condition_variable cv;
     size_t delivered = 0;
 
-    UsrQueue<true> q;
+    UsrQueueAsync q;
     q.start(
         [&](const uint8_t *, size_t) {
             std::lock_guard<std::mutex> lk(mtx);
