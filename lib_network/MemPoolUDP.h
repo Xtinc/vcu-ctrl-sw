@@ -66,7 +66,7 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
             }
 
             expand_memory((static_cast<size_t>(1) << ord) + sizeof(size_t), 25, chunk_idx);
-            VIDEO_DEBUG_PRINT("Expanded memory chunk %.2f MB", static_cast<double>(current_size) / (1024.0 * 1024.0));
+            VIDEO_INFO_PRINT("Expanded memory chunk %.2f MB", static_cast<double>(current_size) / (1024.0 * 1024.0));
         }
 
         uint8_t *block = chunks_[chunk_idx].front();
