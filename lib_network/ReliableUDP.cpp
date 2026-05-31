@@ -1044,7 +1044,7 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
 
 void ReliableUDP::release_recv_buf(uint8_t *p)
 {
-    recv_pool_.deallocate(p);
+    asio::post(strand_, [self = shared_from_this(), p]() { self->recv_pool_.deallocate(p); });
 }
 
 void ReliableUDP::generate_uuid()
