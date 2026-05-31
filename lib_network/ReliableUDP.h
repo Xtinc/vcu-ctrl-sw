@@ -257,11 +257,31 @@ template <> class UsrQueue<true>
         if (!result.second)
             return false; // duplicate seq
 
-        // Disorder metric: 0-based position of this frame in the sorted buffer
-        // at insertion time.  Position 0 = arrived in order; position k = k
-        // earlier frames are already buffered.
-        double pos = static_cast<double>(std::distance(reorder_buf_.begin(), result.first));
-        disorder_hist_.add(pos);
+        // Disorder metric: how far ahead of the next expected delivery point
+        // this frame is.  Measured as max(0, abs_seq - next_deliver_seq_).
+        //
+        // This is the only metric that can break the bootstrapping deadlock:
+        // the old "insertion position in the sorted buffer" metric was always 0
+        // when target_depth_==0 (the initial value), because every frame was
+        // delivered immediately, keeping the buffer empty.  Consequently
+        // target_depth_ could never increase from zero.
+        //
+        // The new metric is non-zero whenever a frame arrives ahead of the
+        // expected sequence, regardless of how many frames are buffered, so
+        // the histogram accumulates real disorder observations even before
+        // target_depth_ has grown.
+        //
+        // Guard: skip the metric before the first delivery; next_deliver_seq_
+        // is 0 (sentinel) at startup while abs_seq is already ~65537, which
+        // would produce a large spurious sample.
+        if (next_deliver_seq_ != 0)
+        {
+            int64_t ahead = static_cast<int64_t>(abs_seq) - static_cast<int64_t>(next_deliver_seq_);
+            double disorder = (ahead > 0) ? std::min(static_cast<double>(ahead),
+                                                     static_cast<double>(MAX_JITTER_DEPTH))
+                                          : 0.0;
+            disorder_hist_.add(disorder);
+        }
 
         cond_.notify_one();
         return true;
