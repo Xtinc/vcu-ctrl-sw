@@ -181,7 +181,7 @@ class DRMDisplayBase
     CrtcProps m_crtc_props{};
     ConnProps m_conn_props{};
 
-    Slot m_slots[2];
+    Slot m_slots[3];
     bool m_in_flight{false};
     std::mutex m_mutex;
     std::condition_variable m_cv;

@@ -825,18 +825,14 @@ void DRMDisplayBase::event_thread_fn()
 
 DRMDisplayBase::Slot *DRMDisplayBase::slot_by_state_locked(SlotState s)
 {
-    if (m_slots[0].state == s)
+    for (auto &slot : m_slots)
     {
-        return &m_slots[0];
+        if (slot.state == s)
+        {
+            return &slot;
+        }
     }
-    else if (m_slots[1].state == s)
-    {
-        return &m_slots[1];
-    }
-    else
-    {
-        return nullptr;
-    }
+    return nullptr;
 }
 
 // ── DRMDisplay (DMA-buf subclass) ─────────────────────────────────────────────
