@@ -194,6 +194,8 @@ class DecMgr
 
     double fps() const;
     double recv_rate() const;
+    double lost_rate() const;
+    size_t jitter_depth() const;
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
 

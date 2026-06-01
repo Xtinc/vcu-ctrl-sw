@@ -345,6 +345,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
     bool is_time_synced() const;
+    size_t jitter_depth() const;
 
   private:
     void start_receive();

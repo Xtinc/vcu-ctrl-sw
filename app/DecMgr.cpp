@@ -204,6 +204,30 @@ double DecMgr::recv_rate() const
     return receiver->recv_rate();
 }
 
+double DecMgr::lost_rate() const
+{
+    if (!m_running.load(std::memory_order_acquire))
+        return 0.0;
+
+    auto receiver = m_receiver;
+    if (!receiver)
+        return 0.0;
+
+    return receiver->lost_rate();
+}
+
+size_t DecMgr::jitter_depth() const
+{
+    if (!m_running.load(std::memory_order_acquire))
+        return 0;
+
+    auto receiver = m_receiver;
+    if (!receiver)
+        return 0;
+
+    return receiver->jitter_depth();
+}
+
 int64_t DecMgr::rtt_ms() const
 {
     if (!m_running.load(std::memory_order_acquire))

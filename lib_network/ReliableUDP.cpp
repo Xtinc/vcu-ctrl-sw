@@ -477,6 +477,11 @@ double ReliableUDP::lost_rate()
     return real_lost_rate;
 }
 
+size_t ReliableUDP::jitter_depth() const
+{
+    return usr_queue_ ? usr_queue_->target_depth() : 0;
+}
+
 void ReliableUDP::count_dropped_packet()
 {
     lost_packets_.fetch_add(1, std::memory_order_relaxed);
