@@ -23,6 +23,7 @@ struct DRMDisplayConfig
     int desired_width = 0;                     ///< Preferred display width in pixels  (0 = no preference).
     int desired_height = 0;                    ///< Preferred display height in pixels (0 = no preference).
     int desired_refresh = 0;                   ///< Preferred refresh rate in Hz       (0 = prefer PREFERRED flag / highest).
+    bool llp2_mode = false;                    ///< LLP2: skip vsync wait; commit after decoder has written >= half a frame.
     std::chrono::nanoseconds submit_lead_time{4'000'000LL};
 };
 
@@ -91,6 +92,7 @@ class DRMDisplayBase
         uint32_t w = 0;
         uint32_t h = 0;
         SlotState state = SlotState::FREE;
+        ClockEntry::ClockTP enqueue_tp{};
     };
 
   public:
@@ -154,8 +156,11 @@ class DRMDisplayBase
     bool do_modeset_locked(uint32_t fb_id, uint32_t w, uint32_t h);
     bool schedule_flip_locked();
     ClockEntry::ClockTP compute_submit_deadline();
+    ClockEntry::ClockTP compute_llp2_deadline_locked(const Slot &pending) const;
+    ClockEntry::ClockTP compute_llp1_deadline_locked() const;
     void drain_flip_event();
     void on_flip_done(unsigned tv_sec, unsigned tv_usec);
+    void update_phase_adjust(ClockEntry::ClockTP hw_tp);
     void event_thread_fn();
 
     Slot *slot_by_state_locked(SlotState s);
@@ -182,7 +187,7 @@ class DRMDisplayBase
     ConnProps m_conn_props{};
 
     Slot m_slots[3];
-    bool m_in_flight{false};
+    std::atomic<bool> m_in_flight{false};
     std::mutex m_mutex;
     std::condition_variable m_cv;
 
@@ -278,7 +283,9 @@ class DRMDisplayDumb : public DRMDisplayBase
     }
 
   private:
-    void release_frame(void * /*key*/) noexcept override {}
+    void release_frame(void * /*key*/) noexcept override
+    {
+    }
 
     struct DumbBuf
     {

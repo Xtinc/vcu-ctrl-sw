@@ -25,6 +25,7 @@ static DRMDisplayConfig to_drm_config(const DecMgrConfig &cfg)
     drm.connector_id = -1;
     drm.crtc_id = -1;
     drm.plane_id = -1;
+    drm.llp2_mode = cfg.low_delay_mode;
     return drm;
 }
 

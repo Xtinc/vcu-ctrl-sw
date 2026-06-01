@@ -33,6 +33,7 @@ extern "C"
 #endif
 
 static constexpr ClockEntry::Nanos kSubmitLeadMin{500'000LL};
+static constexpr ClockEntry::Nanos kLlp2SubmitLead{1'000'000LL};
 static constexpr ClockEntry::Nanos kPhaseTargetMarginMin{500'000LL};
 static constexpr ClockEntry::Nanos kPhaseTargetMarginMax{2'000'000LL};
 static constexpr ClockEntry::Nanos kPhaseDeadband{150'000LL};
@@ -336,6 +337,7 @@ void DRMDisplayBase::stop()
 
 void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
 {
+    bool replaced_pending = false;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
         auto *pending = slot_by_state_locked(SlotState::PENDING);
@@ -343,6 +345,7 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
         {
             release_frame(pending->buf);
             *pending = Slot{};
+            replaced_pending = true;
         }
 
         auto *target = slot_by_state_locked(SlotState::FREE);
@@ -358,8 +361,13 @@ void DRMDisplayBase::submit(void *key, uint32_t fb_id, uint32_t w, uint32_t h)
         target->w = w;
         target->h = h;
         target->state = SlotState::PENDING;
+        target->enqueue_tp = std::chrono::steady_clock::now();
     }
 
+    if (replaced_pending && m_cfg.llp2_mode)
+    {
+        m_submit_timer.cancel();
+    }
     m_cv.notify_all();
 }
 
@@ -645,20 +653,62 @@ bool DRMDisplayBase::schedule_flip_locked()
 ClockEntry::ClockTP DRMDisplayBase::compute_submit_deadline()
 {
     std::lock_guard<std::mutex> lk(m_mutex);
-    if (!slot_by_state_locked(SlotState::PENDING))
+    auto *pending = slot_by_state_locked(SlotState::PENDING);
+    if (!pending)
     {
         return {};
     }
 
+    if (m_cfg.llp2_mode && pending->enqueue_tp != ClockEntry::ClockTP{})
+    {
+        return compute_llp2_deadline_locked(*pending);
+    }
+
+    return compute_llp1_deadline_locked();
+}
+
+ClockEntry::ClockTP DRMDisplayBase::compute_llp2_deadline_locked(const Slot &pending) const
+{
+    const auto now = std::chrono::steady_clock::now();
+    const auto lead_time = kLlp2SubmitLead;
+    const auto min_vsync_tp = pending.enqueue_tp + m_frame_ns / 2;
+
+    ClockEntry::ClockTP target_vsync;
+    if (m_last_flip_tp == ClockEntry::ClockTP{})
+    {
+        target_vsync = min_vsync_tp;
+    }
+    else
+    {
+        // Advance along the predicted vsync grid to the first vsync >= min_vsync_tp.
+        // This ensures the commit arrives lead_time before a real vsync boundary
+        // so the kernel can process it in the current frame; otherwise it would be
+        // deferred to the next vsync, wasting one frame of latency.
+        const auto diff_ns = std::chrono::duration_cast<ClockEntry::Nanos>(min_vsync_tp - m_last_flip_tp);
+        const int64_t n =
+            (diff_ns.count() <= 0) ? 1LL : (diff_ns.count() + m_frame_ns.count() - 1) / m_frame_ns.count();
+        target_vsync = m_last_flip_tp + m_frame_ns * n;
+    }
+
+    auto deadline = target_vsync - lead_time;
+    if (deadline > now + m_frame_ns)
+    {
+        deadline = now;
+    }
+    return deadline;
+}
+
+ClockEntry::ClockTP DRMDisplayBase::compute_llp1_deadline_locked() const
+{
     const auto now = std::chrono::steady_clock::now();
     const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
+
     auto deadline =
         (m_last_flip_tp == ClockEntry::ClockTP{}) ? now : m_last_flip_tp + m_frame_ns - lead_time + m_wait_phase_adjust;
     if (deadline > now + m_frame_ns)
     {
         deadline = now;
     }
-
     return deadline;
 }
 
@@ -705,10 +755,8 @@ void DRMDisplayBase::drain_flip_event()
 void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
 {
     const auto hw_tp = ClockEntry::ClockTP{std::chrono::seconds(tv_sec) + std::chrono::microseconds(tv_usec)};
-
     const auto prev_flip_tp = m_last_flip_tp;
     m_last_flip_tp = hw_tp;
-
     if (prev_flip_tp != ClockEntry::ClockTP{})
     {
         const auto observed_frame = std::chrono::duration_cast<ClockEntry::Nanos>(hw_tp - prev_flip_tp);
@@ -718,44 +766,14 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
         }
     }
 
-    if (m_commit_tp != ClockEntry::ClockTP{})
+    // LLP1 only: update the phase-locked submit timing from the measured
+    // commit-to-vblank latency.  In LLP2 mode the commit time is bounded below
+    // by the DMA constraint, so phase feedback would fight against it.
+    if (!m_cfg.llp2_mode && m_commit_tp != ClockEntry::ClockTP{})
     {
-        const auto commit_to_flip = hw_tp - m_commit_tp;
-        const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
-        const auto target_margin = std::min(std::max(m_frame_ns / 16, kPhaseTargetMarginMin), kPhaseTargetMarginMax);
-        const auto phase_limit = m_frame_ns / kPhaseLimitDiv;
-
-        if (commit_to_flip > lead_time + m_frame_ns / 2)
-        {
-            VIDEO_ERROR_PRINT("DRMDisplay: vblank missed (commit -> flip %.1f ms, frame %.1f ms). "
-                              "advance phase_wait from %.1f ms.",
-                              commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6,
-                              m_wait_phase_adjust.count() * 1e-6);
-            m_wait_phase_adjust -= m_frame_ns / kPhaseStepDiv;
-            if (m_wait_phase_adjust < -phase_limit)
-            {
-                m_wait_phase_adjust = -phase_limit;
-            }
-        }
-        else
-        {
-            const auto error = commit_to_flip - target_margin;
-            if (error > kPhaseDeadband || error < -kPhaseDeadband)
-            {
-                m_wait_phase_adjust += error / kPhaseStepDiv;
-                if (m_wait_phase_adjust > phase_limit)
-                {
-                    m_wait_phase_adjust = phase_limit;
-                }
-                else if (m_wait_phase_adjust < -phase_limit)
-                {
-                    m_wait_phase_adjust = -phase_limit;
-                }
-            }
-        }
-
-        m_commit_tp = {};
+        update_phase_adjust(hw_tp);
     }
+    m_commit_tp = {};
 
     {
         std::lock_guard<std::mutex> lk(m_mutex);
@@ -769,6 +787,44 @@ void DRMDisplayBase::on_flip_done(unsigned tv_sec, unsigned tv_usec)
     }
 
     m_cv.notify_all();
+}
+
+void DRMDisplayBase::update_phase_adjust(ClockEntry::ClockTP hw_tp)
+{
+    const auto commit_to_flip = hw_tp - m_commit_tp;
+    const auto lead_time = compute_fixed_submit_lead(m_cfg, m_frame_ns);
+    const auto target_margin = std::min(std::max(m_frame_ns / 16, kPhaseTargetMarginMin), kPhaseTargetMarginMax);
+    const auto phase_limit = m_frame_ns / kPhaseLimitDiv;
+
+    if (commit_to_flip > lead_time + m_frame_ns / 2)
+    {
+        // Vblank was missed; advance the submit deadline to be earlier next time.
+        VIDEO_ERROR_PRINT("DRMDisplay: vblank missed (commit -> flip %.1f ms, frame %.1f ms). "
+                          "advance phase_wait from %.1f ms.",
+                          commit_to_flip.count() * 1e-6, m_frame_ns.count() * 1e-6, m_wait_phase_adjust.count() * 1e-6);
+        m_wait_phase_adjust -= m_frame_ns / kPhaseStepDiv;
+        if (m_wait_phase_adjust < -phase_limit)
+        {
+            m_wait_phase_adjust = -phase_limit;
+        }
+    }
+    else
+    {
+        // Fine-tune the phase so commit-to-vblank converges to target_margin.
+        const auto error = commit_to_flip - target_margin;
+        if (error > kPhaseDeadband || error < -kPhaseDeadband)
+        {
+            m_wait_phase_adjust += error / kPhaseStepDiv;
+            if (m_wait_phase_adjust > phase_limit)
+            {
+                m_wait_phase_adjust = phase_limit;
+            }
+            else if (m_wait_phase_adjust < -phase_limit)
+            {
+                m_wait_phase_adjust = -phase_limit;
+            }
+        }
+    }
 }
 
 void DRMDisplayBase::event_thread_fn()

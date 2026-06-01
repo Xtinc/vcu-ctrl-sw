@@ -29,7 +29,7 @@ struct DecoderConfig
     uint32_t input_buffer_size = 512 * 1024;           ///< Size in bytes of each input stream buffer.
     uint32_t input_buffer_num = 4;                     ///< Number of input stream buffers in the pool.
     std::string dec_dev_path = "/dev/allegroDecodeIP"; ///< Device file path of the VCU decode IP.
-    bool low_delay_mode = false;                       ///< Enable low-latency profile (split input + VCL unit decode).
+    bool low_delay_mode = false;                       ///< Upgrade to LLP2: adds bUseEarlyCallback on top of LLP1 (requires HW Sync IP + DRMDisplayConfig::llp2_mode).
     uint32_t flush_timeout_ms = 5000;                  ///< Timeout in milliseconds while waiting for decoder EOS.
 };
 

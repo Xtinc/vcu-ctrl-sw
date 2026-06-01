@@ -57,13 +57,19 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
 
         AL_DecSettings_SetDefaults(&m_dec_settings);
         m_dec_settings.eCodec = m_cfg.codec;
+
+        // LLP1 baseline: always enabled for RTDecoder (split-input slice-latency mode).
+        m_dec_settings.bLowLat = true;
+        m_dec_settings.eDecUnit = AL_VCL_NAL_UNIT;
+        m_dec_settings.eDpbMode = AL_DPB_NO_REORDERING;
+        m_dec_settings.eInputMode = AL_DEC_SPLIT_INPUT;
+        m_cfg.input_buffer_num = std::max(m_cfg.input_buffer_num, 8u);
+
+        // LLP2: additionally enable early callback (frame DMA in progress at displayCB time).
+        // Requires DRMDisplayConfig::llp2_mode=true on the display side.
         if (m_cfg.low_delay_mode)
         {
-            m_dec_settings.bLowLat = true;
-            m_dec_settings.eDecUnit = AL_VCL_NAL_UNIT;
-            m_dec_settings.eDpbMode = AL_DPB_NO_REORDERING;
-            m_dec_settings.eInputMode = AL_DEC_SPLIT_INPUT;
-            m_cfg.input_buffer_num = std::max(m_cfg.input_buffer_num, 8u);
+            m_dec_settings.bUseEarlyCallback = true;
         }
 
         auto result = AL_DecSettings_CheckValidity(&m_dec_settings, nullptr);
@@ -311,7 +317,6 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
 
     AL_Buffer_Ref(pFrame);
     AL_BufferGuard frame_guard(pFrame, &AL_Buffer_Unref);
-    AL_Buffer_InvalidateMemory(pFrame);
 
     auto fr_err = AL_Decoder_GetFrameError(m_hDec, pFrame);
     if (AL_IS_ERROR_CODE(fr_err))
@@ -331,6 +336,8 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         VIDEO_DEBUG_PRINT("RTDecoder: unexpected non-main output (eOutputID=%d), dropping frame", pInfo->eOutputID);
         return;
     }
+
+    AL_Buffer_InvalidateMemory(pFrame);
 
     // Give the callback an extra reference so it can hold the buffer beyond
     // this function's scope. The caller MUST call return_display_frame() when
