@@ -238,7 +238,6 @@ class UsrQueueAsync : public UsrQueue
 
     static const size_t MAX_JITTER_DEPTH;
     static const size_t MAX_REORDER_BUF;
-    static const std::chrono::milliseconds FLUSH_TIMEOUT;
 
   public:
     UsrQueueAsync();
@@ -253,7 +252,7 @@ class UsrQueueAsync : public UsrQueue
 
   private:
     void worker_thread();
-    bool try_deliver_locked(std::unique_lock<std::mutex> &lock, bool force);
+    void try_deliver_locked(std::unique_lock<std::mutex> &lock);
 
     ReliableUDP *owner_;
     RecvCallBack receive_callback_;

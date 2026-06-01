@@ -10,7 +10,6 @@ static std::once_flag fec_init_flag;
 
 const size_t UsrQueueAsync::MAX_JITTER_DEPTH = 8;
 const size_t UsrQueueAsync::MAX_REORDER_BUF = 256;
-const std::chrono::milliseconds UsrQueueAsync::FLUSH_TIMEOUT{200};
 
 struct FECLayout
 {
@@ -200,44 +199,29 @@ double UsrQueueAsync::disorder_p90() const
 
 void UsrQueueAsync::worker_thread()
 {
-    using clock = std::chrono::steady_clock;
-    auto flush_at = clock::time_point::max();
-
+    set_current_thread_scheduler_policy();
     while (true)
     {
         std::unique_lock<std::mutex> lock(mutex_);
-
-        if (flush_at == clock::time_point::max())
-            cond_.wait(lock, [this] { return !running_ || !reorder_buf_.empty(); });
-        else
-            cond_.wait_until(lock, flush_at, [this] { return !running_ || !reorder_buf_.empty(); });
+        cond_.wait(lock, [this] { return !running_ || !reorder_buf_.empty(); });
 
         if (!running_ && reorder_buf_.empty())
             break;
 
-        bool force = (!reorder_buf_.empty() && clock::now() >= flush_at);
-        bool delivered = try_deliver_locked(lock, force);
-
-        if (delivered)
-            flush_at = clock::time_point::max();
-        else if (!reorder_buf_.empty() && flush_at == clock::time_point::max())
-            flush_at = clock::now() + UsrQueueAsync::FLUSH_TIMEOUT;
+        try_deliver_locked(lock);
     }
 }
 
-bool UsrQueueAsync::try_deliver_locked(std::unique_lock<std::mutex> &lock, bool force)
+void UsrQueueAsync::try_deliver_locked(std::unique_lock<std::mutex> &lock)
 {
-    bool any = false;
     while (!reorder_buf_.empty())
     {
         auto front_it = reorder_buf_.begin();
         bool in_order = (front_it->first == next_deliver_seq_);
         bool depth_reached = (reorder_buf_.size() > target_depth_.load(std::memory_order_relaxed));
 
-        if (!in_order && !depth_reached && !force)
+        if (!in_order && !depth_reached)
             break;
-
-        force = false; // only one forced delivery per stall event
 
         cb_data item = front_it->second;
 
@@ -260,14 +244,12 @@ bool UsrQueueAsync::try_deliver_locked(std::unique_lock<std::mutex> &lock, bool 
             target_depth_.store(d > MAX_JITTER_DEPTH ? MAX_JITTER_DEPTH : d, std::memory_order_relaxed);
         }
 
-        any = true;
         lock.unlock();
         receive_callback_(item.data, item.size);
         if (owner_)
             owner_->release_recv_buf(item.data);
         lock.lock();
     }
-    return any;
 }
 
 // UsrQueueSync implementation
