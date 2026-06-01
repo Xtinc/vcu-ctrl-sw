@@ -260,6 +260,7 @@ int main(int argc, char *argv[])
 
     DRMDisplayConfig drm_cfg;
     drm_cfg.drm_device = options.drm_device;
+    drm_cfg.llp2_mode = (options.feed_mode == FeedMode::Slice);
 
     DRMDisplay display(drm_cfg, [&dec](AL_TBuffer *f) { dec->return_display_frame(f); });
 
