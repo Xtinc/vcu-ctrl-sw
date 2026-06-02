@@ -6,6 +6,13 @@
 
 using asio::ip::udp;
 
+// UsrQueueAsync static member definitions
+const size_t UsrQueueAsync::MAX_JITTER_DEPTH = 8;
+const size_t UsrQueueAsync::MAX_REORDER_BUF = 256;
+const int64_t UsrQueueAsync::MIN_PLAYOUT_MS = 10;
+const int64_t UsrQueueAsync::MAX_PLAYOUT_MS = 500;
+const double UsrQueueAsync::MIN_FRAME_INTERVAL_MS = 1.0;
+
 static std::once_flag fec_init_flag;
 
 struct FECLayout
@@ -175,7 +182,7 @@ void UsrQueueAsync::update_jitter_locked(uint32_t abs_seq, ClockTP arrival)
             jitter_ms_ += ALPHA * (diff_ms - jitter_ms_);
 
             // Playout latency = 4 × estimated jitter, clamped to [MIN, MAX].
-            // At 60fps jitter ≈ 16ms → 4× = 64ms; MIN_PLAYOUT_MS=50ms gives ~3 frames
+            // At 500fps jitter ≈ 2ms → 4× = 8ms; MIN_PLAYOUT_MS=10ms gives ~5 frames
             // of gap-tolerance before the timeout fires.
             const int64_t latency =
                 std::max(MIN_PLAYOUT_MS, std::min(MAX_PLAYOUT_MS, static_cast<int64_t>(4.0 * jitter_ms_)));

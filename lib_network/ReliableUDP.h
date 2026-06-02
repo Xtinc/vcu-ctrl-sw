@@ -247,16 +247,16 @@ class UsrQueueAsync : public UsrQueue
     struct cb_data
     {
         uint8_t *data;
-        size_t   size;
+        size_t size;
         uint32_t seq;
-        ClockTP  arrival_time;
+        ClockTP arrival_time;
     };
 
-    static constexpr size_t  MAX_JITTER_DEPTH      = 8;    ///< hard cap on target_depth_ (8 × 16.67ms = 133ms @ 60fps)
-    static constexpr size_t  MAX_REORDER_BUF       = 256;
-    static constexpr int64_t MIN_PLAYOUT_MS        = 50;   ///< minimum gap-flush timeout: ~3 frames @ 60fps
-    static constexpr int64_t MAX_PLAYOUT_MS        = 500;  ///< cap on adaptive playout delay (~30 frames @ 60fps)
-    static constexpr double  MIN_FRAME_INTERVAL_MS = 8.0;  ///< pacing floor (~120 fps max)
+    static const size_t MAX_JITTER_DEPTH; ///< hard cap on target_depth_ (8 × 16.67ms = 133ms @ 60fps)
+    static const size_t MAX_REORDER_BUF;
+    static const int64_t MIN_PLAYOUT_MS;       ///< minimum gap-flush timeout: ~5 frames @ 500fps (10ms)
+    static const int64_t MAX_PLAYOUT_MS;       ///< cap on adaptive playout delay
+    static const double MIN_FRAME_INTERVAL_MS; ///< pacing floor (~1000 fps max)
 
   public:
     UsrQueueAsync();
@@ -277,38 +277,38 @@ class UsrQueueAsync : public UsrQueue
     void try_deliver_locked(std::unique_lock<std::mutex> &lock);
     void update_jitter_locked(uint32_t abs_seq, ClockTP arrival);
 
-    ReliableUDP    *owner_;
-    RecvCallBack    receive_callback_;
-    void           *user_data_;
+    ReliableUDP *owner_;
+    RecvCallBack receive_callback_;
+    void *user_data_;
 
-    std::thread             thread_;
-    mutable std::mutex      mutex_;
+    std::thread thread_;
+    mutable std::mutex mutex_;
     std::condition_variable cond_;
-    bool                    running_;
+    bool running_;
 
     std::map<uint32_t, cb_data> reorder_buf_;
-    uint32_t            next_deliver_seq_;
+    uint32_t next_deliver_seq_;
 
     // RFC 3550 inter-arrival jitter estimator (protected by mutex_)
-    bool     has_timing_ref_;
+    bool has_timing_ref_;
     uint32_t last_timing_seq_;
-    ClockTP  last_arrival_time_;
-    double   jitter_ms_;
+    ClockTP last_arrival_time_;
+    double jitter_ms_;
 
     std::atomic<int64_t> playout_latency_ms_;
 
     // Disorder histogram: samples reorder distance (abs_seq - next_deliver_seq_)
     // for each arriving frame.  ceil(P90) drives target_depth_ so depth_reached
     // fires well before the playout timeout when the link has persistent reordering.
-    Histogram<32>       disorder_hist_;   // protected by mutex_
-    std::atomic<size_t> target_depth_;   // ceil(P90 disorder), load/store relaxed
+    Histogram<32> disorder_hist_;      // protected by mutex_
+    std::atomic<size_t> target_depth_; // ceil(P90 disorder), load/store relaxed
 
     // Delivery pacing: EWMA of inter-delivery interval, used to compute the
     // worker deadline when the front frame is already in-order (no gap waiting
     // needed) so buffered frames are played out at a smooth, steady rate.
-    ClockTP last_deliver_time_;   // protected by mutex_
-    bool    has_deliver_ref_;     // whether last_deliver_time_ is valid
-    double  frame_interval_ms_;  // EWMA inter-delivery interval, protected by mutex_
+    ClockTP last_deliver_time_; // protected by mutex_
+    bool has_deliver_ref_;      // whether last_deliver_time_ is valid
+    double frame_interval_ms_;  // EWMA inter-delivery interval, protected by mutex_
 };
 
 /// @brief Synchronous delivery queue — no buffering, no background thread.
