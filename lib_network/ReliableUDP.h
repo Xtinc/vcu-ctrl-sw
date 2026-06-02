@@ -267,7 +267,7 @@ class UsrQueueAsync : public UsrQueue
     void stop() override;
     bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
 
-    /// Returns the current adaptive reorder buffer target depth (= ceil P90 disorder distance).
+    /// Returns the current adaptive reorder buffer target depth (hysteresis-controlled).
     size_t target_depth() const override;
     /// Returns target_depth() as a double for monitoring interfaces.
     double disorder_p90() const override;
@@ -298,10 +298,10 @@ class UsrQueueAsync : public UsrQueue
     std::atomic<int64_t> playout_latency_ms_;
 
     // Disorder histogram: samples reorder distance (abs_seq - next_deliver_seq_)
-    // for each arriving frame.  ceil(P90) drives target_depth_ so depth_reached
-    // fires well before the playout timeout when the link has persistent reordering.
+    // for each arriving frame. A dual-quantile hysteresis controller drives
+    // target_depth_ (fast rise, slower decay) under persistent reordering.
     Histogram<32> disorder_hist_;      // protected by mutex_
-    std::atomic<size_t> target_depth_; // ceil(P90 disorder), load/store relaxed
+    std::atomic<size_t> target_depth_; // hysteresis-controlled depth, load/store relaxed
 
     // Delivery pacing: EWMA of inter-delivery interval, used to compute the
     // worker deadline when the front frame is already in-order (no gap waiting

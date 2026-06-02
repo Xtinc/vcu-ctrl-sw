@@ -177,7 +177,6 @@ void UsrQueueAsync::update_jitter_locked(uint32_t abs_seq, ClockTP arrival)
         // Plausible inter-arrival range: ignore stalls, clock jumps and noise.
         if (diff_ms > 0.0 && diff_ms < 500.0)
         {
-            // RFC 3550 §6.4.1 EWMA: J += (|D| - J) / 16
             constexpr double ALPHA = 0.125;
             jitter_ms_ += ALPHA * (diff_ms - jitter_ms_);
 
@@ -200,9 +199,7 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         return false;
 
     const ClockTP arrival = std::chrono::steady_clock::now();
-
     std::lock_guard<std::mutex> lock(mutex_);
-
     if (reorder_buf_.size() >= MAX_REORDER_BUF)
     {
         if (owner_)
@@ -224,23 +221,38 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     update_jitter_locked(abs_seq, arrival);
 
     // Measure reorder distance: how far ahead of the delivery cursor is this frame.
-    // Feed the distance into the disorder histogram so target_depth_ (= ceil P90)
-    // adapts to the actual reorder span seen on the link.
+    // Feed the distance into the disorder histogram and apply a hysteresis rule:
+    // - rise path  : ceil(Qhigh) (react fast to perturbations)
+    // - decay path : ceil(Qlow)  (release depth more conservatively)
     // Note: late frames (abs_seq < next_deliver_seq_) were already rejected above,
     // so abs_seq >= next_deliver_seq_ is guaranteed here.
     if (next_deliver_seq_ != 0)
     {
         const double disorder = static_cast<double>(abs_seq - next_deliver_seq_);
         disorder_hist_.add(disorder);
-        const double p90 = disorder_hist_.quantile(0.90);
-        if (!std::isnan(p90))
+        const double q_high = disorder_hist_.quantile(0.98);
+        const double q_low = disorder_hist_.quantile(0.75);
+        if (!std::isnan(q_high) && !std::isnan(q_low))
         {
-            const size_t depth = static_cast<size_t>(std::ceil(p90));
-            target_depth_.store(std::max<size_t>(1, std::min<size_t>(MAX_JITTER_DEPTH, depth)),
-                                std::memory_order_relaxed);
+            const size_t curr_depth = target_depth_.load(std::memory_order_relaxed);
+            const size_t rise_depth =
+                std::max<size_t>(1, std::min<size_t>(MAX_JITTER_DEPTH, static_cast<size_t>(std::ceil(q_high))));
+            const size_t decay_depth =
+                std::max<size_t>(1, std::min<size_t>(MAX_JITTER_DEPTH, static_cast<size_t>(std::ceil(q_low))));
+
+            size_t next_depth = curr_depth;
+            if (rise_depth > curr_depth)
+                next_depth = rise_depth;
+            else if (decay_depth < curr_depth)
+                next_depth = decay_depth;
+
+            target_depth_.store(next_depth, std::memory_order_relaxed);
             if (disorder >= 1.0)
-                VIDEO_DEBUG_PRINT("[JitterBuf] reorder seq=%u dist=%.0f p90=%.1f depth=%zu buf=%zu", abs_seq, disorder,
-                                  p90, target_depth_.load(std::memory_order_relaxed), reorder_buf_.size());
+            {
+                VIDEO_DEBUG_PRINT("[JitterBuf] reorder seq=%u dist=%.0f q98=%.1f q75=%.1f depth=%zu buf=%zu", abs_seq,
+                                  disorder, q_high, q_low, target_depth_.load(std::memory_order_relaxed),
+                                  reorder_buf_.size());
+            }
         }
     }
 
