@@ -224,20 +224,39 @@ class UsrQueue
 
 /// @brief Asynchronous delivery queue with adaptive jitter/reorder buffer.
 ///
-/// Frames are inserted into a sorted reorder buffer on the calling thread and
-/// drained by a dedicated background worker thread.  Target buffer depth is
-/// adapted continuously from a P90 disorder histogram.
+/// Design (GStreamer rtpjitterbuffer inspired), tuned for 60 fps video:
+///   - Every enqueued frame records its steady-clock arrival time.
+///   - The worker sleeps via cond_.wait_until(deadline) — no busy-wait.
+///     Deadline is computed per-iteration:
+///       in-order front  → last_deliver_time + frame_interval_ms  (pacing)
+///       gap front       → arrival_time + playout_latency_ms      (gap wait)
+///   - A frame is delivered when any of the following is true:
+///       in_order     : it carries the next expected sequence number
+///       depth_reached: buffer size > target_depth_ (adaptive P90 of reorder
+///                      distances); signals the missing predecessor is lost
+///       timed_out    : arrival_time + playout_latency_ms elapsed (last resort)
+///   - Playout latency is adapted via RFC 3550 §6.4.1 EWMA on inter-arrival
+///     timing, clamped to [MIN_PLAYOUT_MS, MAX_PLAYOUT_MS].
+///   - Delivery is paced at the EWMA inter-frame interval so buffered frames
+///     are handed to the decoder at a smooth, steady rate.
+///   - On shutdown, all remaining buffered frames are drained synchronously.
 class UsrQueueAsync : public UsrQueue
 {
+    using ClockTP = std::chrono::steady_clock::time_point;
+
     struct cb_data
     {
         uint8_t *data;
-        size_t size;
+        size_t   size;
         uint32_t seq;
+        ClockTP  arrival_time;
     };
 
-    static const size_t MAX_JITTER_DEPTH;
-    static const size_t MAX_REORDER_BUF;
+    static constexpr size_t  MAX_JITTER_DEPTH      = 8;    ///< hard cap on target_depth_ (8 × 16.67ms = 133ms @ 60fps)
+    static constexpr size_t  MAX_REORDER_BUF       = 256;
+    static constexpr int64_t MIN_PLAYOUT_MS        = 50;   ///< minimum gap-flush timeout: ~3 frames @ 60fps
+    static constexpr int64_t MAX_PLAYOUT_MS        = 500;  ///< cap on adaptive playout delay (~30 frames @ 60fps)
+    static constexpr double  MIN_FRAME_INTERVAL_MS = 8.0;  ///< pacing floor (~120 fps max)
 
   public:
     UsrQueueAsync();
@@ -247,26 +266,49 @@ class UsrQueueAsync : public UsrQueue
     void start(RecvCallBack callback, void *user_data) override;
     void stop() override;
     bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
+
+    /// Returns the current adaptive reorder buffer target depth (= ceil P90 disorder distance).
     size_t target_depth() const override;
+    /// Returns target_depth() as a double for monitoring interfaces.
     double disorder_p90() const override;
 
   private:
     void worker_thread();
     void try_deliver_locked(std::unique_lock<std::mutex> &lock);
+    void update_jitter_locked(uint32_t abs_seq, ClockTP arrival);
 
-    ReliableUDP *owner_;
-    RecvCallBack receive_callback_;
-    void *user_data_;
+    ReliableUDP    *owner_;
+    RecvCallBack    receive_callback_;
+    void           *user_data_;
 
-    std::thread thread_;
-    mutable std::mutex mutex_;
+    std::thread             thread_;
+    mutable std::mutex      mutex_;
     std::condition_variable cond_;
-    bool running_;
+    bool                    running_;
 
     std::map<uint32_t, cb_data> reorder_buf_;
-    uint32_t next_deliver_seq_;
-    std::atomic<size_t> target_depth_;
-    Histogram<32> disorder_hist_;
+    uint32_t            next_deliver_seq_;
+
+    // RFC 3550 inter-arrival jitter estimator (protected by mutex_)
+    bool     has_timing_ref_;
+    uint32_t last_timing_seq_;
+    ClockTP  last_arrival_time_;
+    double   jitter_ms_;
+
+    std::atomic<int64_t> playout_latency_ms_;
+
+    // Disorder histogram: samples reorder distance (abs_seq - next_deliver_seq_)
+    // for each arriving frame.  ceil(P90) drives target_depth_ so depth_reached
+    // fires well before the playout timeout when the link has persistent reordering.
+    Histogram<32>       disorder_hist_;   // protected by mutex_
+    std::atomic<size_t> target_depth_;   // ceil(P90 disorder), load/store relaxed
+
+    // Delivery pacing: EWMA of inter-delivery interval, used to compute the
+    // worker deadline when the front frame is already in-order (no gap waiting
+    // needed) so buffered frames are played out at a smooth, steady rate.
+    ClockTP last_deliver_time_;   // protected by mutex_
+    bool    has_deliver_ref_;     // whether last_deliver_time_ is valid
+    double  frame_interval_ms_;  // EWMA inter-delivery interval, protected by mutex_
 };
 
 /// @brief Synchronous delivery queue — no buffering, no background thread.
