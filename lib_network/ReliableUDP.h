@@ -213,33 +213,35 @@ class UsrQueue
     {
         return 0;
     }
-
-    /// Returns the P90 disorder quantile (frames).
-    /// Default implementation returns NaN (no statistics available).
-    virtual double disorder_p90() const
-    {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
 };
 
-/// @brief Asynchronous delivery queue with adaptive jitter/reorder buffer.
+/// @brief Asynchronous delivery queue with adaptive depth-window reorder buffer.
 ///
-/// Design (GStreamer rtpjitterbuffer inspired), tuned for 60 fps video:
-///   - Every enqueued frame records its steady-clock arrival time.
-///   - The worker sleeps via cond_.wait_until(deadline) — no busy-wait.
-///     Deadline is computed per-iteration:
-///       in-order front  → last_deliver_time + frame_interval_ms  (pacing)
-///       gap front       → arrival_time + playout_latency_ms      (gap wait)
-///   - A frame is delivered when any of the following is true:
-///       in_order     : it carries the next expected sequence number
-///       depth_reached: buffer size > target_depth_ (adaptive P90 of reorder
-///                      distances); signals the missing predecessor is lost
-///       timed_out    : arrival_time + playout_latency_ms elapsed (last resort)
-///   - Playout latency is adapted via RFC 3550 §6.4.1 EWMA on inter-arrival
-///     timing, clamped to [MIN_PLAYOUT_MS, MAX_PLAYOUT_MS].
-///   - Delivery is paced at the EWMA inter-frame interval so buffered frames
-///     are handed to the decoder at a smooth, steady rate.
-///   - On shutdown, all remaining buffered frames are drained synchronously.
+/// Design principle: the buffer is a sliding window of width target_depth.
+///   - Incoming frames outside the window (distance ≥ target_depth from the
+///     delivery cursor) are dropped immediately — they can never be delivered
+///     in order without excessive delay.
+///   - Frames inside the window are held in a sorted map and delivered in
+///     strict sequence order.
+///   - Output is paced at the long-term average receive rate (recv_interval_ms_)
+///     so the decoder always sees a uniform cadence.
+///   - A gap stalls delivery until either the missing frame arrives or the
+///     buffer fills to target_depth (depth_reached flush).
+///
+/// Two estimators measured at enqueue time (consecutive-sequence samples only):
+///   recv_interval_ms_ — slow EWMA (α=0.05) of inter-arrival intervals (source rate)
+///   jitter_ms_        — EWMA (α=0.125) of |diff − recv_interval| (timing variance)
+///
+/// Dynamic window depth:
+///   dis_depth = P90 of reorder-distance histogram
+///   jit_depth = ⌈4 × jitter_ms / recv_interval_ms⌉
+///   target_depth = max(dis_depth, jit_depth); hysteresis: fast rise, −1/frame decay
+///
+/// Delivery conditions:
+///   in_order     : front frame carries the next expected sequence number
+///   depth_reached: buffer size ≥ target_depth (gap predecessor will never arrive)
+///
+/// On shutdown, all remaining buffered frames are drained synchronously.
 class UsrQueueAsync : public UsrQueue
 {
     using ClockTP = std::chrono::steady_clock::time_point;
@@ -248,15 +250,12 @@ class UsrQueueAsync : public UsrQueue
     {
         uint8_t *data;
         size_t size;
-        uint32_t seq;
-        ClockTP arrival_time;
     };
 
-    static const size_t MAX_JITTER_DEPTH; ///< hard cap on target_depth_ (8 × 16.67ms = 133ms @ 60fps)
-    static const size_t MAX_REORDER_BUF;
-    static const int64_t MIN_PLAYOUT_MS;       ///< minimum gap-flush timeout: ~5 frames @ 500fps (10ms)
-    static const int64_t MAX_PLAYOUT_MS;       ///< cap on adaptive playout delay
-    static const double MIN_FRAME_INTERVAL_MS; ///< pacing floor (~1000 fps max)
+    static const size_t MAX_JITTER_DEPTH;     ///< adaptive depth hard cap — manually tuned upper bound (8 frames)
+    static const size_t INIT_JITTER_DEPTH;    ///< bootstrap depth used before the estimator has enough samples (2 frames)
+    static const size_t MAX_REORDER_BUF;      ///< absolute cap on reorder_buf_ size
+    static const double MIN_FRAME_INTERVAL_MS; ///< pacing floor, ms (~1000 fps max)
 
   public:
     UsrQueueAsync();
@@ -269,8 +268,6 @@ class UsrQueueAsync : public UsrQueue
 
     /// Returns the current adaptive reorder buffer target depth (hysteresis-controlled).
     size_t target_depth() const override;
-    /// Returns target_depth() as a double for monitoring interfaces.
-    double disorder_p90() const override;
 
   private:
     void worker_thread();
@@ -289,26 +286,30 @@ class UsrQueueAsync : public UsrQueue
     std::map<uint32_t, cb_data> reorder_buf_;
     uint32_t next_deliver_seq_;
 
-    // RFC 3550 inter-arrival jitter estimator (protected by mutex_)
+    // Arrival-rate and timing-jitter estimators (protected by mutex_).
+    // recv_interval_ms_: slow EWMA (α=0.05) of consecutive inter-arrival intervals
+    //                    — long-term average receive cadence.
+    // jitter_ms_:        EWMA (α=0.125) of |diff - recv_interval| — true timing variance.
+    // Only consecutive sequence numbers are used to exclude reorder outliers.
     bool has_timing_ref_;
     uint32_t last_timing_seq_;
     ClockTP last_arrival_time_;
-    double jitter_ms_;
+    double recv_interval_ms_; // long-term average inter-arrival (ms), protected by mutex_
+    double jitter_ms_;        // timing jitter (MAD-style EWMA, ms), protected by mutex_
 
-    std::atomic<int64_t> playout_latency_ms_;
-
-    // Disorder histogram: samples reorder distance (abs_seq - next_deliver_seq_)
-    // for each arriving frame. A dual-quantile hysteresis controller drives
-    // target_depth_ (fast rise, slower decay) under persistent reordering.
+    // Disorder histogram drives target_depth_ (= window width).
+    // Combined with jitter_depth, updated on every enqueue.
     Histogram<32> disorder_hist_;      // protected by mutex_
-    std::atomic<size_t> target_depth_; // hysteresis-controlled depth, load/store relaxed
+    std::atomic<size_t> target_depth_; // current window width, load/store relaxed
 
-    // Delivery pacing: EWMA of inter-delivery interval, used to compute the
-    // worker deadline when the front frame is already in-order (no gap waiting
-    // needed) so buffered frames are played out at a smooth, steady rate.
+    // Pre-fill flag: delivery is suppressed until the buffer first reaches
+    // target_depth, ensuring the decoder always starts with a full cushion.
+    bool prefill_done_; // protected by mutex_
+
+    // Output pacing: worker sleeps until last_deliver_time_ + recv_interval_ms_
+    // so the decoder receives frames at a smooth, steady cadence.
     ClockTP last_deliver_time_; // protected by mutex_
     bool has_deliver_ref_;      // whether last_deliver_time_ is valid
-    double frame_interval_ms_;  // EWMA inter-delivery interval, protected by mutex_
 };
 
 /// @brief Synchronous delivery queue — no buffering, no background thread.

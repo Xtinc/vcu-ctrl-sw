@@ -204,28 +204,6 @@ static bool test_jitter_no_duplicates()
     return true;
 }
 
-/// disorder_p90() returns NaN before any frame is enqueued.
-static bool test_jitter_p90_empty()
-{
-    UsrQueueAsync q;
-    return std::isnan(q.disorder_p90());
-}
-
-/// disorder_p90() returns a valid non-negative number after >= 32 samples.
-/// Frames are enqueued without starting the worker so they accumulate
-/// simultaneously, giving the histogram a non-trivial dataset.
-static bool test_jitter_p90_valid()
-{
-    UsrQueueAsync q;
-    static uint8_t dummy[4] = {};
-    // 64 in-order frames all buffered at once → disorder positions 0,1,...,63
-    for (uint32_t i = 0; i < 64; i++)
-        q.enqueue(dummy, 4, i);
-
-    double p90 = q.disorder_p90();
-    return !std::isnan(p90) && p90 >= 0.0;
-}
-
 /// After sustained in-order traffic (well past bootstrap) target_depth must
 /// converge to 0, confirming the depth can decrease.
 static bool test_jitter_depth_recovers()
@@ -355,14 +333,6 @@ static bool test_jitter_window_shuffle()
         }
     }
 
-    // Jitter-tracking sanity: after window-shuffle traffic the histogram must
-    // have observed non-zero disorder.
-    double p90 = q.disorder_p90();
-    if (std::isnan(p90) || p90 <= 0.0)
-    {
-        std::cout << "  [window_shuffle] disorder_p90() = " << p90 << ", expected > 0\n";
-        return false;
-    }
     return true;
 }
 
@@ -514,6 +484,210 @@ static bool test_jitter_permanent_gap()
     return true;
 }
 
+/// Verify output timing uniformity under realistic jitter input.
+///
+/// Frames are injected in sliding-window shuffled order (WINDOW=4) with a
+/// controlled inter-send interval of SEND_INTERVAL_MS ms.  Each frame arrival
+/// is also perturbed by a random jitter of ±JITTER_MS ms to simulate a real
+/// network.  The test measures the wall-clock time between consecutive callback
+/// deliveries and computes the coefficient of variation (CV = stddev / mean).
+///
+/// Pass condition: CV < 0.35.  A buffer that merely forwarded frames as fast
+/// as possible would produce CV >> 1 (bursty window groups); paced output
+/// must be significantly smoother.
+static bool test_jitter_timing_uniformity()
+{
+    constexpr uint32_t N = 120;
+    constexpr double SEND_INTERVAL_MS = 8.0; // nominal 125 fps (fast enough to finish quickly)
+    constexpr double JITTER_MS = 12.0;        // ±12 ms jitter — well above one frame interval
+    constexpr uint32_t WINDOW = 4;
+
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    // Delivery timestamps recorded by the callback.
+    std::vector<std::chrono::steady_clock::time_point> ts;
+    ts.reserve(N);
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    UsrQueueAsync q;
+    q.start(
+        [&](const uint8_t *, size_t) {
+            std::lock_guard<std::mutex> lk(mtx);
+            ts.push_back(std::chrono::steady_clock::now());
+            cv.notify_one();
+        },
+        nullptr);
+
+    // Send frames window-shuffled, each delayed by nominal interval ± jitter.
+    std::mt19937 rng(0xABCD1234);
+    std::uniform_real_distribution<double> jdist(-JITTER_MS, JITTER_MS);
+
+    for (uint32_t base = 0; base < N; base += WINDOW)
+    {
+        uint32_t end = std::min(base + WINDOW, N);
+        std::vector<uint32_t> win;
+        for (uint32_t j = base; j < end; j++)
+            win.push_back(j);
+        std::shuffle(win.begin(), win.end(), rng);
+        for (uint32_t seq : win)
+        {
+            double delay_ms = SEND_INTERVAL_MS + jdist(rng);
+            if (delay_ms < 1.0)
+                delay_ms = 1.0;
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
+            q.enqueue(bufs[seq].data(), 4, seq);
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(10), [&] { return ts.size() >= N; });
+    }
+    q.stop();
+
+    if (ts.size() < N)
+    {
+        std::cout << "  [timing_uniformity] only " << ts.size() << "/" << N << " frames delivered\n";
+        return false;
+    }
+
+    // Compute inter-delivery intervals.
+    std::vector<double> intervals;
+    intervals.reserve(N - 1);
+    for (size_t i = 1; i < ts.size(); i++)
+        intervals.push_back(
+            std::chrono::duration<double, std::milli>(ts[i] - ts[i - 1]).count());
+
+    const double mean = [&] {
+        double s = 0;
+        for (double v : intervals)
+            s += v;
+        return s / static_cast<double>(intervals.size());
+    }();
+    const double var = [&] {
+        double s = 0;
+        for (double v : intervals)
+            s += (v - mean) * (v - mean);
+        return s / static_cast<double>(intervals.size());
+    }();
+    const double stddev = std::sqrt(var);
+    const double cv_val = (mean > 0.0) ? stddev / mean : 999.0;
+
+    std::cout << "  [timing_uniformity] mean_interval=" << std::fixed << std::setprecision(2)
+              << mean << "ms  stddev=" << stddev << "ms  CV=" << cv_val << "\n";
+
+    if (cv_val >= 0.35)
+    {
+        std::cout << "  [timing_uniformity] CV=" << cv_val << " >= 0.35 — output is too bursty\n";
+        return false;
+    }
+    return true;
+}
+
+/// Verify adaptive depth estimation under two traffic phases.
+///
+/// Phase 1 — high disorder (window-6 shuffle, 200 frames injected without
+///            sleep so all arrive nearly simultaneously):
+///   After all phase-1 frames are delivered target_depth must exceed
+///   INIT_JITTER_DEPTH (currently 2), proving the estimator drove it up.
+///
+/// Phase 2 — clean in-order traffic (200 frames, 1 ms apart so every
+///            consecutive-pair sample records disorder == 0):
+///   After phase-2 drains, target_depth must have decayed to ≤ 1.
+static bool test_jitter_adaptive_estimation()
+{
+    constexpr uint32_t PHASE1 = 200;
+    constexpr uint32_t PHASE2 = 200;
+    constexpr uint32_t TOTAL = PHASE1 + PHASE2;
+    constexpr uint32_t WINDOW = 6;
+    constexpr size_t INIT_DEPTH = 2; // mirrors UsrQueueAsync::INIT_JITTER_DEPTH
+
+    std::vector<std::array<uint8_t, 4>> bufs(TOTAL);
+    for (uint32_t i = 0; i < TOTAL; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t delivered = 0;
+
+    UsrQueueAsync q;
+    q.start(
+        [&](const uint8_t *, size_t) {
+            std::lock_guard<std::mutex> lk(mtx);
+            ++delivered;
+            cv.notify_one();
+        },
+        nullptr);
+
+    // Phase 1: burst all window-shuffled frames at once (no inter-frame sleep).
+    {
+        std::mt19937 rng(0xFEED0001);
+        for (uint32_t base = 0; base < PHASE1; base += WINDOW)
+        {
+            uint32_t end = std::min(base + WINDOW, PHASE1);
+            std::vector<uint32_t> win;
+            for (uint32_t j = base; j < end; j++)
+                win.push_back(j);
+            std::shuffle(win.begin(), win.end(), rng);
+            for (uint32_t seq : win)
+                q.enqueue(bufs[seq].data(), 4, seq);
+        }
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(5), [&] { return delivered >= PHASE1; });
+    }
+
+    if (delivered < PHASE1)
+    {
+        std::cout << "  [adaptive_estimation] phase-1 stalled at " << delivered << "/" << PHASE1 << "\n";
+        q.stop();
+        return false;
+    }
+
+    const size_t depth_after_phase1 = q.target_depth();
+    std::cout << "  [adaptive_estimation] target_depth after disorder phase = " << depth_after_phase1 << "\n";
+
+    if (depth_after_phase1 <= INIT_DEPTH)
+    {
+        std::cout << "  [adaptive_estimation] depth " << depth_after_phase1
+                  << " did not rise above INIT_JITTER_DEPTH=" << INIT_DEPTH << "\n";
+        q.stop();
+        return false;
+    }
+
+    // Phase 2: strictly in-order, paced 1 ms apart.
+    for (uint32_t i = PHASE1; i < TOTAL; i++)
+    {
+        q.enqueue(bufs[i].data(), 4, i);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(5), [&] { return delivered >= TOTAL; });
+    }
+    q.stop();
+
+    if (delivered < TOTAL)
+    {
+        std::cout << "  [adaptive_estimation] phase-2 stalled at " << delivered << "/" << TOTAL << "\n";
+        return false;
+    }
+
+    const size_t depth_after_phase2 = q.target_depth();
+    std::cout << "  [adaptive_estimation] target_depth after clean phase = " << depth_after_phase2 << "\n";
+
+    if (depth_after_phase2 > 1)
+    {
+        std::cout << "  [adaptive_estimation] depth " << depth_after_phase2
+                  << " did not decay to ≤1 after in-order traffic\n";
+        return false;
+    }
+    return true;
+}
+
 static int run_jitter_tests()
 {
     struct Test
@@ -526,12 +700,12 @@ static int run_jitter_tests()
         {"in-order delivery preserves order   ", test_jitter_inorder},
         {"reorder: all frames received        ", test_jitter_reorder_complete},
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
-        {"disorder_p90() = NaN before samples ", test_jitter_p90_empty},
-        {"disorder_p90() valid after bootstrap", test_jitter_p90_valid},
         {"target_depth recovers after reorder ", test_jitter_depth_recovers},
-        {"window-shuffle: order+p90 tracking  ", test_jitter_window_shuffle},
+        {"window-shuffle: order+depth tracking", test_jitter_window_shuffle},
         {"adaptive depth rises then falls     ", test_jitter_adapt_up_down},
         {"permanent gap skipped, rest deliver ", test_jitter_permanent_gap},
+        {"output timing uniform under jitter  ", test_jitter_timing_uniformity},
+        {"adaptive depth estimation correct   ", test_jitter_adaptive_estimation},
     };
 
     std::cout << "\nJitter buffer unit tests\n";
