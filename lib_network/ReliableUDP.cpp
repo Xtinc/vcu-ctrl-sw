@@ -1,15 +1,12 @@
 #include "ReliableUDP.h"
 #include <algorithm>
-#include <cinttypes>
 #include <cmath>
+#include <cinttypes>
 #include <pthread.h>
 
 using asio::ip::udp;
 
 // UsrQueueAsync static member definitions
-const size_t UsrQueueAsync::MAX_JITTER_DEPTH = 8;
-const size_t UsrQueueAsync::INIT_JITTER_DEPTH = 2;
-const size_t UsrQueueAsync::MAX_REORDER_BUF = 256;
 const double UsrQueueAsync::MIN_FRAME_INTERVAL_MS = 1.0;
 
 static std::once_flag fec_init_flag;
@@ -107,15 +104,12 @@ asio::io_context &BackgroundService::context()
 
 // UsrQueueAsync implementation
 UsrQueueAsync::UsrQueueAsync()
-    : owner_(nullptr), user_data_(nullptr), running_(false), next_deliver_seq_(0), has_timing_ref_(false),
-      last_timing_seq_(0), recv_interval_ms_(0.0), jitter_ms_(0.0), target_depth_(INIT_JITTER_DEPTH),
-      prefill_done_(false), has_deliver_ref_(false)
+        : owner_(nullptr), running_(false), primed_(false), expected_seq_(0), gap_active_(false),
+            has_arrival_ref_(false), last_rate_seq_(0), avg_interval_ms_(0.0), jitter_ms_(0.0), avg_depth_frames_(0.0),
+            disorder_depth_frames_(0.0), max_disorder_depth_(0), stat_recv_(0), stat_deliver_(0), stat_skip_(0),
+            stat_drop_(0), stat_duplicate_(0), stat_late_(0), stat_reorder_(0), stat_stale_(0), stat_overflow_(0)
 {
-}
-
-size_t UsrQueueAsync::target_depth() const
-{
-    return target_depth_.load(std::memory_order_relaxed);
+        sanitize_tuning_locked();
 }
 
 UsrQueueAsync::~UsrQueueAsync()
@@ -123,9 +117,58 @@ UsrQueueAsync::~UsrQueueAsync()
     stop();
 }
 
+void UsrQueueAsync::sanitize_tuning_locked()
+{
+    tuning_.target_depth = std::max<size_t>(1, tuning_.target_depth);
+    tuning_.startup_depth = std::max<size_t>(1, tuning_.startup_depth);
+    tuning_.max_buffered_frames = std::max<size_t>(2, tuning_.max_buffered_frames);
+
+    tuning_.target_depth = std::min(tuning_.target_depth, tuning_.max_buffered_frames);
+    tuning_.startup_depth = std::min(tuning_.startup_depth, tuning_.max_buffered_frames);
+
+    tuning_.stale_timeout_ms = std::max(tuning_.stale_timeout_ms, MIN_FRAME_INTERVAL_MS);
+    tuning_.default_frame_interval_ms = std::max(tuning_.default_frame_interval_ms, MIN_FRAME_INTERVAL_MS);
+    tuning_.stats_interval_ms = std::max(tuning_.stats_interval_ms, MIN_FRAME_INTERVAL_MS);
+    tuning_.depth_feedback_gain = std::clamp(tuning_.depth_feedback_gain, 0.0, 0.5);
+    tuning_.min_pacing_factor = std::clamp(tuning_.min_pacing_factor, 0.1, 1.0);
+    tuning_.max_pacing_factor = std::max(tuning_.max_pacing_factor, 1.0);
+    if (tuning_.max_pacing_factor < tuning_.min_pacing_factor)
+        tuning_.max_pacing_factor = tuning_.min_pacing_factor;
+}
+
 void UsrQueueAsync::set_owner(ReliableUDP *owner)
 {
     owner_ = owner;
+}
+
+void UsrQueueAsync::reset_state_locked()
+{
+    buffered_frames_.clear();
+    primed_ = false;
+    expected_seq_ = 0;
+    next_delivery_time_ = ClockTP{};
+    gap_active_ = false;
+    gap_start_time_ = ClockTP{};
+
+    has_arrival_ref_ = false;
+    last_rate_seq_ = 0;
+    last_rate_time_ = ClockTP{};
+    avg_interval_ms_ = 0.0;
+    jitter_ms_ = 0.0;
+    avg_depth_frames_ = 0.0;
+    disorder_depth_frames_ = 0.0;
+    max_disorder_depth_ = 0;
+
+    stat_recv_ = 0;
+    stat_deliver_ = 0;
+    stat_skip_ = 0;
+    stat_drop_ = 0;
+    stat_duplicate_ = 0;
+    stat_late_ = 0;
+    stat_reorder_ = 0;
+    stat_stale_ = 0;
+    stat_overflow_ = 0;
+    last_stats_time_ = std::chrono::steady_clock::now();
 }
 
 void UsrQueueAsync::start(RecvCallBack callback, void *user_data)
@@ -135,14 +178,9 @@ void UsrQueueAsync::start(RecvCallBack callback, void *user_data)
         return;
 
     receive_callback_ = callback;
-    user_data_ = user_data;
-    // Reset delivery state for a clean (re-)start.
-    next_deliver_seq_ = 0;
-    has_timing_ref_ = false;
-    recv_interval_ms_ = 0.0;
-    jitter_ms_ = 0.0;
-    prefill_done_ = false;
-    has_deliver_ref_ = false;
+    (void)user_data;
+    sanitize_tuning_locked();
+    reset_state_locked();
     running_ = true;
     thread_ = std::thread(&UsrQueueAsync::worker_thread, this);
 }
@@ -158,36 +196,146 @@ void UsrQueueAsync::stop()
         thread_.join();
 }
 
-// Called under mutex_. Only samples strictly consecutive sequence numbers
-// to exclude reorder outliers from both estimators.
-void UsrQueueAsync::update_jitter_locked(uint32_t abs_seq, ClockTP arrival)
+void UsrQueueAsync::update_depth_estimate_locked(double depth)
 {
-    if (!has_timing_ref_)
+    constexpr double ALPHA_DEPTH = 0.05;
+    if (avg_depth_frames_ <= 0.0)
     {
-        has_timing_ref_ = true;
-        last_timing_seq_ = abs_seq;
-        last_arrival_time_ = arrival;
+        avg_depth_frames_ = depth;
         return;
     }
 
-    if (static_cast<int64_t>(abs_seq) - static_cast<int64_t>(last_timing_seq_) == 1)
-    {
-        const double diff_ms = std::chrono::duration<double, std::milli>(arrival - last_arrival_time_).count();
-        if (diff_ms > 0.0 && diff_ms < 500.0)
-        {
-            constexpr double ALPHA_RATE = 0.05;
-            if (recv_interval_ms_ < MIN_FRAME_INTERVAL_MS)
-                recv_interval_ms_ = diff_ms;
-            else
-                recv_interval_ms_ += ALPHA_RATE * (diff_ms - recv_interval_ms_);
+    avg_depth_frames_ += ALPHA_DEPTH * (depth - avg_depth_frames_);
+}
 
-            constexpr double ALPHA_JITTER = 0.125;
-            jitter_ms_ += ALPHA_JITTER * (std::abs(diff_ms - recv_interval_ms_) - jitter_ms_);
+void UsrQueueAsync::update_estimators_locked(uint32_t abs_seq, ClockTP arrival)
+{
+    if (!has_arrival_ref_)
+    {
+        has_arrival_ref_ = true;
+        last_rate_seq_ = abs_seq;
+        last_rate_time_ = arrival;
+        return;
+    }
+
+    const int64_t seq_delta = static_cast<int64_t>(abs_seq) - static_cast<int64_t>(last_rate_seq_);
+    if (seq_delta > 0 && seq_delta <= static_cast<int64_t>(tuning_.max_buffered_frames))
+    {
+        const double diff_ms = std::chrono::duration<double, std::milli>(arrival - last_rate_time_).count();
+        if (diff_ms > 0.0 && diff_ms < 1000.0)
+        {
+            constexpr double ALPHA_RATE = 0.02;
+            constexpr double ALPHA_JITTER = 0.10;
+            const double sample_interval_ms = diff_ms / static_cast<double>(seq_delta);
+            if (avg_interval_ms_ < MIN_FRAME_INTERVAL_MS)
+            {
+                avg_interval_ms_ = sample_interval_ms;
+                jitter_ms_ = 0.0;
+            }
+            else
+            {
+                const double deviation = std::abs(sample_interval_ms - avg_interval_ms_);
+                avg_interval_ms_ += ALPHA_RATE * (sample_interval_ms - avg_interval_ms_);
+                jitter_ms_ += ALPHA_JITTER * (deviation - jitter_ms_);
+            }
         }
     }
 
-    last_timing_seq_ = abs_seq;
-    last_arrival_time_ = arrival;
+    last_rate_seq_ = abs_seq;
+    last_rate_time_ = arrival;
+}
+
+void UsrQueueAsync::note_disorder_locked(uint32_t abs_seq)
+{
+    constexpr double ALPHA_DISORDER = 0.10;
+    constexpr double DECAY_DISORDER = 0.02;
+
+    double sample = 0.0;
+    if (primed_ && abs_seq > expected_seq_)
+    {
+        sample = static_cast<double>(abs_seq - expected_seq_);
+        ++stat_reorder_;
+        max_disorder_depth_ = std::max(max_disorder_depth_, static_cast<uint32_t>(sample));
+    }
+
+    if (sample > 0.0)
+    {
+        disorder_depth_frames_ += ALPHA_DISORDER * (sample - disorder_depth_frames_);
+    }
+    else
+    {
+        disorder_depth_frames_ += DECAY_DISORDER * (0.0 - disorder_depth_frames_);
+    }
+}
+
+double UsrQueueAsync::bootstrap_interval_locked() const
+{
+    if (avg_interval_ms_ >= MIN_FRAME_INTERVAL_MS)
+        return avg_interval_ms_;
+
+    if (buffered_frames_.size() >= 2)
+    {
+        const auto &first = buffered_frames_.front();
+        const auto &last = buffered_frames_.back();
+        const double span_ms =
+            std::chrono::duration<double, std::milli>(last.arrival - first.arrival).count() /
+            static_cast<double>(buffered_frames_.size() - 1);
+        if (span_ms >= MIN_FRAME_INTERVAL_MS)
+            return span_ms;
+    }
+
+    return tuning_.default_frame_interval_ms;
+}
+
+double UsrQueueAsync::compute_delivery_interval_locked() const
+{
+    const double base_interval_ms = std::max(MIN_FRAME_INTERVAL_MS, bootstrap_interval_locked());
+    const double smoothed_depth = 0.5 * (avg_depth_frames_ + static_cast<double>(buffered_frames_.size()));
+    const double depth_error = smoothed_depth - static_cast<double>(tuning_.target_depth);
+    const double correction = std::clamp(1.0 - tuning_.depth_feedback_gain * depth_error,
+                                         tuning_.min_pacing_factor, tuning_.max_pacing_factor);
+    return std::max(MIN_FRAME_INTERVAL_MS, base_interval_ms * correction);
+}
+
+double UsrQueueAsync::compute_gap_wait_ms_locked() const
+{
+    const double base_interval_ms = std::max(MIN_FRAME_INTERVAL_MS, bootstrap_interval_locked());
+    const double jitter_guard_ms = std::max(base_interval_ms, jitter_ms_ * 2.0);
+    const double disorder_guard_ms = std::max(1.0, disorder_depth_frames_) * base_interval_ms;
+    const double wait_ms =
+        base_interval_ms * static_cast<double>(tuning_.target_depth + 1) + jitter_guard_ms + disorder_guard_ms;
+    return std::clamp(wait_ms, base_interval_ms, tuning_.stale_timeout_ms);
+}
+
+void UsrQueueAsync::drop_frame_locked(std::list<BufferedFrame>::iterator it)
+{
+    uint8_t *data = it->data;
+    buffered_frames_.erase(it);
+    if (owner_)
+    {
+        owner_->count_dropped_packet();
+        owner_->release_recv_buf(data);
+    }
+}
+
+void UsrQueueAsync::purge_stale_locked(ClockTP now)
+{
+    const auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                  std::chrono::duration<double, std::milli>(tuning_.stale_timeout_ms));
+    for (auto it = buffered_frames_.begin(); it != buffered_frames_.end();)
+    {
+        if (it->arrival >= cutoff)
+        {
+            ++it;
+            continue;
+        }
+
+        VIDEO_DEBUG_PRINT("[JitterBuf] stale drop seq=%u", it->seq);
+        ++stat_drop_;
+        ++stat_stale_;
+        auto to_drop = it++;
+        drop_frame_locked(to_drop);
+    }
 }
 
 bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
@@ -198,62 +346,40 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     const ClockTP arrival = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Drop frames already past the delivery cursor.
-    if (next_deliver_seq_ != 0 && abs_seq < next_deliver_seq_)
+    if (!running_)
         return false;
 
-    // Drop frames outside the reorder window [cursor, cursor+depth].
-    // Accepting up to depth+1 positions means the buffer can hold exactly
-    // `depth` frames when the cursor frame is missing, allowing depth_reached
-    // to flush the gap in try_deliver_locked.
-    const size_t depth = target_depth_.load(std::memory_order_relaxed);
-    if (next_deliver_seq_ != 0 && (abs_seq - next_deliver_seq_) > depth)
+    ++stat_recv_;
+
+    if (primed_ && abs_seq < expected_seq_)
     {
-        if (owner_)
-            owner_->count_dropped_packet();
-        VIDEO_DEBUG_PRINT("[JitterBuf] drop seq=%u cursor=%u depth=%zu", abs_seq, next_deliver_seq_, depth);
+        ++stat_late_;
         return false;
     }
 
-    if (reorder_buf_.size() >= MAX_REORDER_BUF)
+    auto it = buffered_frames_.begin();
+    while (it != buffered_frames_.end() && it->seq < abs_seq)
+        ++it;
+    if (it != buffered_frames_.end() && it->seq == abs_seq)
     {
-        if (owner_)
-            owner_->count_dropped_packet();
+        ++stat_duplicate_;
         return false;
     }
 
-    if (!reorder_buf_.emplace(abs_seq, cb_data{data, size}).second)
-        return false; // duplicate
+    buffered_frames_.insert(it, {abs_seq, data, size, arrival});
+    update_estimators_locked(abs_seq, arrival);
+    note_disorder_locked(abs_seq);
+    update_depth_estimate_locked(static_cast<double>(buffered_frames_.size()));
 
-    update_jitter_locked(abs_seq, arrival);
+    purge_stale_locked(arrival);
 
-    // Adapt target_depth from disorder histogram (P90) and timing jitter,
-    // taking the larger of the two. Hysteresis: rise immediately, decay -1/frame.
-    if (next_deliver_seq_ != 0)
+    while (buffered_frames_.size() > tuning_.max_buffered_frames)
     {
-        const double disorder = static_cast<double>(abs_seq - next_deliver_seq_);
-        disorder_hist_.add(disorder);
-
-        const double q_p90 = disorder_hist_.quantile(0.90);
-        size_t dis_depth = 1;
-        if (!std::isnan(q_p90) && q_p90 >= 0.0)
-            dis_depth = std::min<size_t>(MAX_JITTER_DEPTH, 1 + static_cast<size_t>(std::ceil(q_p90)));
-
-        size_t jit_depth = 1;
-        if (recv_interval_ms_ >= MIN_FRAME_INTERVAL_MS && jitter_ms_ > 0.0)
-            jit_depth = std::min<size_t>(MAX_JITTER_DEPTH,
-                                         static_cast<size_t>(std::ceil(4.0 * jitter_ms_ / recv_interval_ms_)));
-
-        const size_t new_target = std::max(dis_depth, jit_depth);
-        const size_t curr_depth = target_depth_.load(std::memory_order_relaxed);
-        const size_t next_depth = (new_target >= curr_depth) ? new_target : curr_depth - 1;
-        target_depth_.store(next_depth, std::memory_order_relaxed);
-
-        if (disorder >= 1.0)
-            VIDEO_DEBUG_PRINT("[JitterBuf] reorder seq=%u dist=%.0f dis_d=%zu jit_d=%zu depth=%zu buf=%zu"
-                              " recv_fi=%.1fms jitter=%.1fms",
-                              abs_seq, disorder, dis_depth, jit_depth, next_depth, reorder_buf_.size(),
-                              recv_interval_ms_, jitter_ms_);
+        auto tail = std::prev(buffered_frames_.end());
+        VIDEO_DEBUG_PRINT("[JitterBuf] overflow drop seq=%u", tail->seq);
+        ++stat_drop_;
+        ++stat_overflow_;
+        drop_frame_locked(tail);
     }
 
     cond_.notify_one();
@@ -268,113 +394,189 @@ void UsrQueueAsync::worker_thread()
     {
         std::unique_lock<std::mutex> lock(mutex_);
 
-        if (reorder_buf_.empty())
-        {
-            cond_.wait(lock, [this] { return !running_ || !reorder_buf_.empty(); });
-        }
-        else
-        {
-            const uint32_t front_seq = reorder_buf_.begin()->first;
-            const bool front_in_order = (next_deliver_seq_ == 0) || (front_seq == next_deliver_seq_);
-
-            if (front_in_order)
-            {
-                // Pace output at the long-term average receive interval.
-                // If woken early by a new-frame notify, loop back and re-sleep
-                // so the decoder always receives frames at a steady cadence.
-                if (has_deliver_ref_ && recv_interval_ms_ >= MIN_FRAME_INTERVAL_MS)
-                {
-                    const ClockTP deadline =
-                        last_deliver_time_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                 std::chrono::duration<double, std::milli>(recv_interval_ms_));
-                    cond_.wait_until(lock, deadline);
-                    if (std::chrono::steady_clock::now() < deadline)
-                        continue;
-                }
-            }
-            else
-            {
-                // Gap: wait for the missing frame or for depth_reached to flush it.
-                cond_.wait(lock);
-            }
-        }
+        const auto now = std::chrono::steady_clock::now();
+        purge_stale_locked(now);
+        print_stats_locked(now);
 
         if (!running_)
         {
-            while (!reorder_buf_.empty())
-            {
-                auto front_it = reorder_buf_.begin();
-                cb_data item = front_it->second;
-                if (front_it->first != next_deliver_seq_)
-                    next_deliver_seq_ = front_it->first;
-                next_deliver_seq_++;
-                reorder_buf_.erase(front_it);
-
-                lock.unlock();
-                receive_callback_(item.data, item.size);
-                if (owner_)
-                    owner_->release_recv_buf(item.data);
-                lock.lock();
-            }
+            drain_locked(lock);
             break;
         }
 
-        try_deliver_locked(lock);
+        if (buffered_frames_.empty())
+        {
+            gap_active_ = false;
+            const auto stats_deadline =
+                last_stats_time_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                       std::chrono::duration<double, std::milli>(tuning_.stats_interval_ms));
+            cond_.wait_until(lock, stats_deadline);
+            continue;
+        }
+
+        if (!primed_)
+        {
+            if (buffered_frames_.size() < tuning_.startup_depth)
+            {
+                cond_.wait(lock, [this] { return !running_ || buffered_frames_.size() >= tuning_.startup_depth; });
+                continue;
+            }
+
+            primed_ = true;
+            expected_seq_ = buffered_frames_.front().seq;
+            next_delivery_time_ = now;
+            gap_active_ = false;
+        }
+
+        if (std::chrono::steady_clock::now() < next_delivery_time_)
+        {
+            cond_.wait_until(lock, next_delivery_time_);
+            continue;
+        }
+
+        if (buffered_frames_.front().seq == expected_seq_)
+        {
+            deliver_one_locked(lock);
+            continue;
+        }
+
+        if (buffered_frames_.front().seq < expected_seq_)
+        {
+            ++stat_drop_;
+            auto stale_front = buffered_frames_.begin();
+            drop_frame_locked(stale_front);
+            continue;
+        }
+
+        if (!gap_active_)
+        {
+            gap_active_ = true;
+            gap_start_time_ = std::chrono::steady_clock::now();
+        }
+
+        const auto gap_deadline =
+            gap_start_time_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                  std::chrono::duration<double, std::milli>(compute_gap_wait_ms_locked()));
+        const bool depth_pressure = buffered_frames_.size() > tuning_.target_depth;
+        const auto gap_now = std::chrono::steady_clock::now();
+        if (depth_pressure || gap_now >= gap_deadline)
+        {
+            skip_gap_locked(buffered_frames_.front().seq);
+            continue;
+        }
+
+        cond_.wait_until(lock, gap_deadline, [this] {
+            return !running_ || buffered_frames_.empty() || buffered_frames_.front().seq <= expected_seq_ ||
+                   buffered_frames_.size() > tuning_.target_depth;
+        });
     }
 }
 
-void UsrQueueAsync::try_deliver_locked(std::unique_lock<std::mutex> &lock)
+void UsrQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
 {
-    if (reorder_buf_.empty())
+    if (buffered_frames_.empty())
         return;
 
-    // Pre-fill: hold back delivery until the buffer first reaches target_depth,
-    // giving the decoder a cushion of depth × recv_interval_ms against late frames.
-    if (!prefill_done_)
-    {
-        if (reorder_buf_.size() < target_depth_.load(std::memory_order_relaxed))
-            return;
-        prefill_done_ = true;
-    }
+    auto frame = buffered_frames_.front();
+    buffered_frames_.pop_front();
 
-    auto front_it = reorder_buf_.begin();
-    const bool in_order = (next_deliver_seq_ == 0) || (front_it->first == next_deliver_seq_);
-    // depth_reached: buffer holds `depth` frames while cursor is missing —
-    // the predecessor will never arrive; skip it and deliver the next frame.
-    const bool depth_reached = (reorder_buf_.size() >= target_depth_.load(std::memory_order_relaxed));
-
-    if (!in_order && !depth_reached)
-        return;
-
-    cb_data item = front_it->second;
     const ClockTP now = std::chrono::steady_clock::now();
+    expected_seq_ = frame.seq + 1;
+    gap_active_ = false;
+    update_depth_estimate_locked(static_cast<double>(buffered_frames_.size()));
+    next_delivery_time_ =
+        now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::duration<double, std::milli>(compute_delivery_interval_locked()));
 
-    if (front_it->first != next_deliver_seq_)
-    {
-        VIDEO_DEBUG_PRINT("[JitterBuf] gap flush skip=%u seq=%u depth=%zu buf=%zu",
-                          front_it->first - next_deliver_seq_, front_it->first,
-                          target_depth_.load(std::memory_order_relaxed), reorder_buf_.size());
-        next_deliver_seq_ = front_it->first;
-    }
-    next_deliver_seq_++;
-    reorder_buf_.erase(front_it);
-
-    last_deliver_time_ = now;
-    has_deliver_ref_ = true;
-    if (next_deliver_seq_ % 300 == 0)
-        VIDEO_INFO_PRINT("[JitterBuf] stats seq=%u recv_fi=%.1fms jitter=%.1fms depth=%zu buf=%zu",
-                         next_deliver_seq_, recv_interval_ms_, jitter_ms_,
-                         target_depth_.load(std::memory_order_relaxed), reorder_buf_.size());
+    ++stat_deliver_;
+    print_stats_locked(now);
 
     lock.unlock();
-    receive_callback_(item.data, item.size);
+    if (receive_callback_)
+        receive_callback_(frame.data, frame.size);
     if (owner_)
-        owner_->release_recv_buf(item.data);
+        owner_->release_recv_buf(frame.data);
     lock.lock();
 }
 
+void UsrQueueAsync::skip_gap_locked(uint32_t next_available_seq)
+{
+    if (!primed_ || next_available_seq <= expected_seq_)
+        return;
+
+    const uint32_t missing = next_available_seq - expected_seq_;
+    VIDEO_DEBUG_PRINT(
+        "[JitterBuf] gap skip expected=%u next=%u miss=%u depth=%zu avg_fi=%.2fms jitter=%.2fms disorder=%.2f",
+        expected_seq_, next_available_seq, missing, buffered_frames_.size(), avg_interval_ms_, jitter_ms_,
+        disorder_depth_frames_);
+
+    stat_skip_ += missing;
+    if (owner_)
+    {
+        for (uint32_t i = 0; i < missing; ++i)
+            owner_->count_dropped_packet();
+    }
+
+    expected_seq_ = next_available_seq;
+    gap_active_ = false;
+    next_delivery_time_ = std::chrono::steady_clock::now();
+}
+
+void UsrQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
+{
+    while (!buffered_frames_.empty())
+    {
+        auto frame = buffered_frames_.front();
+        buffered_frames_.pop_front();
+        lock.unlock();
+        if (receive_callback_)
+            receive_callback_(frame.data, frame.size);
+        if (owner_)
+            owner_->release_recv_buf(frame.data);
+        lock.lock();
+    }
+}
+
+void UsrQueueAsync::print_stats_locked(ClockTP now)
+{
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(now - last_stats_time_).count();
+
+    if (elapsed_ms < tuning_.stats_interval_ms)
+        return;
+
+    const double interval_ms = std::max(MIN_FRAME_INTERVAL_MS, bootstrap_interval_locked());
+    const double fps = 1000.0 / interval_ms;
+    const double jitter_depth = jitter_ms_ / interval_ms;
+
+    VIDEO_INFO_PRINT("[JitterBuf] avg_fi=%.2fms(%.1ffps) jitter=%.2fms jit_depth=%.2f dis_depth=%.2f max_dis=%u "
+                     "depth=%.2f(cur=%zu tgt=%zu) recv=%" PRIu64 " dlv=%" PRIu64 " skip=%" PRIu64
+                     " drop=%" PRIu64 " dup=%" PRIu64 " late=%" PRIu64 " reorder=%" PRIu64
+                     " stale=%" PRIu64 " ovf=%" PRIu64,
+                     interval_ms, fps, jitter_ms_, jitter_depth, disorder_depth_frames_, max_disorder_depth_,
+                     avg_depth_frames_, buffered_frames_.size(), tuning_.target_depth,
+                     stat_recv_, stat_deliver_, stat_skip_, stat_drop_, stat_duplicate_, stat_late_, stat_reorder_,
+                     stat_stale_, stat_overflow_);
+
+    stat_recv_ = 0;
+    stat_deliver_ = 0;
+    stat_skip_ = 0;
+    stat_drop_ = 0;
+    stat_duplicate_ = 0;
+    stat_late_ = 0;
+    stat_reorder_ = 0;
+    stat_stale_ = 0;
+    stat_overflow_ = 0;
+    max_disorder_depth_ = 0;
+    last_stats_time_ = now;
+}
+
+size_t UsrQueueAsync::jitter_depth() const
+{
+    return tuning_.target_depth;
+}
+
 // UsrQueueSync implementation
-UsrQueueSync::UsrQueueSync() : owner_(nullptr), user_data_(nullptr)
+UsrQueueSync::UsrQueueSync() : owner_(nullptr)
 {
 }
 
@@ -386,13 +588,12 @@ void UsrQueueSync::set_owner(ReliableUDP *owner)
 void UsrQueueSync::start(RecvCallBack callback, void *user_data)
 {
     receive_callback_ = callback;
-    user_data_ = user_data;
+    (void)user_data;
 }
 
 void UsrQueueSync::stop()
 {
     receive_callback_ = nullptr;
-    user_data_ = nullptr;
 }
 
 bool UsrQueueSync::enqueue(uint8_t *data, size_t size, uint32_t /*abs_seq*/)
@@ -583,11 +784,6 @@ double ReliableUDP::lost_rate()
     return real_lost_rate;
 }
 
-size_t ReliableUDP::jitter_depth() const
-{
-    return usr_queue_ ? usr_queue_->target_depth() : 0;
-}
-
 void ReliableUDP::count_dropped_packet()
 {
     lost_packets_.fetch_add(1, std::memory_order_relaxed);
@@ -606,6 +802,11 @@ int64_t ReliableUDP::offset_ms() const
 bool ReliableUDP::is_time_synced() const
 {
     return time_synced_.load(std::memory_order_relaxed);
+}
+
+size_t ReliableUDP::jitter_depth() const
+{
+    return usr_queue_->jitter_depth();
 }
 
 double ReliableUDP::send_rate()

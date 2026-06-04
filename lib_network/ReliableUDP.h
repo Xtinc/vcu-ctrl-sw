@@ -13,7 +13,6 @@
 #include <cstring>
 #include <functional>
 #include <list>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -194,8 +193,8 @@ class ReliableUDP;
 /// @brief Abstract base for user delivery queues.
 ///
 /// Concrete implementations differ in how they dispatch received frames to the
-/// application callback:
-/// - UsrQueueAsync  — background thread with adaptive jitter/reorder buffer
+/// application callback:+
+/// - UsrQueueAsync  — background thread with fixed-depth jitter/reorder buffer
 /// - UsrQueueSync   — direct call inside the receive path (no buffering)
 class UsrQueue
 {
@@ -206,56 +205,55 @@ class UsrQueue
     virtual void start(RecvCallBack callback, void *user_data) = 0;
     virtual void stop() = 0;
     virtual bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) = 0;
-
-    /// Returns the current adaptive jitter buffer depth (frames).
-    /// Default implementation for queues without buffering returns 0.
-    virtual size_t target_depth() const
-    {
-        return 0;
-    }
+    virtual size_t jitter_depth() const = 0;
 };
 
-/// @brief Asynchronous delivery queue with adaptive depth-window reorder buffer.
+/// @brief Asynchronous fixed-depth jitter buffer for fully reassembled frames.
 ///
-/// Design principle: the buffer is a sliding window of width target_depth.
-///   - Incoming frames outside the window (distance ≥ target_depth from the
-///     delivery cursor) are dropped immediately — they can never be delivered
-///     in order without excessive delay.
-///   - Frames inside the window are held in a sorted map and delivered in
-///     strict sequence order.
-///   - Output is paced at the long-term average receive rate (recv_interval_ms_)
-///     so the decoder always sees a uniform cadence.
-///   - A gap stalls delivery until either the missing frame arrives or the
-///     buffer fills to target_depth (depth_reached flush).
+/// This queue trades latency for continuity. It keeps a steady frame cushion
+/// near its configured target depth, reorders buffered frames by absolute
+/// sequence number, and feeds the decoder at the long-term average receive cadence.
 ///
-/// Two estimators measured at enqueue time (consecutive-sequence samples only):
-///   recv_interval_ms_ — slow EWMA (α=0.05) of inter-arrival intervals (source rate)
-///   jitter_ms_        — EWMA (α=0.125) of |diff − recv_interval| (timing variance)
+/// Behaviour model:
+///  - Startup prefill waits until the configured startup depth is buffered.
+///  - Normal delivery is paced by a long-term receive-interval estimator.
+///  - Occupancy feedback nudges the delivery interval so buffered depth stays
+///    near the configured target depth instead of draining to zero or growing
+///    unbounded.
+///  - When a sequence gap blocks delivery, the queue waits for late arrival up
+///    to a jitter/reorder-aware deadline, then skips the missing span.
 ///
-/// Dynamic window depth:
-///   dis_depth = P90 of reorder-distance histogram
-///   jit_depth = ⌈4 × jitter_ms / recv_interval_ms⌉
-///   target_depth = max(dis_depth, jit_depth); hysteresis: fast rise, −1/frame decay
-///
-/// Delivery conditions:
-///   in_order     : front frame carries the next expected sequence number
-///   depth_reached: buffer size ≥ target_depth (gap predecessor will never arrive)
-///
-/// On shutdown, all remaining buffered frames are drained synchronously.
+/// Periodic diagnostics report receive cadence, estimated time jitter,
+/// estimated jitter depth and disorder depth, current/average buffer depth, and
+/// per-window counters.
 class UsrQueueAsync : public UsrQueue
 {
     using ClockTP = std::chrono::steady_clock::time_point;
 
-    struct cb_data
+    // Internal tuning block for on-site manual adjustment.
+    // Change these defaults directly in code when tuning latency vs. continuity.
+    struct Tunables
     {
-        uint8_t *data;
-        size_t size;
+        size_t target_depth = 4;
+        size_t startup_depth = 4; // usually keep this equal to target_depth
+        size_t max_buffered_frames = 64;
+        double stale_timeout_ms = 2000.0;
+        double default_frame_interval_ms = 16.0;
+        double stats_interval_ms = 5000.0;
+        double depth_feedback_gain = 0.08;
+        double min_pacing_factor = 0.70;
+        double max_pacing_factor = 1.30;
     };
 
-    static const size_t MAX_JITTER_DEPTH;     ///< adaptive depth hard cap — manually tuned upper bound (8 frames)
-    static const size_t INIT_JITTER_DEPTH;    ///< bootstrap depth used before the estimator has enough samples (2 frames)
-    static const size_t MAX_REORDER_BUF;      ///< absolute cap on reorder_buf_ size
-    static const double MIN_FRAME_INTERVAL_MS; ///< pacing floor, ms (~1000 fps max)
+    struct BufferedFrame
+    {
+        uint32_t seq;
+        uint8_t *data;
+        size_t size;
+        ClockTP arrival;
+    };
+
+    static const double MIN_FRAME_INTERVAL_MS;
 
   public:
     UsrQueueAsync();
@@ -265,51 +263,60 @@ class UsrQueueAsync : public UsrQueue
     void start(RecvCallBack callback, void *user_data) override;
     void stop() override;
     bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
-
-    /// Returns the current adaptive reorder buffer target depth (hysteresis-controlled).
-    size_t target_depth() const override;
+    size_t jitter_depth() const override;
 
   private:
     void worker_thread();
-    void try_deliver_locked(std::unique_lock<std::mutex> &lock);
-    void update_jitter_locked(uint32_t abs_seq, ClockTP arrival);
+        void sanitize_tuning_locked();
+        void reset_state_locked();
+        void drain_locked(std::unique_lock<std::mutex> &lock);
+        void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
+        void update_depth_estimate_locked(double depth);
+        void note_disorder_locked(uint32_t abs_seq);
+        void purge_stale_locked(ClockTP now);
+        void drop_frame_locked(std::list<BufferedFrame>::iterator it);
+        double bootstrap_interval_locked() const;
+        double compute_delivery_interval_locked() const;
+        double compute_gap_wait_ms_locked() const;
+        void deliver_one_locked(std::unique_lock<std::mutex> &lock);
+        void skip_gap_locked(uint32_t next_available_seq);
+        void print_stats_locked(ClockTP now);
 
     ReliableUDP *owner_;
     RecvCallBack receive_callback_;
-    void *user_data_;
 
     std::thread thread_;
     mutable std::mutex mutex_;
     std::condition_variable cond_;
     bool running_;
 
-    std::map<uint32_t, cb_data> reorder_buf_;
-    uint32_t next_deliver_seq_;
+    std::list<BufferedFrame> buffered_frames_;
+    bool primed_;
+    uint32_t expected_seq_;
+    ClockTP next_delivery_time_;
+    bool gap_active_;
+    ClockTP gap_start_time_;
+    Tunables tuning_;
 
-    // Arrival-rate and timing-jitter estimators (protected by mutex_).
-    // recv_interval_ms_: slow EWMA (α=0.05) of consecutive inter-arrival intervals
-    //                    — long-term average receive cadence.
-    // jitter_ms_:        EWMA (α=0.125) of |diff - recv_interval| — true timing variance.
-    // Only consecutive sequence numbers are used to exclude reorder outliers.
-    bool has_timing_ref_;
-    uint32_t last_timing_seq_;
-    ClockTP last_arrival_time_;
-    double recv_interval_ms_; // long-term average inter-arrival (ms), protected by mutex_
-    double jitter_ms_;        // timing jitter (MAD-style EWMA, ms), protected by mutex_
+    bool has_arrival_ref_;
+    uint32_t last_rate_seq_;
+    ClockTP last_rate_time_;
+    double avg_interval_ms_;
+    double jitter_ms_;
+    double avg_depth_frames_;
+    double disorder_depth_frames_;
+    uint32_t max_disorder_depth_;
 
-    // Disorder histogram drives target_depth_ (= window width).
-    // Combined with jitter_depth, updated on every enqueue.
-    Histogram<32> disorder_hist_;      // protected by mutex_
-    std::atomic<size_t> target_depth_; // current window width, load/store relaxed
-
-    // Pre-fill flag: delivery is suppressed until the buffer first reaches
-    // target_depth, ensuring the decoder always starts with a full cushion.
-    bool prefill_done_; // protected by mutex_
-
-    // Output pacing: worker sleeps until last_deliver_time_ + recv_interval_ms_
-    // so the decoder receives frames at a smooth, steady cadence.
-    ClockTP last_deliver_time_; // protected by mutex_
-    bool has_deliver_ref_;      // whether last_deliver_time_ is valid
+    uint64_t stat_recv_;
+    uint64_t stat_deliver_;
+    uint64_t stat_skip_;
+    uint64_t stat_drop_;
+    uint64_t stat_duplicate_;
+    uint64_t stat_late_;
+    uint64_t stat_reorder_;
+    uint64_t stat_stale_;
+    uint64_t stat_overflow_;
+    ClockTP last_stats_time_;
 };
 
 /// @brief Synchronous delivery queue — no buffering, no background thread.
@@ -326,11 +333,11 @@ class UsrQueueSync : public UsrQueue
     void start(RecvCallBack callback, void *user_data) override;
     void stop() override;
     bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
+    size_t jitter_depth() const override { return 0; }
 
   private:
     ReliableUDP *owner_;
     RecvCallBack receive_callback_;
-    void *user_data_;
 };
 
 /**
