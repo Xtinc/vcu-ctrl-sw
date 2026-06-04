@@ -36,8 +36,9 @@ struct AL_TInfoDecode;
  */
 struct DecMgrConfig
 {
-    VideoCodec codec = VideoCodec::HEVC;             ///< Video codec
-    bool low_delay_mode = false;                     ///< LLP2 mode: bUseEarlyCallback on decoder + llp2_mode on display (LLP1 always active)
+    VideoCodec codec = VideoCodec::HEVC; ///< Video codec
+    bool low_delay_mode =
+        false; ///< LLP2 mode: bUseEarlyCallback on decoder + llp2_mode on display (LLP1 always active)
     uint32_t input_buffer_size = 4u * 1024u * 1024u; ///< Bytes per input stream buffer
     std::string dec_dev = "/dev/allegroDecodeIP";    ///< VCU decoder device
     std::string drm_device = "/dev/dri/card0";       ///< DRM device node
@@ -195,7 +196,7 @@ class DecMgr
     double fps() const;
     double recv_rate() const;
     double lost_rate() const;
-    size_t jitter_depth() const;
+    std::string queue_stats_text() const;
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
 

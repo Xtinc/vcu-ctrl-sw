@@ -74,11 +74,49 @@ static bool enqueue_with_retry(UsrQueueAsync &q, uint8_t *data, size_t size, uin
     return false;
 }
 
-static bool enqueue_with_interval(UsrQueueAsync &q, uint8_t *data, size_t size, uint32_t seq,
-                                  std::chrono::milliseconds interval = std::chrono::milliseconds(2))
+static std::string queue_stat_value(const std::string &stats, const std::string &key)
 {
-    std::this_thread::sleep_for(interval);
-    return q.enqueue(data, size, seq);
+    const auto pos = stats.find(key);
+    if (pos == std::string::npos)
+        return std::string{};
+
+    const auto begin = pos + key.size();
+    const auto end = stats.find(',', begin);
+    return stats.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+}
+
+static uint64_t queue_stat_u64(const std::string &stats, const std::string &key)
+{
+    const auto value = queue_stat_value(stats, key);
+    return value.empty() ? 0 : static_cast<uint64_t>(std::stoull(value));
+}
+
+static double queue_stat_disorder_depth(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_dis=");
+    const auto end = value.find('f');
+    return value.empty() ? 0.0 : std::stod(value.substr(0, end));
+}
+
+static uint64_t queue_stat_max_disorder_depth(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_dis=");
+    const auto slash = value.find('/');
+    return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(slash + 1)));
+}
+
+static uint64_t queue_stat_current_depth(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_depth=");
+    const auto slash = value.find('/');
+    return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(0, slash)));
+}
+
+static uint64_t queue_stat_target_depth(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_depth=");
+    const auto slash = value.rfind('/');
+    return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(slash + 1)));
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +280,69 @@ static bool test_jitter_no_duplicates()
     return true;
 }
 
+static bool test_jitter_stats_snapshot_is_read_only()
+{
+    std::array<uint8_t, 4> buf{};
+    uint32_t value = 1;
+    std::memcpy(buf.data(), &value, 4);
+
+    UsrQueueAsync q;
+    q.start([](const uint8_t *, size_t) {}, nullptr);
+
+    bool ok = true;
+    ok = ok && q.enqueue(buf.data(), buf.size(), 0);
+    q.enqueue(buf.data(), buf.size(), 0);
+
+    const std::string peek = q.stats_text();
+    if (queue_stat_u64(peek, "q_recv=") != 2 || queue_stat_u64(peek, "q_dup=") != 1 ||
+        queue_stat_current_depth(peek) != 1 || queue_stat_target_depth(peek) == 0)
+    {
+        std::cout << "  [stats_snapshot] unexpected peek stats: " << peek << '\n';
+        ok = false;
+    }
+
+    const std::string again = q.stats_text();
+    if (again != peek)
+    {
+        std::cout << "  [stats_snapshot] stats_text() mutated counters unexpectedly\n";
+        ok = false;
+    }
+
+    q.stop();
+    return ok;
+}
+
+static bool test_jitter_inorder_prefill_not_reorder()
+{
+    constexpr uint32_t N = 16;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    UsrQueueAsync q;
+    q.start([](const uint8_t *, size_t) {}, nullptr);
+
+    for (uint32_t i = 0; i < N; i++)
+    {
+        if (!q.enqueue(bufs[i].data(), 4, i))
+        {
+            q.stop();
+            return false;
+        }
+    }
+
+    const std::string stats = q.stats_text();
+    q.stop();
+
+    if (queue_stat_u64(stats, "q_reorder=") != 0 || queue_stat_max_disorder_depth(stats) != 0 ||
+        queue_stat_disorder_depth(stats) != 0.0)
+    {
+        std::cout << "  [inorder_prefill] in-order prefill counted as reorder: " << stats << '\n';
+        return false;
+    }
+    return true;
+}
+
 /// After a disorder phase and a clean phase, the fixed target depth must remain
 /// unchanged while the queue continues to drain all frames correctly.
 static bool test_jitter_depth_recovers()
@@ -257,7 +358,7 @@ static bool test_jitter_depth_recovers()
     size_t delivered = 0;
 
     UsrQueueAsync q;
-    const size_t fixed_depth = q.jitter_depth();
+    const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start(
         [&](const uint8_t *, size_t) {
             std::lock_guard<std::mutex> lk(mtx);
@@ -311,7 +412,7 @@ static bool test_jitter_depth_recovers()
         std::cout << "  [depth_recovers] expected " << N << " frames, got " << delivered << '\n';
         return false;
     }
-    if (q.jitter_depth() != fixed_depth || fixed_depth == 0)
+    if (queue_stat_target_depth(q.stats_text()) != fixed_depth || fixed_depth == 0)
     {
         std::cout << "  [depth_recovers] fixed target depth changed unexpectedly\n";
         return false;
@@ -412,7 +513,7 @@ static bool test_jitter_adapt_up_down()
     size_t delivered = 0;
 
     UsrQueueAsync q;
-    const size_t fixed_depth = q.jitter_depth();
+    const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start(
         [&](const uint8_t *, size_t) {
             std::lock_guard<std::mutex> lk(mtx);
@@ -469,7 +570,7 @@ static bool test_jitter_adapt_up_down()
         std::cout << "  [adapt_up_down] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (q.jitter_depth() != fixed_depth || fixed_depth == 0)
+    if (queue_stat_target_depth(q.stats_text()) != fixed_depth || fixed_depth == 0)
     {
         std::cout << "  [adapt_up_down] fixed target depth changed unexpectedly\n";
         return false;
@@ -667,7 +768,7 @@ static bool test_jitter_adaptive_estimation()
     size_t delivered = 0;
 
     UsrQueueAsync q;
-    const size_t fixed_depth = q.jitter_depth();
+    const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start(
         [&](const uint8_t *, size_t) {
             std::lock_guard<std::mutex> lk(mtx);
@@ -722,7 +823,7 @@ static bool test_jitter_adaptive_estimation()
         return false;
     }
 
-    if (q.jitter_depth() != fixed_depth || fixed_depth == 0)
+    if (queue_stat_target_depth(q.stats_text()) != fixed_depth || fixed_depth == 0)
     {
         std::cout << "  [adaptive_estimation] fixed target depth changed unexpectedly\n";
         return false;
@@ -1138,6 +1239,8 @@ static int run_jitter_tests()
         {"in-order delivery preserves order   ", test_jitter_inorder},
         {"reorder: all frames received        ", test_jitter_reorder_complete},
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
+        {"stats snapshot is read-only        ", test_jitter_stats_snapshot_is_read_only},
+        {"in-order prefill is not reorder     ", test_jitter_inorder_prefill_not_reorder},
         {"fixed depth stays stable after reorder", test_jitter_depth_recovers},
         {"window-shuffle: order under fixed depth", test_jitter_window_shuffle},
         {"fixed depth survives mixed phases   ", test_jitter_adapt_up_down},

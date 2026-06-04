@@ -1,6 +1,7 @@
 #ifndef UDP_MEM_H
 #define UDP_MEM_H
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +21,7 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
 
     static_assert(CHUNK_MIN_ORD < CHUNK_MAX_ORD, "CHUNK_MIN_ORD must be less than CHUNK_MAX_ORD");
     static_assert(CHUNK_MIN_ORD >= 6, "CHUNK_MIN_ORD must be greater than 6");
-    static_assert(CHUNK_MAX_ORD <= 16, "CHUNK_MAX_ORD must be less than or equal to 16");
+    static_assert(CHUNK_MAX_ORD <= 17, "CHUNK_MAX_ORD must be less than or equal to 17");
     static constexpr size_t MAX_MEMPOOL_SZ = 2 * 1024 * 1024 * 1024ULL; // 2GB
 
   public:

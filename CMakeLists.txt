@@ -25,7 +25,7 @@ else()
         # -Wshadow
         -Wformat=2
         # -Wconversion
-        -Wnull-dereference
+        # -Wnull-dereference
         -Wunreachable-code
     )
 endif()

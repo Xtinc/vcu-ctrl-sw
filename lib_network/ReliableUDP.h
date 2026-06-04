@@ -188,26 +188,6 @@ struct TRXFrame
 constexpr size_t TRX_HEADER_SIZE = sizeof(TRXUnit::Header);
 constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
 
-class ReliableUDP;
-
-/// @brief Abstract base for user delivery queues.
-///
-/// Concrete implementations differ in how they dispatch received frames to the
-/// application callback:+
-/// - UsrQueueAsync  — background thread with fixed-depth jitter/reorder buffer
-/// - UsrQueueSync   — direct call inside the receive path (no buffering)
-class UsrQueue
-{
-  public:
-    virtual ~UsrQueue() = default;
-
-    virtual void set_owner(ReliableUDP *owner) = 0;
-    virtual void start(RecvCallBack callback, void *user_data) = 0;
-    virtual void stop() = 0;
-    virtual bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) = 0;
-    virtual size_t jitter_depth() const = 0;
-};
-
 /// @brief Asynchronous fixed-depth jitter buffer for fully reassembled frames.
 ///
 /// This queue trades latency for continuity. It keeps a steady frame cushion
@@ -223,10 +203,9 @@ class UsrQueue
 ///  - When a sequence gap blocks delivery, the queue waits for late arrival up
 ///    to a jitter/reorder-aware deadline, then skips the missing span.
 ///
-/// Periodic diagnostics report receive cadence, estimated time jitter,
-/// estimated jitter depth and disorder depth, current/average buffer depth, and
-/// per-window counters.
-class UsrQueueAsync : public UsrQueue
+/// Queue statistics are exposed through stats_text(); reading them never mutates
+/// queue state. Counters reset only when the queue state is reset.
+class UsrQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
 
@@ -234,12 +213,11 @@ class UsrQueueAsync : public UsrQueue
     // Change these defaults directly in code when tuning latency vs. continuity.
     struct Tunables
     {
-        size_t target_depth = 4;
-        size_t startup_depth = 4; // usually keep this equal to target_depth
+        size_t target_depth = 10;
+        size_t startup_depth = 10; // usually keep this equal to target_depth
         size_t max_buffered_frames = 64;
         double stale_timeout_ms = 2000.0;
         double default_frame_interval_ms = 16.0;
-        double stats_interval_ms = 5000.0;
         double depth_feedback_gain = 0.08;
         double min_pacing_factor = 0.70;
         double max_pacing_factor = 1.30;
@@ -253,36 +231,49 @@ class UsrQueueAsync : public UsrQueue
         ClockTP arrival;
     };
 
+    struct Counters
+    {
+        uint64_t recv = 0;
+        uint64_t deliver = 0;
+        uint64_t skip = 0;
+        uint64_t drop = 0;
+        uint64_t duplicate = 0;
+        uint64_t late = 0;
+        uint64_t reorder = 0;
+        uint64_t stale = 0;
+        uint64_t overflow = 0;
+        uint32_t max_disorder_depth = 0;
+    };
+
     static const double MIN_FRAME_INTERVAL_MS;
 
   public:
     UsrQueueAsync();
-    ~UsrQueueAsync() override;
+    ~UsrQueueAsync();
 
-    void set_owner(ReliableUDP *owner) override;
-    void start(RecvCallBack callback, void *user_data) override;
-    void stop() override;
-    bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
-    size_t jitter_depth() const override;
+    void start(RecvCallBack callback, void *user_data);
+    void stop();
+    bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq);
+    std::string stats_text() const;
 
   private:
     void worker_thread();
-        void sanitize_tuning_locked();
-        void reset_state_locked();
-        void drain_locked(std::unique_lock<std::mutex> &lock);
-        void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
-        void update_depth_estimate_locked(double depth);
-        void note_disorder_locked(uint32_t abs_seq);
-        void purge_stale_locked(ClockTP now);
-        void drop_frame_locked(std::list<BufferedFrame>::iterator it);
-        double bootstrap_interval_locked() const;
-        double compute_delivery_interval_locked() const;
-        double compute_gap_wait_ms_locked() const;
-        void deliver_one_locked(std::unique_lock<std::mutex> &lock);
-        void skip_gap_locked(uint32_t next_available_seq);
-        void print_stats_locked(ClockTP now);
+    void sanitize_tuning_locked();
+    void reset_state_locked();
+    void drain_locked(std::unique_lock<std::mutex> &lock);
+    void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
+    void update_depth_estimate_locked(double depth);
+    void note_disorder_locked(uint32_t abs_seq);
+    void purge_stale_locked(ClockTP now);
+    void drop_frame_locked(std::list<BufferedFrame>::iterator it);
+    void release_frame_data(uint8_t *data);
+    double bootstrap_interval_locked() const;
+    double compute_delivery_interval_locked() const;
+    double compute_gap_wait_ms_locked() const;
+    void deliver_one_locked(std::unique_lock<std::mutex> &lock);
+    void skip_gap_locked(uint32_t next_available_seq);
 
-    ReliableUDP *owner_;
+    MemPool<6, 17> frame_pool_;
     RecvCallBack receive_callback_;
 
     std::thread thread_;
@@ -301,43 +292,14 @@ class UsrQueueAsync : public UsrQueue
     bool has_arrival_ref_;
     uint32_t last_rate_seq_;
     ClockTP last_rate_time_;
+    bool has_highest_arrival_seq_;
+    uint32_t highest_arrival_seq_;
     double avg_interval_ms_;
     double jitter_ms_;
     double avg_depth_frames_;
     double disorder_depth_frames_;
-    uint32_t max_disorder_depth_;
-
-    uint64_t stat_recv_;
-    uint64_t stat_deliver_;
-    uint64_t stat_skip_;
-    uint64_t stat_drop_;
-    uint64_t stat_duplicate_;
-    uint64_t stat_late_;
-    uint64_t stat_reorder_;
-    uint64_t stat_stale_;
-    uint64_t stat_overflow_;
-    ClockTP last_stats_time_;
-};
-
-/// @brief Synchronous delivery queue — no buffering, no background thread.
-///
-/// enqueue() calls the application callback directly on the caller's thread
-/// and releases the buffer immediately after the callback returns.
-class UsrQueueSync : public UsrQueue
-{
-  public:
-    UsrQueueSync();
-    ~UsrQueueSync() override = default;
-
-    void set_owner(ReliableUDP *owner) override;
-    void start(RecvCallBack callback, void *user_data) override;
-    void stop() override;
-    bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq) override;
-    size_t jitter_depth() const override { return 0; }
-
-  private:
-    ReliableUDP *owner_;
-    RecvCallBack receive_callback_;
+    double disorder_guard_depth_frames_;
+    Counters counters_;
 };
 
 /**
@@ -385,7 +347,6 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     {
         usr_queue_->start(callback, user_data);
     }
-    void release_recv_buf(uint8_t *p);
     double send_rate();
     double recv_rate();
     double lost_rate();
@@ -394,7 +355,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
     bool is_time_synced() const;
-    size_t jitter_depth() const;
+    std::string queue_stats_text() const;
 
   private:
     void start_receive();
@@ -429,8 +390,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     udp_socket_ptr send_socket_;
     asio::ip::udp::endpoint remote_endpoint_;
     uint8_t *receive_buffer_;
-    MemPool<6, 16> send_pool_;
-    MemPool<6, 16> recv_pool_;
+    MemPool<6, 17> send_pool_;
+    MemPool<6, 17> recv_pool_;
     std::atomic<uint64_t> recv_packets_;
 
     reed_solomon *rs_;
@@ -449,7 +410,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 
-    std::unique_ptr<UsrQueue> usr_queue_;
+    std::unique_ptr<UsrQueueAsync> usr_queue_;
     std::atomic<uint64_t> lost_packets_;
     std::atomic<uint64_t> send_bytes_;
     std::atomic<uint64_t> recv_bytes_;
