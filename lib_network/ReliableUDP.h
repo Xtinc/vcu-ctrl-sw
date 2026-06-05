@@ -60,10 +60,8 @@ struct TRXProbe
     int32_t t2_delta_ms; ///< pong: (int32_t)(receiver_time - t1_ms), range ±2^31 ms; ping: 0.
 };
 
-/// @brief Transmission unit (UDP payload): a fixed-length Header followed by a variable-length data block.
 struct TRXUnit
 {
-    /// @brief Fixed per-packet header, TRX_HEADER_SIZE bytes in total.
     struct Header
     {
         uint16_t frame_seq;      // 2 B - frame sequence number
@@ -111,8 +109,6 @@ struct TRXUnit
     }
 };
 
-/// @brief Receiver-side context that accumulates units belonging to the same group,
-///        tracking a received-unit bitmap and a stale-group timeout timestamp.
 struct TRXGroup
 {
     uint16_t trxunit_cycle;
@@ -148,8 +144,6 @@ struct TRXGroup
     }
 };
 
-/// @brief Receiver-side context that collects reassembled groups belonging to the same frame;
-///        assembles the complete frame once all groups have arrived.
 struct TRXFrame
 {
     using Fragment = std::pair<uint64_t, uint8_t *>;
@@ -240,7 +234,7 @@ class UsrQueueAsync
     UsrQueueAsync();
     ~UsrQueueAsync();
 
-    void start(RecvCallBack callback, void *user_data);
+    void start(RecvCallBack callback);
     void stop();
     bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq);
     std::string stats_text() const;
@@ -332,9 +326,9 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void stop();
     bool add_destination(const std::string &address, unsigned short port);
     bool send(const uint8_t *data, size_t size);
-    void set_receive_callback(RecvCallBack callback, void *user_data = nullptr)
+    void set_receive_callback(RecvCallBack callback)
     {
-        usr_queue_->start(callback, user_data);
+        usr_queue_->start(callback);
     }
     double send_rate();
     double recv_rate();
