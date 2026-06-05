@@ -48,7 +48,7 @@ enum class TRXFECMode
 
 constexpr uint8_t MAGIC_TRX_PROBE_NUMBER = 0xA5;
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
-constexpr size_t MAX_TRX_UDP_SIZE = 131072;
+constexpr size_t MAX_TRX_UDP_SIZE = 65535;
 constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;
 constexpr size_t TRX_RS_FEC_REDUNDANCY = 3;
 constexpr size_t MAX_XOR_PACKET_NUM_PER_GROUP = 1;
@@ -273,7 +273,7 @@ class UsrQueueAsync
     void deliver_one_locked(std::unique_lock<std::mutex> &lock);
     void skip_gap_locked(uint32_t next_available_seq);
 
-    MemPool<6, 17> frame_pool_;
+    MemPool<6, 16> frame_pool_;
     RecvCallBack receive_callback_;
 
     std::thread thread_;
@@ -350,7 +350,6 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     double send_rate();
     double recv_rate();
     double lost_rate();
-    void count_dropped_packet();
 
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
@@ -360,8 +359,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
   private:
     void start_receive();
     void handle_receive(const asio::error_code &error, size_t bytes_transferred);
-    void create_no_fec_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
-                             uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id, uint16_t total_groups);
+
     std::vector<TRXUnit> create_trx_units(const uint8_t *data, size_t size);
     void create_huge_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
                                uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id,
@@ -375,12 +373,9 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void assemble_complete_message(uint16_t frame_seq, uint16_t group_num, uint16_t group_seq, uint8_t *data,
                                    size_t size);
     void generate_uuid();
-    TRXFECMode resolve_fec_mode(size_t packet_size) const;
-
     void schedule_probe();
     void send_probe();
     void handle_probe_packet(const TRXProbe &pkt);
-    static uint32_t get_time_ms();
 
   private:
     std::atomic<bool> running_;
@@ -390,8 +385,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     udp_socket_ptr send_socket_;
     asio::ip::udp::endpoint remote_endpoint_;
     uint8_t *receive_buffer_;
-    MemPool<6, 17> send_pool_;
-    MemPool<6, 17> recv_pool_;
+    MemPool<6, 16> send_pool_;
+    MemPool<6, 16> recv_pool_;
     std::atomic<uint64_t> recv_packets_;
 
     reed_solomon *rs_;

@@ -513,7 +513,7 @@ void EncMgr::loop_thread_func()
 
     while (state != State::Stopping)
     {
-        State next;
+        State next{};
         switch (state)
         {
         case State::Opening:

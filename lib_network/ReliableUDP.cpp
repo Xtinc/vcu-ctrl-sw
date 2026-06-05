@@ -20,6 +20,12 @@ struct FECLayout
     uint8_t fec_packets_count;
 };
 
+static inline uint32_t get_time_ms()
+{
+    using namespace std::chrono;
+    return static_cast<uint32_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
 static double calc_rate_bps(std::atomic<uint64_t> &total_bytes, std::mutex &rate_mutex,
                             std::chrono::steady_clock::time_point &last_time, uint64_t &last_bytes)
 {
@@ -755,11 +761,6 @@ double ReliableUDP::lost_rate()
     return real_lost_rate;
 }
 
-void ReliableUDP::count_dropped_packet()
-{
-    lost_packets_.fetch_add(1, std::memory_order_relaxed);
-}
-
 int64_t ReliableUDP::rtt_ms() const
 {
     return rtt_ms_.load(std::memory_order_relaxed);
@@ -963,49 +964,9 @@ void ReliableUDP::create_small_rtx_group(std::vector<TRXUnit> &all_units, const 
     all_units.push_back(redundant_unit);
 }
 
-void ReliableUDP::create_no_fec_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
-                                      uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id,
-                                      uint16_t total_groups)
-{
-    TRXUnit unit;
-    unit.head.group_seq = current_group_id;
-    unit.head.units_idx = 0;
-    unit.head.units_num = 1;
-    unit.head.group_len = static_cast<uint16_t>(current_group_size);
-    unit.head.frame_seq = current_frame_id;
-    unit.head.group_num = total_groups;
-    unit.head.units_len = static_cast<uint16_t>(current_group_size);
-    unit.head.conn_uuid = uid;
-    unit.head.check_sum = TRXUnit::adler_8(&unit.head);
-
-    unit.data = static_cast<uint8_t *>(send_pool_.allocate(current_group_size));
-    memcpy(unit.data, data, current_group_size);
-
-    all_units.push_back(unit);
-}
-
-TRXFECMode ReliableUDP::resolve_fec_mode(size_t packet_size) const
-{
-    return packet_size > MAX_TRX_DATA_SIZE ? TRXFECMode::RS : TRXFECMode::XOR;
-}
-
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
 {
-    const TRXFECMode fec_mode = resolve_fec_mode(size);
-
-    size_t max_group_data_size;
-    switch (fec_mode)
-    {
-    case TRXFECMode::RS:
-        max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
-        break;
-    case TRXFECMode::XOR:
-    case TRXFECMode::None:
-    default:
-        max_group_data_size = MAX_TRX_DATA_SIZE;
-        break;
-    }
-
+    constexpr auto max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
     const size_t total_groups = (size + max_group_data_size - 1) / max_group_data_size;
 
     std::vector<TRXUnit> all_units;
@@ -1019,21 +980,15 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
         size_t remaining_size = size - offset;
         size_t current_group_size = std::min(remaining_size, max_group_data_size);
 
-        switch (fec_mode)
+        if (current_group_size > MAX_TRX_DATA_SIZE)
         {
-        case TRXFECMode::RS:
             create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                   static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
-            break;
-        case TRXFECMode::XOR:
+        }
+        else
+        {
             create_small_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                    static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
-            break;
-        case TRXFECMode::None:
-        default:
-            create_no_fec_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
-                                static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
-            break;
         }
 
         offset += current_group_size;
@@ -1396,12 +1351,6 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
         VIDEO_ERROR_PRINT("Error occurred while sending data: %s", e.what());
         return false;
     }
-}
-
-uint32_t ReliableUDP::get_time_ms()
-{
-    using namespace std::chrono;
-    return static_cast<uint32_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
 void ReliableUDP::send_probe()
