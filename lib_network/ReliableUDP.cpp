@@ -5,20 +5,20 @@
 #include <iomanip>
 #include <pthread.h>
 #include <sstream>
+#include <tuple>
 
 using asio::ip::udp;
 
-// UsrQueueAsync static member definitions
-const double UsrQueueAsync::MIN_FRAME_INTERVAL_MS = 1.0;
+constexpr static auto MIN_FRAME_INTERVAL_MS = 1.0;
+constexpr static auto TRX_RS_FEC_GROUP_UNIT_NUMS = MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY;
+constexpr static auto TRX_XOR_FEC_GROUP_UNIT_NUMS = MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY;
 
 static std::once_flag fec_init_flag;
 
-struct FECLayout
+template <typename T> static T clamp_value(const T value, const T low, const T high)
 {
-    TRXFECMode mode;
-    uint8_t data_packets_count;
-    uint8_t fec_packets_count;
-};
+    return std::max(low, std::min(value, high));
+}
 
 static inline uint32_t get_time_ms()
 {
@@ -45,26 +45,6 @@ static double calc_rate_bps(std::atomic<uint64_t> &total_bytes, std::mutex &rate
     last_bytes = current_bytes;
 
     return static_cast<double>(delta_bytes) * 8.0 / elapsed_seconds;
-}
-
-template <typename T> static T clamp_value(const T value, const T low, const T high)
-{
-    return std::max(low, std::min(value, high));
-}
-
-static FECLayout resolve_fec_layout(uint8_t units_num)
-{
-    switch (units_num)
-    {
-    case 1:
-        return {TRXFECMode::None, 1, 0};
-    case 2:
-        return {TRXFECMode::XOR, 1, 1};
-    case MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY:
-        return {TRXFECMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
-    default:
-        return {TRXFECMode::RS, MAX_RS_PACKET_NUM_PER_GROUP, TRX_RS_FEC_REDUNDANCY};
-    }
 }
 
 void set_current_thread_scheduler_policy()
@@ -970,7 +950,6 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
     const size_t total_groups = (size + max_group_data_size - 1) / max_group_data_size;
 
     std::vector<TRXUnit> all_units;
-
     size_t offset = 0;
     uint16_t current_frame_id = next_frame_id_++;
     uint16_t current_group_id = (next_group_id_ >= 0xffffu - MAX_GROUP_NUM_PER_FRAME) ? 0 : next_group_id_;
@@ -1011,98 +990,118 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
     }
     last_group_id_ = seq;
 
-    if (unit.data)
+    if (!unit.data)
     {
-        auto it = std::find_if(receive_groups_.begin(), receive_groups_.end(), [seq, uid, this](const TRXGroup &group) {
-            return group.trxuint_guuid == uid && group.trxunit_group == seq && group.trxunit_cycle == group_cycle_;
-        });
+        return;
+    }
 
-        if (it == receive_groups_.end())
+    auto it = std::find_if(receive_groups_.begin(), receive_groups_.end(), [seq, uid, this](const TRXGroup &group) {
+        return group.trxuint_guuid == uid && group.trxunit_group == seq && group.trxunit_cycle == group_cycle_;
+    });
+
+    if (it == receive_groups_.end())
+    {
+        TRXGroup new_group;
+        new_group.trxunit_cycle = group_cycle_;
+        new_group.trxunit_group = seq;
+        new_group.trxuint_guuid = uid;
+        new_group.trxunit_recvd = 0;
+        new_group.timestamp = now;
+        receive_groups_.push_front(new_group);
+        it = receive_groups_.begin();
+        recv_packets_ += unit.head.units_num;
+    }
+
+    auto units_num = it->units.empty() ? static_cast<uint8_t>(unit.head.units_num)
+                                       : static_cast<uint8_t>(it->units.front().head.units_num);
+
+    if (it->has_received(idx))
+    {
+        recv_pool_.deallocate(unit.data);
+        return;
+    }
+
+    if (units_num != TRX_RS_FEC_GROUP_UNIT_NUMS || units_num != TRX_XOR_FEC_GROUP_UNIT_NUMS)
+    {
+        VIDEO_ERROR_PRINT("Unsupported units_num %u for group (%u,%u)", units_num, it->trxunit_cycle,
+                          it->trxunit_group);
+        recv_pool_.deallocate(unit.data);
+    }
+
+    if (!it->units.empty() && units_num != static_cast<uint8_t>(unit.head.units_num))
+    {
+        VIDEO_ERROR_PRINT("Inconsistent units_num for group (%u,%u)", it->trxunit_cycle, it->trxunit_group);
+        recv_pool_.deallocate(unit.data);
+        return;
+    }
+
+    it->set_received(idx);
+
+    auto data_packets_count = 0;
+    bool use_rs_fec = false;
+
+    if (units_num == TRX_RS_FEC_GROUP_UNIT_NUMS)
+    {
+        data_packets_count = MAX_RS_PACKET_NUM_PER_GROUP;
+        use_rs_fec = true;
+    }
+    else
+    {
+        data_packets_count = MAX_XOR_PACKET_NUM_PER_GROUP;
+    }
+
+    auto it_recv_count = it->received_cnt();
+    if (it_recv_count < data_packets_count)
+    {
+        it->units.push_back(unit);
+    }
+    else if (it_recv_count == data_packets_count)
+    {
+        it->units.push_back(unit);
+        auto sentinel = it->units.front();
+        sentinel.data = nullptr;
+        if (use_rs_fec)
         {
-            TRXGroup new_group;
-            new_group.trxunit_cycle = group_cycle_;
-            new_group.trxunit_group = seq;
-            new_group.trxuint_guuid = uid;
-            new_group.trxunit_recvd = 0;
-            new_group.timestamp = now;
-            receive_groups_.push_front(new_group);
-            it = receive_groups_.begin();
-            recv_packets_ += unit.head.units_num;
-        }
-
-        auto units_num = it->units.empty() ? static_cast<uint8_t>(unit.head.units_num)
-                                           : static_cast<uint8_t>(it->units.front().head.units_num);
-
-        if (it->has_received(idx))
-        {
-            recv_pool_.deallocate(unit.data);
-            return;
-        }
-
-        if (!it->units.empty() && units_num != static_cast<uint8_t>(unit.head.units_num))
-        {
-            VIDEO_ERROR_PRINT("Inconsistent units_num for group (%u,%u)", it->trxunit_cycle, it->trxunit_group);
-            recv_pool_.deallocate(unit.data);
-            return;
-        }
-
-        it->set_received(idx);
-
-        auto layout = resolve_fec_layout(units_num);
-        auto data_packets_count = layout.data_packets_count;
-
-        auto it_recv_count = it->received_cnt();
-        if (it_recv_count < data_packets_count)
-        {
-            it->units.push_back(unit);
-        }
-        else if (it_recv_count == data_packets_count)
-        {
-            it->units.push_back(unit);
-            auto sentinel = it->units.front();
-            sentinel.data = nullptr;
-            if (layout.mode != TRXFECMode::RS)
-            {
-                assemble_complete_message(unit.head.frame_seq, unit.head.group_num, unit.head.group_seq, unit.data,
-                                          unit.head.group_len);
-            }
-            else
-            {
-                auto units_copy = std::move(it->units);
-                try_recover_group(units_copy, data_packets_count);
-            }
-            it->units.clear();
-            it->units.push_back(sentinel);
-        }
-        else if (it_recv_count == unit.head.units_num)
-        {
-            recv_pool_.deallocate(unit.data);
-            receive_groups_.erase(it);
+            auto units_copy = std::move(it->units);
+            try_recover_group(units_copy, data_packets_count);
         }
         else
         {
-            recv_pool_.deallocate(unit.data);
+            assemble_complete_message(unit.head.frame_seq, unit.head.group_num, unit.head.group_seq, unit.data,
+                                      unit.head.group_len);
         }
+        it->units.clear();
+        it->units.push_back(sentinel);
+    }
+    else if (it_recv_count == unit.head.units_num)
+    {
+        recv_pool_.deallocate(unit.data);
+        receive_groups_.erase(it);
+    }
+    else
+    {
+        recv_pool_.deallocate(unit.data);
+    }
 
-        while (!receive_groups_.empty() && now - receive_groups_.back().timestamp > std::chrono::seconds(3))
+    while (!receive_groups_.empty() && now - receive_groups_.back().timestamp > std::chrono::seconds(3))
+    {
+        auto &oldest_group = receive_groups_.back();
+        auto recv_cnt = oldest_group.received_cnt();
+        auto oldest_units_num = oldest_group.units.empty()
+                                    ? static_cast<uint8_t>(0)
+                                    : static_cast<uint8_t>(oldest_group.units.front().head.units_num);
+        auto oldest_layout_num =
+            oldest_units_num == TRX_RS_FEC_GROUP_UNIT_NUMS ? TRX_RS_FEC_GROUP_UNIT_NUMS : TRX_XOR_FEC_GROUP_UNIT_NUMS;
+
+        lost_packets_ +=
+            static_cast<uint64_t>(oldest_layout_num - recv_cnt);
+
+        for (auto &u : oldest_group.units)
         {
-            auto &oldest_group = receive_groups_.back();
-            auto recv_cnt = oldest_group.received_cnt();
-            auto oldest_units_num = oldest_group.units.empty()
-                                        ? static_cast<uint8_t>(0)
-                                        : static_cast<uint8_t>(oldest_group.units.front().head.units_num);
-            auto oldest_layout = resolve_fec_layout(oldest_units_num);
-
-            lost_packets_ +=
-                static_cast<uint64_t>(oldest_layout.data_packets_count + oldest_layout.fec_packets_count - recv_cnt);
-
-            for (auto &u : oldest_group.units)
-            {
-                recv_pool_.deallocate(u.data);
-            }
-
-            receive_groups_.pop_back();
+            recv_pool_.deallocate(u.data);
         }
+
+        receive_groups_.pop_back();
     }
 }
 

@@ -39,13 +39,6 @@ class BackgroundService
 
 using RecvCallBack = std::function<void(const uint8_t *data, size_t size)>;
 
-enum class TRXFECMode
-{
-    None,
-    XOR,
-    RS,
-};
-
 constexpr uint8_t MAGIC_TRX_PROBE_NUMBER = 0xA5;
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
 constexpr size_t MAX_TRX_UDP_SIZE = 65535;
@@ -188,33 +181,31 @@ struct TRXFrame
 constexpr size_t TRX_HEADER_SIZE = sizeof(TRXUnit::Header);
 constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
 
-/// @brief Asynchronous fixed-depth jitter buffer for fully reassembled frames.
-///
-/// This queue trades latency for continuity. It keeps a steady frame cushion
-/// near its configured target depth, reorders buffered frames by absolute
-/// sequence number, and feeds the decoder at the long-term average receive cadence.
-///
-/// Behaviour model:
-///  - Startup prefill waits until the configured startup depth is buffered.
-///  - Normal delivery is paced by a long-term receive-interval estimator.
-///  - Occupancy feedback nudges the delivery interval so buffered depth stays
-///    near the configured target depth instead of draining to zero or growing
-///    unbounded.
-///  - When a sequence gap blocks delivery, the queue waits for late arrival up
-///    to a jitter/reorder-aware deadline, then skips the missing span.
-///
-/// Queue statistics are exposed through stats_text(); reading them never mutates
-/// queue state. Counters reset only when the queue state is reset.
+/** @brief Asynchronous fixed-depth jitter buffer for fully reassembled frames.
+ *
+ * This queue trades latency for continuity. It keeps a steady frame cushion
+ * near its configured target depth, reorders buffered frames by absolute
+ * sequence number, and feeds the decoder at the long-term average receive cadence.
+ *
+ * Behaviour model:
+ *  - Startup prefill waits until the configured startup depth is buffered.
+ *  - Normal delivery is paced by a long-term receive-interval estimator.
+ *  - Occupancy feedback nudges the delivery interval so buffered depth stays
+ *    near the configured target depth instead of draining to zero or growing
+ *    unbounded.
+ *  - When a sequence gap blocks delivery, the queue waits for late arrival up
+ *    to a jitter/reorder-aware deadline, then skips the missing span.
+ *
+ * Queue statistics are exposed through stats_text(); reading them never mutates
+ * queue state. Counters reset only when the queue state is reset.
+ */
 class UsrQueueAsync
 {
-    using ClockTP = std::chrono::steady_clock::time_point;
-
-    // Internal tuning block for on-site manual adjustment.
-    // Change these defaults directly in code when tuning latency vs. continuity.
+    using ClockTP = ClockEntry::ClockTP;
     struct Tunables
     {
         size_t target_depth = 10;
-        size_t startup_depth = 10; // usually keep this equal to target_depth
+        size_t startup_depth = 10;
         size_t max_buffered_frames = 64;
         double stale_timeout_ms = 2000.0;
         double default_frame_interval_ms = 16.0;
@@ -244,8 +235,6 @@ class UsrQueueAsync
         uint64_t overflow = 0;
         uint32_t max_disorder_depth = 0;
     };
-
-    static const double MIN_FRAME_INTERVAL_MS;
 
   public:
     UsrQueueAsync();
