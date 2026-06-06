@@ -1572,11 +1572,15 @@ static void run_fec_test(const TestConfig &cfg)
         hdr.payload_crc = adler32_compute(payload_ptr, payload_size);
         std::memcpy(msg_buf.data(), &hdr, TEST_HDR_SIZE);
 
+        auto now = std::chrono::steady_clock::now();
         if (sender->send(msg_buf.data(), total_size))
         {
             state.send_count++;
             seq++;
         }
+
+        auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - now).count();
+        VIDEO_INFO_PRINT("Sent seq=%u  payload=%zu bytes  elapsed=%.2f us", hdr.seq, payload_size, elapsed);
     }
 
     {
