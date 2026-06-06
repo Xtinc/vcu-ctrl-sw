@@ -190,11 +190,12 @@ int main(int argc, char *argv[])
         cfg.height = cmds.front().height;
         cfg.chroma_mode = (fourcc == FOURCC(NV12)) ? AL_CHROMA_4_2_0 : AL_CHROMA_4_2_2;
 
-        auto encoder = std::make_unique<RTEncoderFile>(cfg, [&](const uint8_t *pData, size_t size, bool) {
-            VIDEO_INFO_PRINT("[%6u] size: %6zu bytes", totalEncodedUnits, size);
-            outFile.write(reinterpret_cast<const char *>(pData), size);
-            ++totalEncodedUnits;
-        });
+        auto encoder =
+            std::make_unique<RTEncoderFile>(cfg, [&](const uint8_t *pData, size_t size, uint32_t, uint32_t, bool) {
+                VIDEO_INFO_PRINT("[%6u] size: %6zu bytes", totalEncodedUnits, size);
+                outFile.write(reinterpret_cast<const char *>(pData), size);
+                ++totalEncodedUnits;
+            });
 
         uint16_t current_width = cfg.width;
         uint16_t current_height = cfg.height;

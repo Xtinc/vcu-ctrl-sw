@@ -3,7 +3,7 @@
 #include "V4L2Source.h"
 #include "lib_network/ReliableUDP.h"
 
-static char send_buffer[MAX_TRX_UDP_SIZE];
+static uint8_t send_buffer[MAX_TRX_UDP_SIZE];
 
 static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> weak_udp)
 {
@@ -12,7 +12,7 @@ static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> 
         return {};
     }
 
-    return [weak_udp, send_buf](const uint8_t *data, size_t size, uint32_t frame_idx, uint32_t slice_num, bool eof) {
+    return [weak_udp](const uint8_t *data, size_t size, uint32_t frame_idx, uint32_t slice_num, bool eof) {
         auto udp = weak_udp.lock();
         if (!udp)
         {
