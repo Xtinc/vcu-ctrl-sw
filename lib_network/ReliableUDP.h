@@ -236,6 +236,7 @@ class UsrQueueAsync
 
     void start(RecvCallBack callback);
     void stop();
+    void reset();
     bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq);
     std::string stats_text() const;
 
@@ -243,6 +244,7 @@ class UsrQueueAsync
     void worker_thread();
     void sanitize_tuning_locked();
     void reset_state_locked();
+    void clear_buffered_frames_locked();
     void drain_locked(std::unique_lock<std::mutex> &lock);
     void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
     void update_depth_estimate_locked(double depth);
@@ -352,6 +354,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
                                 uint16_t total_groups);
 
     void process_received_unit(const TRXUnit &unit);
+    void reset_receive_state_for_new_epoch(uint16_t uid);
     void try_recover_group(std::vector<TRXUnit> &units, uint8_t data_packets_count);
     void assemble_complete_message(uint16_t frame_seq, uint16_t group_num, uint16_t group_seq, uint8_t *data,
                                    size_t size);
@@ -376,6 +379,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
 
     asio::ip::udp::endpoint target_endpoint_;
     uint16_t target_uid_;
+    bool has_active_conn_uuid_;
+    uint16_t active_conn_uuid_;
     bool destination_set_;
     std::mutex target_mutex_;
 

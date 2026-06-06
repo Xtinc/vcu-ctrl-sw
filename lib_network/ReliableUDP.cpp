@@ -129,7 +129,7 @@ void UsrQueueAsync::sanitize_tuning_locked()
 
 void UsrQueueAsync::reset_state_locked()
 {
-    buffered_frames_.clear();
+    clear_buffered_frames_locked();
     primed_ = false;
     expected_seq_ = 0;
     next_delivery_time_ = ClockTP{};
@@ -147,6 +147,15 @@ void UsrQueueAsync::reset_state_locked()
     disorder_depth_frames_ = 0.0;
     disorder_guard_depth_frames_ = 0.0;
     counters_ = Counters{};
+}
+
+void UsrQueueAsync::clear_buffered_frames_locked()
+{
+    for (auto &frame : buffered_frames_)
+    {
+        release_frame_data(frame.data);
+    }
+    buffered_frames_.clear();
 }
 
 void UsrQueueAsync::start(RecvCallBack callback)
@@ -171,6 +180,15 @@ void UsrQueueAsync::stop()
     cond_.notify_all();
     if (thread_.joinable())
         thread_.join();
+}
+
+void UsrQueueAsync::reset()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reset_state_locked();
+    }
+    cond_.notify_all();
 }
 
 void UsrQueueAsync::update_depth_estimate_locked(double depth)
@@ -361,6 +379,8 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         return false;
     }
 
+    purge_stale_locked(arrival);
+
     auto *queued_data = static_cast<uint8_t *>(frame_pool_.allocate(size));
     if (!queued_data)
         return false;
@@ -370,8 +390,6 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     update_estimators_locked(abs_seq, arrival);
     note_disorder_locked(abs_seq);
     update_depth_estimate_locked(static_cast<double>(buffered_frames_.size()));
-
-    purge_stale_locked(arrival);
 
     while (buffered_frames_.size() > tuning_.max_buffered_frames)
     {
@@ -568,12 +586,13 @@ void UsrQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
 // ReliableUDP implementation
 ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port)
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
-      send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), destination_set_(false),
-      frame_cycle_(1), group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
-      usr_queue_(std::make_unique<UsrQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
-      last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
-      last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
-      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0)
+      send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), has_active_conn_uuid_(false),
+      active_conn_uuid_(0), destination_set_(false), frame_cycle_(1), group_cycle_(1), next_group_id_(1),
+      next_frame_id_(1), last_frame_id_(0), last_group_id_(0), usr_queue_(std::make_unique<UsrQueueAsync>()),
+      lost_packets_(0), send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
+      last_recv_rate_time_(std::chrono::steady_clock::now()), last_lost_rate_time_(std::chrono::steady_clock::now()),
+      last_send_rate_bytes_(0), last_recv_rate_bytes_(0), probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0),
+      time_synced_(false), probe_seq_(0)
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -981,7 +1000,23 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
     auto idx = static_cast<size_t>(unit.head.units_idx);
     auto now = std::chrono::steady_clock::now();
 
-    if (last_group_id_ > 3 * 0xffffu / 4 && seq < 0xffffu / 4)
+    if (!has_active_conn_uuid_)
+    {
+        has_active_conn_uuid_ = true;
+        active_conn_uuid_ = uid;
+    }
+    else if (uid != active_conn_uuid_)
+    {
+        reset_receive_state_for_new_epoch(uid);
+    }
+
+    const bool normal_wrap = last_group_id_ > 3 * 0xffffu / 4 && seq < 0xffffu / 4;
+    if (uid == active_conn_uuid_ && last_group_id_ > seq && !normal_wrap)
+    {
+        reset_receive_state_for_new_epoch(uid);
+    }
+
+    if (normal_wrap)
     {
         group_cycle_++;
     }
@@ -1099,6 +1134,37 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
 
         receive_groups_.pop_back();
     }
+}
+
+void ReliableUDP::reset_receive_state_for_new_epoch(uint16_t uid)
+{
+    VIDEO_INFO_PRINT("Remote stream epoch changed: %u -> %u, reset receive state", active_conn_uuid_, uid);
+
+    for (auto &group : receive_groups_)
+    {
+        for (auto &unit : group.units)
+        {
+            if (unit.data)
+                recv_pool_.deallocate(unit.data);
+        }
+    }
+    receive_groups_.clear();
+
+    for (auto &frame : receive_frames_)
+    {
+        for (const auto &fragment : frame.fragments)
+        {
+            recv_pool_.deallocate(fragment.second);
+        }
+    }
+    receive_frames_.clear();
+
+    active_conn_uuid_ = uid;
+    frame_cycle_ = 1;
+    group_cycle_ = 1;
+    last_frame_id_ = 0;
+    last_group_id_ = 0;
+    usr_queue_->reset();
 }
 
 void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_packets_count)
