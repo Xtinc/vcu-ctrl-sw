@@ -136,15 +136,13 @@ static bool test_jitter_inorder()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            received.push_back(v);
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        received.push_back(v);
+        cv.notify_one();
+    });
 
     for (uint32_t i = 0; i < N; i++)
     {
@@ -184,15 +182,13 @@ static bool test_jitter_reorder_complete()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            received.push_back(v);
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        received.push_back(v);
+        cv.notify_one();
+    });
 
     for (uint32_t i = 0; i < N; i += 2)
     {
@@ -238,15 +234,13 @@ static bool test_jitter_no_duplicates()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            received.push_back(v);
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        received.push_back(v);
+        cv.notify_one();
+    });
 
     for (uint32_t i = 0; i < N; i++)
     {
@@ -287,7 +281,7 @@ static bool test_jitter_stats_snapshot_is_read_only()
     std::memcpy(buf.data(), &value, 4);
 
     UsrQueueAsync q;
-    q.start([](const uint8_t *, size_t) {}, nullptr);
+    q.start([](const uint8_t *, size_t) {});
 
     bool ok = true;
     ok = ok && q.enqueue(buf.data(), buf.size(), 0);
@@ -320,7 +314,7 @@ static bool test_jitter_inorder_prefill_not_reorder()
         std::memcpy(bufs[i].data(), &i, 4);
 
     UsrQueueAsync q;
-    q.start([](const uint8_t *, size_t) {}, nullptr);
+    q.start([](const uint8_t *, size_t) {});
 
     for (uint32_t i = 0; i < N; i++)
     {
@@ -359,13 +353,11 @@ static bool test_jitter_depth_recovers()
 
     UsrQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
-    q.start(
-        [&](const uint8_t *, size_t) {
-            std::lock_guard<std::mutex> lk(mtx);
-            ++delivered;
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    });
 
     // Phase 1: 100 pairwise-swapped frames to push disorder up.
     constexpr uint32_t PHASE1 = 100;
@@ -442,15 +434,13 @@ static bool test_jitter_window_shuffle()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            received.push_back(v);
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        received.push_back(v);
+        cv.notify_one();
+    });
 
     std::mt19937 rng(0xCAFEBEEF);
     for (uint32_t base = 0; base < N; base += WINDOW)
@@ -514,13 +504,11 @@ static bool test_jitter_adapt_up_down()
 
     UsrQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
-    q.start(
-        [&](const uint8_t *, size_t) {
-            std::lock_guard<std::mutex> lk(mtx);
-            ++delivered;
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    });
 
     // Phase 1: window-shuffle disorder.
     std::mt19937 rng(0xDEADC0DE);
@@ -595,15 +583,13 @@ static bool test_jitter_permanent_gap()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            received.push_back(v);
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        received.push_back(v);
+        cv.notify_one();
+    });
 
     for (uint32_t i = 0; i < N; i++)
         if (i != SKIP)
@@ -658,7 +644,7 @@ static bool test_jitter_timing_uniformity()
 {
     constexpr uint32_t N = 120;
     constexpr double SEND_INTERVAL_MS = 8.0; // nominal 125 fps (fast enough to finish quickly)
-    constexpr double JITTER_MS = 12.0;        // ±12 ms jitter — well above one frame interval
+    constexpr double JITTER_MS = 12.0;       // ±12 ms jitter — well above one frame interval
     constexpr uint32_t WINDOW = 2;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
@@ -672,13 +658,11 @@ static bool test_jitter_timing_uniformity()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *, size_t) {
-            std::lock_guard<std::mutex> lk(mtx);
-            ts.push_back(std::chrono::steady_clock::now());
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ts.push_back(std::chrono::steady_clock::now());
+        cv.notify_one();
+    });
 
     // Send frames window-shuffled, each delayed by nominal interval ± jitter.
     std::mt19937 rng(0xABCD1234);
@@ -696,8 +680,7 @@ static bool test_jitter_timing_uniformity()
             double delay_ms = SEND_INTERVAL_MS + jdist(rng);
             if (delay_ms < 1.0)
                 delay_ms = 1.0;
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
             if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(1000)))
             {
                 q.stop();
@@ -722,8 +705,7 @@ static bool test_jitter_timing_uniformity()
     std::vector<double> intervals;
     intervals.reserve(N - 1);
     for (size_t i = 1; i < ts.size(); i++)
-        intervals.push_back(
-            std::chrono::duration<double, std::milli>(ts[i] - ts[i - 1]).count());
+        intervals.push_back(std::chrono::duration<double, std::milli>(ts[i] - ts[i - 1]).count());
 
     const double mean = [&] {
         double s = 0;
@@ -740,8 +722,8 @@ static bool test_jitter_timing_uniformity()
     const double stddev = std::sqrt(var);
     const double cv_val = (mean > 0.0) ? stddev / mean : 999.0;
 
-    std::cout << "  [timing_uniformity] mean_interval=" << std::fixed << std::setprecision(2)
-              << mean << "ms  stddev=" << stddev << "ms  CV=" << cv_val << "\n";
+    std::cout << "  [timing_uniformity] mean_interval=" << std::fixed << std::setprecision(2) << mean
+              << "ms  stddev=" << stddev << "ms  CV=" << cv_val << "\n";
 
     if (cv_val >= 0.50)
     {
@@ -769,13 +751,11 @@ static bool test_jitter_adaptive_estimation()
 
     UsrQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
-    q.start(
-        [&](const uint8_t *, size_t) {
-            std::lock_guard<std::mutex> lk(mtx);
-            ++delivered;
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    });
 
     // Phase 1: high timing jitter with consecutive sequence numbers.
     // This directly exercises the jitter_ms_/recv_interval_ms estimator path.
@@ -843,11 +823,11 @@ static bool test_jitter_adaptive_estimation()
 /// Additionally verifies strict monotone ordering of all delivered frames.
 static bool test_jitter_bimodal_jitter_uniformity()
 {
-    constexpr uint32_t N        = 160;
-    constexpr uint32_t WINDOW   = 8;
-    constexpr double   FAST_MS  = 2.0;
-    constexpr double   SLOW_MS  = 30.0;
-    constexpr double   CV_LIMIT = 0.60;
+    constexpr uint32_t N = 160;
+    constexpr uint32_t WINDOW = 8;
+    constexpr double FAST_MS = 2.0;
+    constexpr double SLOW_MS = 30.0;
+    constexpr double CV_LIMIT = 0.60;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
     for (uint32_t i = 0; i < N; i++)
@@ -861,16 +841,14 @@ static bool test_jitter_bimodal_jitter_uniformity()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            ts.push_back(std::chrono::steady_clock::now());
-            received_seqs.push_back(v);
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        ts.push_back(std::chrono::steady_clock::now());
+        received_seqs.push_back(v);
+        cv.notify_one();
+    });
 
     std::mt19937 rng(0xF00DCAFE);
     uint32_t send_count = 0;
@@ -887,8 +865,7 @@ static bool test_jitter_bimodal_jitter_uniformity()
             // Bimodal delay: alternate fast/slow regardless of shuffle order.
             const double delay_ms = (send_count % 2 == 0) ? FAST_MS : SLOW_MS;
             ++send_count;
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
             if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(2000)))
             {
                 q.stop();
@@ -914,8 +891,8 @@ static bool test_jitter_bimodal_jitter_uniformity()
     {
         if (received_seqs[i] < received_seqs[i - 1])
         {
-            std::cout << "  [bimodal_jitter] order violation at index " << i
-                      << ": seq " << received_seqs[i] << " after " << received_seqs[i - 1] << '\n';
+            std::cout << "  [bimodal_jitter] order violation at index " << i << ": seq " << received_seqs[i]
+                      << " after " << received_seqs[i - 1] << '\n';
             return false;
         }
     }
@@ -928,24 +905,25 @@ static bool test_jitter_bimodal_jitter_uniformity()
 
     const double mean = [&] {
         double s = 0;
-        for (double v : intervals) s += v;
+        for (double v : intervals)
+            s += v;
         return s / static_cast<double>(intervals.size());
     }();
     const double var = [&] {
         double s = 0;
-        for (double v : intervals) s += (v - mean) * (v - mean);
+        for (double v : intervals)
+            s += (v - mean) * (v - mean);
         return s / static_cast<double>(intervals.size());
     }();
     const double stddev = std::sqrt(var);
     const double cv_out = (mean > 0.0) ? stddev / mean : 999.0;
 
-    std::cout << "  [bimodal_jitter] mean=" << std::fixed << std::setprecision(2)
-              << mean << "ms  stddev=" << stddev << "ms  CV=" << cv_out << '\n';
+    std::cout << "  [bimodal_jitter] mean=" << std::fixed << std::setprecision(2) << mean << "ms  stddev=" << stddev
+              << "ms  CV=" << cv_out << '\n';
 
     if (cv_out >= CV_LIMIT)
     {
-        std::cout << "  [bimodal_jitter] CV=" << cv_out << " >= " << CV_LIMIT
-                  << " — output is too bursty\n";
+        std::cout << "  [bimodal_jitter] CV=" << cv_out << " >= " << CV_LIMIT << " — output is too bursty\n";
         return false;
     }
     return true;
@@ -963,11 +941,11 @@ static bool test_jitter_bimodal_jitter_uniformity()
 /// Also verifies strict monotone delivery order.
 static bool test_jitter_burst_silence_uniformity()
 {
-    constexpr uint32_t BURST_COUNT  = 8;
-    constexpr uint32_t BURST_SIZE   = 12;
-    constexpr uint32_t N            = BURST_COUNT * BURST_SIZE; // 96 frames
-    constexpr double   SILENCE_MS   = 80.0;  // inter-burst gap
-    constexpr double   CV_LIMIT     = 0.60;
+    constexpr uint32_t BURST_COUNT = 8;
+    constexpr uint32_t BURST_SIZE = 12;
+    constexpr uint32_t N = BURST_COUNT * BURST_SIZE; // 96 frames
+    constexpr double SILENCE_MS = 80.0;              // inter-burst gap
+    constexpr double CV_LIMIT = 0.60;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
     for (uint32_t i = 0; i < N; i++)
@@ -981,16 +959,14 @@ static bool test_jitter_burst_silence_uniformity()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            ts.push_back(std::chrono::steady_clock::now());
-            received_seqs.push_back(v);
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        ts.push_back(std::chrono::steady_clock::now());
+        received_seqs.push_back(v);
+        cv.notify_one();
+    });
 
     std::mt19937 rng(0xBEEFCAFE);
     for (uint32_t b = 0; b < BURST_COUNT; b++)
@@ -1012,8 +988,7 @@ static bool test_jitter_burst_silence_uniformity()
         }
         // Silence between bursts (skip after last burst).
         if (b + 1 < BURST_COUNT)
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(static_cast<int64_t>(SILENCE_MS * 1000.0)));
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(SILENCE_MS * 1000.0)));
     }
 
     {
@@ -1033,8 +1008,8 @@ static bool test_jitter_burst_silence_uniformity()
     {
         if (received_seqs[i] < received_seqs[i - 1])
         {
-            std::cout << "  [burst_silence] order violation at index " << i
-                      << ": seq " << received_seqs[i] << " after " << received_seqs[i - 1] << '\n';
+            std::cout << "  [burst_silence] order violation at index " << i << ": seq " << received_seqs[i] << " after "
+                      << received_seqs[i - 1] << '\n';
             return false;
         }
     }
@@ -1047,12 +1022,14 @@ static bool test_jitter_burst_silence_uniformity()
 
     const double mean = [&] {
         double s = 0;
-        for (double v : intervals) s += v;
+        for (double v : intervals)
+            s += v;
         return s / static_cast<double>(intervals.size());
     }();
     const double var = [&] {
         double s = 0;
-        for (double v : intervals) s += (v - mean) * (v - mean);
+        for (double v : intervals)
+            s += (v - mean) * (v - mean);
         return s / static_cast<double>(intervals.size());
     }();
     const double stddev = std::sqrt(var);
@@ -1061,7 +1038,7 @@ static bool test_jitter_burst_silence_uniformity()
     // Compute input CV for reference (BURST_SIZE × 0 ms + SILENCE_MS × 1 gap
     // per burst → input stream is clearly bursty).
     const double in_mean = SILENCE_MS / static_cast<double>(BURST_SIZE);
-    const double in_cv   = [&] {
+    const double in_cv = [&] {
         // In-burst intervals ≈ 0 ms, inter-burst interval ≈ SILENCE_MS.
         double s2 = 0;
         const double n_fast = static_cast<double>(BURST_SIZE - 1) * BURST_COUNT;
@@ -1072,13 +1049,11 @@ static bool test_jitter_burst_silence_uniformity()
     }();
 
     std::cout << "  [burst_silence] input_CV≈" << std::fixed << std::setprecision(2) << in_cv
-              << "  output: mean=" << mean << "ms  stddev=" << stddev
-              << "ms  CV=" << cv_out << '\n';
+              << "  output: mean=" << mean << "ms  stddev=" << stddev << "ms  CV=" << cv_out << '\n';
 
     if (cv_out >= CV_LIMIT)
     {
-        std::cout << "  [burst_silence] CV=" << cv_out << " >= " << CV_LIMIT
-                  << " — burst not absorbed\n";
+        std::cout << "  [burst_silence] CV=" << cv_out << " >= " << CV_LIMIT << " — burst not absorbed\n";
         return false;
     }
     return true;
@@ -1095,10 +1070,10 @@ static bool test_jitter_burst_silence_uniformity()
 ///       output inter-delivery interval CV.
 static bool test_jitter_large_window_order()
 {
-    constexpr uint32_t N             = 400;
-    constexpr uint32_t WINDOW        = 10;
-    constexpr double   BASE_MS       = 5.0;
-    constexpr double   MAX_JITTER_MS = 20.0;
+    constexpr uint32_t N = 400;
+    constexpr uint32_t WINDOW = 10;
+    constexpr double BASE_MS = 5.0;
+    constexpr double MAX_JITTER_MS = 20.0;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
     for (uint32_t i = 0; i < N; i++)
@@ -1112,16 +1087,14 @@ static bool test_jitter_large_window_order()
     std::condition_variable cv;
 
     UsrQueueAsync q;
-    q.start(
-        [&](const uint8_t *data, size_t) {
-            uint32_t v;
-            std::memcpy(&v, data, 4);
-            std::lock_guard<std::mutex> lk(mtx);
-            received_seqs.push_back(v);
-            ts.push_back(std::chrono::steady_clock::now());
-            cv.notify_one();
-        },
-        nullptr);
+    q.start([&](const uint8_t *data, size_t) {
+        uint32_t v;
+        std::memcpy(&v, data, 4);
+        std::lock_guard<std::mutex> lk(mtx);
+        received_seqs.push_back(v);
+        ts.push_back(std::chrono::steady_clock::now());
+        cv.notify_one();
+    });
 
     std::mt19937 rng(0x12345678);
     std::uniform_real_distribution<double> jdist(0.0, MAX_JITTER_MS);
@@ -1137,8 +1110,7 @@ static bool test_jitter_large_window_order()
         for (uint32_t seq : win)
         {
             const double delay_ms = BASE_MS + jdist(rng);
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
             if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(2000)))
             {
                 q.stop();
@@ -1155,8 +1127,7 @@ static bool test_jitter_large_window_order()
 
     if (received_seqs.size() < N)
     {
-        std::cout << "  [large_window_order] only " << received_seqs.size()
-                  << "/" << N << " frames delivered\n";
+        std::cout << "  [large_window_order] only " << received_seqs.size() << "/" << N << " frames delivered\n";
         return false;
     }
 
@@ -1164,7 +1135,11 @@ static bool test_jitter_large_window_order()
     std::vector<uint32_t> cnt(N, 0);
     for (uint32_t s : received_seqs)
     {
-        if (s >= N) { std::cout << "  [large_window_order] seq " << s << " out of range\n"; return false; }
+        if (s >= N)
+        {
+            std::cout << "  [large_window_order] seq " << s << " out of range\n";
+            return false;
+        }
         cnt[s]++;
     }
     for (uint32_t i = 0; i < N; i++)
@@ -1181,8 +1156,8 @@ static bool test_jitter_large_window_order()
     {
         if (received_seqs[i] < received_seqs[i - 1])
         {
-            std::cout << "  [large_window_order] order violation at index " << i
-                      << ": seq " << received_seqs[i] << " after " << received_seqs[i - 1] << '\n';
+            std::cout << "  [large_window_order] order violation at index " << i << ": seq " << received_seqs[i]
+                      << " after " << received_seqs[i - 1] << '\n';
             return false;
         }
     }
@@ -1197,24 +1172,27 @@ static bool test_jitter_large_window_order()
     std::sort(sorted_iv.begin(), sorted_iv.end());
     auto percentile = [&](double p) {
         const double pos = p * static_cast<double>(sorted_iv.size() - 1);
-        const size_t lo  = static_cast<size_t>(pos);
-        const size_t hi  = std::min(lo + 1, sorted_iv.size() - 1);
+        const size_t lo = static_cast<size_t>(pos);
+        const size_t hi = std::min(lo + 1, sorted_iv.size() - 1);
         return sorted_iv[lo] + (pos - lo) * (sorted_iv[hi] - sorted_iv[lo]);
     };
 
     const double mean = [&] {
-        double s = 0; for (double v : intervals) s += v;
+        double s = 0;
+        for (double v : intervals)
+            s += v;
         return s / static_cast<double>(intervals.size());
     }();
     const double var = [&] {
-        double s = 0; for (double v : intervals) s += (v - mean) * (v - mean);
+        double s = 0;
+        for (double v : intervals)
+            s += (v - mean) * (v - mean);
         return s / static_cast<double>(intervals.size());
     }();
     const double cv_out = (mean > 0.0) ? std::sqrt(var) / mean : 999.0;
 
-    std::cout << "  [large_window_order] N=" << N << " window=" << WINDOW
-              << "  output: mean=" << std::fixed << std::setprecision(2) << mean
-              << "ms  P50=" << percentile(0.50) << "ms"
+    std::cout << "  [large_window_order] N=" << N << " window=" << WINDOW << "  output: mean=" << std::fixed
+              << std::setprecision(2) << mean << "ms  P50=" << percentile(0.50) << "ms"
               << "  P90=" << percentile(0.90) << "ms"
               << "  P99=" << percentile(0.99) << "ms"
               << "  CV=" << cv_out << '\n';

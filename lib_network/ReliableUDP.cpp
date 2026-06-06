@@ -149,14 +149,13 @@ void UsrQueueAsync::reset_state_locked()
     counters_ = Counters{};
 }
 
-void UsrQueueAsync::start(RecvCallBack callback, void *user_data)
+void UsrQueueAsync::start(RecvCallBack callback)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (running_)
         return;
 
-    receive_callback_ = callback;
-    (void)user_data;
+    receive_callback_ = std::move(callback);
     sanitize_tuning_locked();
     reset_state_locked();
     running_ = true;
@@ -327,7 +326,6 @@ void UsrQueueAsync::purge_stale_locked(ClockTP now)
             continue;
         }
 
-        VIDEO_DEBUG_PRINT("[JitterBuf] stale drop seq=%u", it->seq);
         ++counters_.drop;
         ++counters_.stale;
         auto to_drop = it++;
@@ -378,7 +376,6 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     while (buffered_frames_.size() > tuning_.max_buffered_frames)
     {
         auto tail = std::prev(buffered_frames_.end());
-        VIDEO_DEBUG_PRINT("[JitterBuf] overflow drop seq=%u", tail->seq);
         ++counters_.drop;
         ++counters_.overflow;
         drop_frame_locked(tail);
