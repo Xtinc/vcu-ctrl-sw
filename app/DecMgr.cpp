@@ -10,8 +10,8 @@ static DecoderConfig to_decoder_config(const DecMgrConfig &cfg)
     dec.input_buffer_size = cfg.input_buffer_size;
     dec.low_delay_mode = cfg.low_delay_mode;
     dec.dec_dev_path = cfg.dec_dev;
-    dec.input_buffer_num = 4;
-    dec.flush_timeout_ms = 5000;
+    dec.input_buffer_num = 6;
+    dec.flush_timeout_ms = 50000;
     return dec;
 }
 
@@ -78,11 +78,13 @@ bool DecMgr::start()
 
         m_receiver = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
         m_receiver->set_receive_callback([this](const uint8_t *data, size_t size) {
-            if (size < 2)
+            if (size < sizeof(SLICHead))
             {
                 return;
             }
-            push_stream(data + 1, size - 1, static_cast<StreamFlags>(data[0]));
+
+            const auto *head = reinterpret_cast<const SLICHead *>(data);
+            push_stream(data + sizeof(SLICHead), size - sizeof(SLICHead), static_cast<StreamFlags>(head->slice_tok));
         });
         m_receiver->start();
 

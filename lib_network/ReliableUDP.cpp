@@ -1018,7 +1018,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         return;
     }
 
-    if (units_num != TRX_RS_FEC_GROUP_UNIT_NUMS || units_num != TRX_XOR_FEC_GROUP_UNIT_NUMS)
+    if (units_num != TRX_RS_FEC_GROUP_UNIT_NUMS && units_num != TRX_XOR_FEC_GROUP_UNIT_NUMS)
     {
         VIDEO_ERROR_PRINT("Unsupported units_num %u for group (%u,%u)", units_num, it->trxunit_cycle,
                           it->trxunit_group);
