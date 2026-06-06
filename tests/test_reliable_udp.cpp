@@ -1704,13 +1704,14 @@ int main(int argc, char *argv[])
         cfg.loss_rate_max = cfg.loss_rate_min;
     }
 
+    run_jitter_tests();
+
     std::cout << "ReliableUDP loopback test\n";
     std::cout << "  Payload  : " << cfg.min_payload_bytes << " - " << cfg.max_payload_bytes << " bytes\n";
     std::cout << "  Rate     : " << std::fixed << std::setprecision(2) << cfg.target_rate_bps / 1e6 << " Mbps\n";
     std::cout << "  Loss     : " << cfg.loss_rate_min * 100.0 << "% - " << cfg.loss_rate_max * 100.0 << "%\n";
     std::cout << "  Duration : " << cfg.duration_sec << " s\n\n";
-    if (int rc = run_jitter_tests())
-        return rc;
+
     try
     {
         run_fec_test(cfg);

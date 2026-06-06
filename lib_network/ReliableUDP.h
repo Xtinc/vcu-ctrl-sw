@@ -200,7 +200,7 @@ class UsrQueueAsync
     {
         size_t target_depth = 10;
         size_t startup_depth = 10;
-        size_t max_buffered_frames = 64;
+        size_t max_buffered_frames = 128;
         double stale_timeout_ms = 2000.0;
         double default_frame_interval_ms = 16.0;
         double depth_feedback_gain = 0.08;

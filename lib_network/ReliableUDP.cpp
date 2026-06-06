@@ -393,6 +393,7 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
 
     while (buffered_frames_.size() > tuning_.max_buffered_frames)
     {
+        VIDEO_DEBUG_PRINT("[JitterBuf] buffered frames overflow: size=%zu max=%zu", buffered_frames_.size(), tuning_.max_buffered_frames);
         auto tail = std::prev(buffered_frames_.end());
         ++counters_.drop;
         ++counters_.overflow;
