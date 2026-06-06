@@ -19,7 +19,6 @@ extern "C"
 
 static constexpr int kStreamSmoothingCount = 2;
 static constexpr int kHeightAlign = 8;
-static constexpr int kMaxSliceNum = 8;
 static constexpr uint32_t kMaxWidth = 3840;
 static constexpr uint32_t kMaxHeight = 2160;
 
@@ -514,7 +513,8 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
         {
             try
             {
-                m_callback(pBase, uSize, eof);
+                std::lock_guard<std::mutex> lock(m_cb_mutex);
+                m_callback(pBase, uSize, m_frame_count, m_cfg.low_delay_mode ? kMaxSliceNum : 1, eof);
             }
             catch (...)
             {
@@ -724,8 +724,7 @@ void RTEncoderBase::push_stream_buffers()
 }
 
 // Implementation for FILE source mode
-RTEncoderFile::RTEncoderFile(const EncoderConfig &cfg, EncodedFrameCallback cb)
-    : RTEncoderBase(cfg, std::move(cb))
+RTEncoderFile::RTEncoderFile(const EncoderConfig &cfg, EncodedFrameCallback cb) : RTEncoderBase(cfg, std::move(cb))
 {
 }
 
@@ -835,8 +834,7 @@ DMAFd &DMAFd::operator=(DMAFd &&other) noexcept
 }
 
 // Implementation for V4L2_DMABUF source mode
-RTEncoderV4L2::RTEncoderV4L2(const EncoderConfig &cfg, EncodedFrameCallback cb)
-    : RTEncoderBase(cfg, std::move(cb))
+RTEncoderV4L2::RTEncoderV4L2(const EncoderConfig &cfg, EncodedFrameCallback cb) : RTEncoderBase(cfg, std::move(cb))
 {
 }
 

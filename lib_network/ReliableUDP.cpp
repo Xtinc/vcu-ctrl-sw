@@ -1021,7 +1021,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         return;
     }
 
-    if (units_num != TRX_RS_FEC_GROUP_UNIT_NUMS || units_num != TRX_XOR_FEC_GROUP_UNIT_NUMS)
+    if (units_num != TRX_RS_FEC_GROUP_UNIT_NUMS && units_num != TRX_XOR_FEC_GROUP_UNIT_NUMS)
     {
         VIDEO_ERROR_PRINT("Unsupported units_num %u for group (%u,%u)", units_num, it->trxunit_cycle,
                           it->trxunit_group);
@@ -1093,8 +1093,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         auto oldest_layout_num =
             oldest_units_num == TRX_RS_FEC_GROUP_UNIT_NUMS ? TRX_RS_FEC_GROUP_UNIT_NUMS : TRX_XOR_FEC_GROUP_UNIT_NUMS;
 
-        lost_packets_ +=
-            static_cast<uint64_t>(oldest_layout_num - recv_cnt);
+        lost_packets_ += static_cast<uint64_t>(oldest_layout_num - recv_cnt);
 
         for (auto &u : oldest_group.units)
         {

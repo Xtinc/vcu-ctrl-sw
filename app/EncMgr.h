@@ -4,12 +4,12 @@
 #include "VideoTypes.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
-#include <condition_variable>
 
 class RTEncoderV4L2;
 class V4L2Source;
@@ -23,7 +23,7 @@ struct EncMgrConfig
     std::string v4l2_dev;                   ///< V4L2 capture device path, e.g. "/dev/video0" (required)
     std::string v4l2_subdev;                ///< V4L2 sub-device for source detection and events (required)
     std::string sync_dev;                   ///< Xilinx sync device path (empty = disabled)
-    int source_check_interval_ms = 2000;    ///< Interval for checking source in WaitingSource state
+    int source_check_interval_ms = 30000;   ///< Interval for checking source in WaitingSource state
     VideoCodec codec = VideoCodec::HEVC;    ///< Codec selection
     RateControl rc_mode = RateControl::CBR; ///< Rate-control mode
     uint16_t width = 3840;                  ///< Initial/fallback frame width

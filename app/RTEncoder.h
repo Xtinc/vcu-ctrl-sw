@@ -1,8 +1,8 @@
 #ifndef REALTIME_ENCODER_H
 #define REALTIME_ENCODER_H
 
-#include "V4L2DMAFd.h"
 #include "MemMgr.h"
+#include "V4L2DMAFd.h"
 #include <atomic>
 #include <chrono>
 #include <unordered_map>
@@ -13,6 +13,8 @@ extern "C"
 #include "lib_common_enc/Settings.h"
 #include "lib_encode/lib_encoder.h"
 }
+
+static constexpr int kMaxSliceNum = 8;
 
 struct EncoderConfig
 {
@@ -38,8 +40,6 @@ struct EncoderConfig
     std::string dma_dev_path = "/dev/dmaproxy";   // DMAProxy device node (e.g., "/dev/dmaproxy")
     bool low_delay_mode = false; // true = low-latency P-frame GOP (no B-frames, minimal encode/decode latency)
 };
-
-
 
 /**
  * @brief RTEncoderBase is a hardware-accelerated video encoder wrapper for the Allegro DVT VCU SDK.
@@ -87,7 +87,8 @@ struct EncoderConfig
  * @endcode
  */
 /// Callback invoked for each encoded NAL unit / AU on the SDK thread.
-using EncodedFrameCallback = std::function<void(const uint8_t *pData, size_t size, bool eof)>;
+using EncodedFrameCallback =
+    std::function<void(const uint8_t *pData, size_t size, uint32_t frame_idx, uint32_t slice_num, bool eof)>;
 
 class RTEncoderBase
 {
@@ -202,6 +203,7 @@ class RTEncoderBase
     AL_TAllocator *m_pAllocator;
     AL_IEncScheduler *m_pScheduler;
     AL_HEncoder m_hEnc;
+    std::mutex m_cb_mutex;
 
     std::unique_ptr<PixMapBufPool> m_source_buf_pool;
     std::unique_ptr<GenericBufPool> m_stream_buf_pool;
