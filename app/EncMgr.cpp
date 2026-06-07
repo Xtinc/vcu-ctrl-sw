@@ -3,7 +3,7 @@
 #include "V4L2Source.h"
 #include "lib_network/ReliableUDP.h"
 
-static uint8_t send_buffer[MAX_TRX_UDP_SIZE];
+#include <cstring>
 
 static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> weak_udp)
 {
@@ -19,16 +19,22 @@ static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> 
             return;
         }
 
-        if (size > MAX_TRX_UDP_SIZE)
+        constexpr size_t slice_header_size = sizeof(SLICHead);
+        if (size + slice_header_size > MAX_TRX_UDP_SIZE)
         {
-            VIDEO_ERROR_PRINT("Encoded frame size %zu exceeds max UDP payload %zu, dropping frame", size,
-                              MAX_TRX_UDP_SIZE);
+            VIDEO_ERROR_PRINT(
+                "Encoded frame size %zu plus slice header %zu exceeds max UDP payload %zu, dropping frame", size,
+                slice_header_size, MAX_TRX_UDP_SIZE);
             return;
         }
 
-        auto send_sz = pack_slice(send_buffer, data, size, frame_idx, static_cast<uint8_t>(slice_num),
-                                  static_cast<uint8_t>(eof ? StreamFlags::EndOfFrame : StreamFlags::EndOfSlice));
-        udp->send(send_buffer, send_sz);
+        const auto send_sz = slice_header_size + size;
+        udp->send_fill(send_sz, [data, size, frame_idx, slice_num, eof](uint8_t *dst, size_t) {
+            SLICHead head{static_cast<uint8_t>(slice_num),
+                          static_cast<uint8_t>(eof ? StreamFlags::EndOfFrame : StreamFlags::EndOfSlice), frame_idx};
+            std::memcpy(dst, &head, sizeof(head));
+            std::memcpy(dst + sizeof(head), data, size);
+        });
     };
 }
 

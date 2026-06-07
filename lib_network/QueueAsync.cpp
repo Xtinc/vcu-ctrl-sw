@@ -21,8 +21,193 @@ void set_current_thread_scheduler_policy()
     pthread_setname_np(thread, "video_thd");
 }
 
+// SendQueueAsync implementation
+SendQueueAsync::SendQueueAsync()
+    : free_head_(0), free_tail_(0), free_count_(0), queue_head_(0), queue_tail_(0), queue_count_(0), running_(false)
+{
+    for (auto &slot : slots_)
+    {
+        slot.data = new uint8_t[SEND_QUEUE_MAX_PACKET_SIZE];
+    }
+    reset_storage_locked();
+}
+
+SendQueueAsync::~SendQueueAsync()
+{
+    stop();
+
+    for (auto &slot : slots_)
+    {
+        delete[] slot.data;
+    }
+}
+
+void SendQueueAsync::start(SendCallBack callback)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (running_)
+        return;
+
+    send_callback_ = std::move(callback);
+    reset_storage_locked();
+    running_ = true;
+    thread_ = std::thread(&SendQueueAsync::worker_thread, this);
+}
+
+void SendQueueAsync::stop()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        running_ = false;
+        clear_queued_locked();
+    }
+    cond_.notify_all();
+    if (thread_.joinable())
+        thread_.join();
+}
+
+void SendQueueAsync::clear_queued_locked()
+{
+    while (queue_count_ > 0)
+    {
+        const size_t index = queued_indices_[queue_head_];
+        queue_head_ = (queue_head_ + 1) % SEND_QUEUE_DEPTH;
+        --queue_count_;
+        slots_[index].size = 0;
+
+        if (free_count_ < SEND_QUEUE_DEPTH)
+        {
+            free_indices_[free_tail_] = index;
+            free_tail_ = (free_tail_ + 1) % SEND_QUEUE_DEPTH;
+            ++free_count_;
+        }
+    }
+    queue_head_ = 0;
+    queue_tail_ = 0;
+}
+
+void SendQueueAsync::reset_storage_locked()
+{
+    queue_head_ = 0;
+    queue_tail_ = 0;
+    queue_count_ = 0;
+    free_head_ = 0;
+    free_tail_ = 0;
+    free_count_ = SEND_QUEUE_DEPTH;
+
+    for (size_t i = 0; i < SEND_QUEUE_DEPTH; ++i)
+    {
+        free_indices_[i] = i;
+    }
+}
+
+bool SendQueueAsync::enqueue(const uint8_t *data, size_t size)
+{
+    if (!data || size == 0 || size > SEND_QUEUE_MAX_PACKET_SIZE)
+        return false;
+
+    return enqueue_fill(size, [data](uint8_t *dst, size_t dst_size) { std::memcpy(dst, data, dst_size); });
+}
+
+bool SendQueueAsync::enqueue_fill(size_t size, FillCallback callback)
+{
+    if (size == 0 || size > SEND_QUEUE_MAX_PACKET_SIZE || !callback)
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!running_)
+        return false;
+
+    if (free_count_ == 0)
+    {
+        VIDEO_ERROR_PRINT("[SendQueue] queue overflow, dropping packet size=%zu depth=%zu", size, SEND_QUEUE_DEPTH);
+        return false;
+    }
+
+    const size_t index = free_indices_[free_head_];
+    free_head_ = (free_head_ + 1) % SEND_QUEUE_DEPTH;
+    --free_count_;
+
+    try
+    {
+        callback(slots_[index].data, size);
+    }
+    catch (const std::exception &e)
+    {
+        VIDEO_ERROR_PRINT("[SendQueue] fill callback threw exception: %s", e.what());
+        free_head_ = (free_head_ + SEND_QUEUE_DEPTH - 1) % SEND_QUEUE_DEPTH;
+        free_indices_[free_head_] = index;
+        ++free_count_;
+        return false;
+    }
+    catch (...)
+    {
+        VIDEO_ERROR_PRINT("[SendQueue] fill callback threw unknown exception");
+        free_head_ = (free_head_ + SEND_QUEUE_DEPTH - 1) % SEND_QUEUE_DEPTH;
+        free_indices_[free_head_] = index;
+        ++free_count_;
+        return false;
+    }
+
+    slots_[index].size = size;
+    queued_indices_[queue_tail_] = index;
+    queue_tail_ = (queue_tail_ + 1) % SEND_QUEUE_DEPTH;
+    ++queue_count_;
+
+    cond_.notify_one();
+    return true;
+}
+
+void SendQueueAsync::worker_thread()
+{
+    set_current_thread_scheduler_policy();
+
+    while (true)
+    {
+        size_t index = 0;
+        size_t size = 0;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cond_.wait(lock, [this] { return !running_ || queue_count_ > 0; });
+
+            if (!running_)
+                break;
+
+            index = queued_indices_[queue_head_];
+            size = slots_[index].size;
+            queue_head_ = (queue_head_ + 1) % SEND_QUEUE_DEPTH;
+            --queue_count_;
+        }
+
+        try
+        {
+            if (send_callback_)
+                send_callback_(slots_[index].data, size);
+        }
+        catch (const std::exception &e)
+        {
+            VIDEO_ERROR_PRINT("[SendQueue] send callback threw exception: %s", e.what());
+        }
+        catch (...)
+        {
+            VIDEO_ERROR_PRINT("[SendQueue] send callback threw unknown exception");
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (free_count_ < SEND_QUEUE_DEPTH)
+            {
+                slots_[index].size = 0;
+                free_indices_[free_tail_] = index;
+                free_tail_ = (free_tail_ + 1) % SEND_QUEUE_DEPTH;
+                ++free_count_;
+            }
+        }
+    }
+}
+
 // UsrQueueAsync implementation
-UsrQueueAsync::UsrQueueAsync()
+RecvQueueAsync::RecvQueueAsync()
     : frame_pool_(64), running_(false), primed_(false), expected_seq_(0), gap_active_(false), has_arrival_ref_(false),
       last_rate_seq_(0), has_highest_arrival_seq_(false), highest_arrival_seq_(0), avg_interval_ms_(0.0),
       jitter_ms_(0.0), avg_depth_frames_(0.0), disorder_depth_frames_(0.0), disorder_guard_depth_frames_(0.0)
@@ -30,12 +215,12 @@ UsrQueueAsync::UsrQueueAsync()
     sanitize_tuning_locked();
 }
 
-UsrQueueAsync::~UsrQueueAsync()
+RecvQueueAsync::~RecvQueueAsync()
 {
     stop();
 }
 
-void UsrQueueAsync::sanitize_tuning_locked()
+void RecvQueueAsync::sanitize_tuning_locked()
 {
     tuning_.target_depth = std::max<size_t>(1, tuning_.target_depth);
     tuning_.startup_depth = std::max<size_t>(1, tuning_.startup_depth);
@@ -53,7 +238,7 @@ void UsrQueueAsync::sanitize_tuning_locked()
         tuning_.max_pacing_factor = tuning_.min_pacing_factor;
 }
 
-void UsrQueueAsync::reset_state_locked()
+void RecvQueueAsync::reset_state_locked()
 {
     clear_buffered_frames_locked();
     primed_ = false;
@@ -75,7 +260,7 @@ void UsrQueueAsync::reset_state_locked()
     counters_ = Counters{};
 }
 
-void UsrQueueAsync::clear_buffered_frames_locked()
+void RecvQueueAsync::clear_buffered_frames_locked()
 {
     for (auto &frame : buffered_frames_)
     {
@@ -84,7 +269,7 @@ void UsrQueueAsync::clear_buffered_frames_locked()
     buffered_frames_.clear();
 }
 
-void UsrQueueAsync::start(RecvCallBack callback)
+void RecvQueueAsync::start(RecvCallBack callback)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (running_)
@@ -94,10 +279,10 @@ void UsrQueueAsync::start(RecvCallBack callback)
     sanitize_tuning_locked();
     reset_state_locked();
     running_ = true;
-    thread_ = std::thread(&UsrQueueAsync::worker_thread, this);
+    thread_ = std::thread(&RecvQueueAsync::worker_thread, this);
 }
 
-void UsrQueueAsync::stop()
+void RecvQueueAsync::stop()
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -108,7 +293,7 @@ void UsrQueueAsync::stop()
         thread_.join();
 }
 
-void UsrQueueAsync::reset()
+void RecvQueueAsync::reset()
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -117,7 +302,7 @@ void UsrQueueAsync::reset()
     cond_.notify_all();
 }
 
-void UsrQueueAsync::update_depth_estimate_locked(double depth)
+void RecvQueueAsync::update_depth_estimate_locked(double depth)
 {
     constexpr double ALPHA_DEPTH = 0.05;
     if (avg_depth_frames_ <= 0.0)
@@ -129,7 +314,7 @@ void UsrQueueAsync::update_depth_estimate_locked(double depth)
     avg_depth_frames_ += ALPHA_DEPTH * (depth - avg_depth_frames_);
 }
 
-void UsrQueueAsync::update_estimators_locked(uint32_t abs_seq, ClockTP arrival)
+void RecvQueueAsync::update_estimators_locked(uint32_t abs_seq, ClockTP arrival)
 {
     if (!has_arrival_ref_)
     {
@@ -169,7 +354,7 @@ void UsrQueueAsync::update_estimators_locked(uint32_t abs_seq, ClockTP arrival)
     last_rate_time_ = arrival;
 }
 
-void UsrQueueAsync::note_disorder_locked(uint32_t abs_seq)
+void RecvQueueAsync::note_disorder_locked(uint32_t abs_seq)
 {
     constexpr double ALPHA_DISORDER = 0.10;
     constexpr double DECAY_DISORDER = 0.02;
@@ -207,7 +392,7 @@ void UsrQueueAsync::note_disorder_locked(uint32_t abs_seq)
     }
 }
 
-double UsrQueueAsync::bootstrap_interval_locked() const
+double RecvQueueAsync::bootstrap_interval_locked() const
 {
     if (avg_interval_ms_ >= MIN_FRAME_INTERVAL_MS)
         return avg_interval_ms_;
@@ -225,7 +410,7 @@ double UsrQueueAsync::bootstrap_interval_locked() const
     return tuning_.default_frame_interval_ms;
 }
 
-double UsrQueueAsync::compute_delivery_interval_locked() const
+double RecvQueueAsync::compute_delivery_interval_locked() const
 {
     const double base_interval_ms = std::max(MIN_FRAME_INTERVAL_MS, bootstrap_interval_locked());
     const double smoothed_depth = 0.5 * (avg_depth_frames_ + static_cast<double>(buffered_frames_.size()));
@@ -235,7 +420,7 @@ double UsrQueueAsync::compute_delivery_interval_locked() const
     return std::max(MIN_FRAME_INTERVAL_MS, base_interval_ms * correction);
 }
 
-double UsrQueueAsync::compute_gap_wait_ms_locked() const
+double RecvQueueAsync::compute_gap_wait_ms_locked() const
 {
     const double base_interval_ms = std::max(tuning_.default_frame_interval_ms, bootstrap_interval_locked());
     const double jitter_guard_ms = std::max(base_interval_ms, jitter_ms_ * 2.0);
@@ -246,19 +431,19 @@ double UsrQueueAsync::compute_gap_wait_ms_locked() const
     return clamp_value(wait_ms, base_interval_ms, tuning_.stale_timeout_ms);
 }
 
-void UsrQueueAsync::drop_frame_locked(std::list<BufferedFrame>::iterator it)
+void RecvQueueAsync::drop_frame_locked(std::list<BufferedFrame>::iterator it)
 {
     uint8_t *data = it->data;
     buffered_frames_.erase(it);
     release_frame_data(data);
 }
 
-void UsrQueueAsync::release_frame_data(uint8_t *data)
+void RecvQueueAsync::release_frame_data(uint8_t *data)
 {
     frame_pool_.deallocate(data);
 }
 
-void UsrQueueAsync::purge_stale_locked(ClockTP now)
+void RecvQueueAsync::purge_stale_locked(ClockTP now)
 {
     const auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                   std::chrono::duration<double, std::milli>(tuning_.stale_timeout_ms));
@@ -277,7 +462,7 @@ void UsrQueueAsync::purge_stale_locked(ClockTP now)
     }
 }
 
-bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
+bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
 {
     if (data == nullptr)
         return false;
@@ -331,7 +516,7 @@ bool UsrQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     return true;
 }
 
-std::string UsrQueueAsync::stats_text() const
+std::string RecvQueueAsync::stats_text() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -347,7 +532,7 @@ std::string UsrQueueAsync::stats_text() const
     return os.str();
 }
 
-void UsrQueueAsync::worker_thread()
+void RecvQueueAsync::worker_thread()
 {
     set_current_thread_scheduler_policy();
 
@@ -431,7 +616,7 @@ void UsrQueueAsync::worker_thread()
     }
 }
 
-void UsrQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
+void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
 {
     if (buffered_frames_.empty())
         return;
@@ -466,7 +651,7 @@ void UsrQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
     release_frame_data(frame.data);
 }
 
-void UsrQueueAsync::skip_gap_locked(uint32_t next_available_seq)
+void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
 {
     if (!primed_ || next_available_seq <= expected_seq_)
         return;
@@ -484,7 +669,7 @@ void UsrQueueAsync::skip_gap_locked(uint32_t next_available_seq)
     next_delivery_time_ = std::chrono::steady_clock::now();
 }
 
-void UsrQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
+void RecvQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
 {
     while (!buffered_frames_.empty())
     {

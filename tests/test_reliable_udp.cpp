@@ -61,7 +61,7 @@ static void print_divider()
 
 // For tests that validate ordering/fixed-depth smoothing (not overload behavior), retry
 // enqueue when the current reorder window is temporarily full.
-static bool enqueue_with_retry(UsrQueueAsync &q, uint8_t *data, size_t size, uint32_t seq,
+static bool enqueue_with_retry(RecvQueueAsync &q, uint8_t *data, size_t size, uint32_t seq,
                                std::chrono::milliseconds timeout = std::chrono::milliseconds(500))
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -135,7 +135,7 @@ static bool test_jitter_inorder()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -181,7 +181,7 @@ static bool test_jitter_reorder_complete()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -233,7 +233,7 @@ static bool test_jitter_no_duplicates()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -280,7 +280,7 @@ static bool test_jitter_stats_snapshot_is_read_only()
     uint32_t value = 1;
     std::memcpy(buf.data(), &value, 4);
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([](const uint8_t *, size_t) {});
 
     bool ok = true;
@@ -313,7 +313,7 @@ static bool test_jitter_inorder_prefill_not_reorder()
     for (uint32_t i = 0; i < N; i++)
         std::memcpy(bufs[i].data(), &i, 4);
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([](const uint8_t *, size_t) {});
 
     for (uint32_t i = 0; i < N; i++)
@@ -351,7 +351,7 @@ static bool test_jitter_depth_recovers()
     std::condition_variable cv;
     size_t delivered = 0;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
@@ -433,7 +433,7 @@ static bool test_jitter_window_shuffle()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -502,7 +502,7 @@ static bool test_jitter_adapt_up_down()
     std::condition_variable cv;
     size_t delivered = 0;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
@@ -582,7 +582,7 @@ static bool test_jitter_permanent_gap()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -657,7 +657,7 @@ static bool test_jitter_timing_uniformity()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ts.push_back(std::chrono::steady_clock::now());
@@ -749,7 +749,7 @@ static bool test_jitter_adaptive_estimation()
     std::condition_variable cv;
     size_t delivered = 0;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
@@ -840,7 +840,7 @@ static bool test_jitter_bimodal_jitter_uniformity()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -958,7 +958,7 @@ static bool test_jitter_burst_silence_uniformity()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -1086,7 +1086,7 @@ static bool test_jitter_large_window_order()
     std::mutex mtx;
     std::condition_variable cv;
 
-    UsrQueueAsync q;
+    RecvQueueAsync q;
     q.start([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
@@ -1205,6 +1205,112 @@ static bool test_jitter_large_window_order()
     return true;
 }
 
+static bool test_send_queue_fill()
+{
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<uint8_t> received;
+
+    SendQueueAsync q;
+    q.start([&](const uint8_t *data, size_t size) {
+        std::lock_guard<std::mutex> lk(mtx);
+        received.assign(data, data + size);
+        cv.notify_one();
+    });
+
+    constexpr size_t payload_size = 8;
+    if (!q.enqueue_fill(payload_size, [](uint8_t *data, size_t size) {
+            for (size_t i = 0; i < size; ++i)
+                data[i] = static_cast<uint8_t>(i + 1);
+        }))
+    {
+        q.stop();
+        return false;
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() == payload_size; });
+    }
+
+    if (received.size() != payload_size)
+    {
+        q.stop();
+        return false;
+    }
+    for (size_t i = 0; i < received.size(); ++i)
+    {
+        if (received[i] != static_cast<uint8_t>(i + 1))
+        {
+            q.stop();
+            return false;
+        }
+    }
+
+    if (q.enqueue_fill(SEND_QUEUE_MAX_PACKET_SIZE + 1, [](uint8_t *, size_t) {}))
+    {
+        q.stop();
+        return false;
+    }
+
+    std::atomic<bool> release_worker{false};
+    std::atomic<bool> worker_blocked{false};
+    std::atomic<size_t> full_q_delivered{0};
+    SendQueueAsync full_q;
+    full_q.start([&](const uint8_t *, size_t) {
+        worker_blocked.store(true, std::memory_order_release);
+        while (!release_worker.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        full_q_delivered.fetch_add(1, std::memory_order_release);
+    });
+
+    bool ok = full_q.enqueue_fill(1, [](uint8_t *data, size_t) { data[0] = 0; });
+    for (size_t retry = 0; retry < 1000 && !worker_blocked.load(std::memory_order_acquire); ++retry)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!worker_blocked.load(std::memory_order_acquire))
+    {
+        release_worker.store(true, std::memory_order_release);
+        full_q.stop();
+        q.stop();
+        return false;
+    }
+
+    for (size_t i = 0; i + 1 < SEND_QUEUE_DEPTH; ++i)
+    {
+        ok = ok && full_q.enqueue_fill(1, [i](uint8_t *data, size_t) { data[0] = static_cast<uint8_t>(i); });
+    }
+
+    if (!ok || full_q.enqueue_fill(1, [](uint8_t *data, size_t) { data[0] = 0xA5; }))
+    {
+        release_worker.store(true, std::memory_order_release);
+        full_q.stop();
+        q.stop();
+        return false;
+    }
+
+    release_worker.store(true, std::memory_order_release);
+    for (size_t retry = 0; retry < 1000 && full_q_delivered.load(std::memory_order_acquire) < SEND_QUEUE_DEPTH;
+         ++retry)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    bool recovered = false;
+    for (size_t retry = 0; retry < 1000 && !recovered; ++retry)
+    {
+        recovered = full_q.enqueue_fill(1, [](uint8_t *data, size_t) { data[0] = 0x5A; });
+        if (!recovered)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    full_q.stop();
+    q.stop();
+
+    return recovered;
+}
+
 static int run_jitter_tests()
 {
     struct Test
@@ -1228,6 +1334,7 @@ static int run_jitter_tests()
         {"bimodal jitter: uniform output      ", test_jitter_bimodal_jitter_uniformity},
         {"burst+silence: output smoothed      ", test_jitter_burst_silence_uniformity},
         {"large window: strict order + CV     ", test_jitter_large_window_order},
+        {"send queue fill API                 ", test_send_queue_fill},
     };
 
     std::cout << "\nJitter buffer unit tests\n";
@@ -1571,16 +1678,11 @@ static void run_fec_test(const TestConfig &cfg)
         hdr.payload_len = static_cast<uint32_t>(payload_size);
         hdr.payload_crc = adler32_compute(payload_ptr, payload_size);
         std::memcpy(msg_buf.data(), &hdr, TEST_HDR_SIZE);
-
-        auto now = std::chrono::steady_clock::now();
         if (sender->send(msg_buf.data(), total_size))
         {
             state.send_count++;
             seq++;
         }
-
-        auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - now).count();
-        VIDEO_INFO_PRINT("Sent seq=%u  payload=%zu bytes  elapsed=%.2f us", hdr.seq, payload_size, elapsed);
     }
 
     {

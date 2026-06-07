@@ -79,11 +79,11 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
       send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), has_active_conn_uuid_(false),
       active_conn_uuid_(0), destination_set_(false), frame_cycle_(1), group_cycle_(1), next_group_id_(1),
-      next_frame_id_(1), last_frame_id_(0), last_group_id_(0), usr_queue_(std::make_unique<UsrQueueAsync>()),
-      lost_packets_(0), send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
-      last_recv_rate_time_(std::chrono::steady_clock::now()), last_lost_rate_time_(std::chrono::steady_clock::now()),
-      last_send_rate_bytes_(0), last_recv_rate_bytes_(0), probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0),
-      time_synced_(false), probe_seq_(0)
+      next_frame_id_(1), last_frame_id_(0), last_group_id_(0), usr_queue_(std::make_unique<RecvQueueAsync>()),
+      send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
+      last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
+      last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
+      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0)
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -152,6 +152,7 @@ void ReliableUDP::start()
         return;
     }
 
+    send_queue_->start([this](const uint8_t *data, size_t size) { send_queued_frame(data, size); });
     start_receive();
 }
 
@@ -187,7 +188,12 @@ bool ReliableUDP::add_destination(const std::string &address, unsigned short por
     VIDEO_INFO_PRINT("Destination set to %s:%u", endpoint.address().to_string().c_str(), endpoint.port());
 
     asio::post(strand_, [self = shared_from_this()]() {
-        self->send_probe();
+        TRXProbe pkt{};
+        pkt.magic = MAGIC_TRX_PROBE_NUMBER;
+        pkt.type = 0;
+        pkt.seq = self->probe_seq_++;
+        pkt.t1_ms = get_time_ms();
+        self->send_probe_packet(pkt, "ping");
         self->schedule_probe();
     });
 
@@ -217,6 +223,7 @@ void ReliableUDP::stop()
     }
 
     probe_timer_.cancel();
+    send_queue_->stop();
     usr_queue_->stop();
 }
 
@@ -549,6 +556,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         VIDEO_ERROR_PRINT("Unsupported units_num %u for group (%u,%u)", units_num, it->trxunit_cycle,
                           it->trxunit_group);
         recv_pool_.deallocate(unit.data);
+        return;
     }
 
     if (!it->units.empty() && units_num != static_cast<uint8_t>(unit.head.units_num))
@@ -849,12 +857,23 @@ void ReliableUDP::generate_uuid()
 
 bool ReliableUDP::send(const uint8_t *data, size_t size)
 {
+    if (!data)
+    {
+        VIDEO_ERROR_PRINT("Invalid data or size for sending");
+        return false;
+    }
+
+    return send_fill(size, [data](uint8_t *dst, size_t dst_size) { std::memcpy(dst, data, dst_size); });
+}
+
+bool ReliableUDP::send_fill(size_t size, FillCallback callback)
+{
     if (!running_)
     {
         return false;
     }
 
-    if (!data || size == 0 || size > MAX_TRX_UDP_SIZE)
+    if (size == 0 || size > MAX_TRX_UDP_SIZE || !callback)
     {
         VIDEO_ERROR_PRINT("Invalid data or size for sending");
         return false;
@@ -869,43 +888,79 @@ bool ReliableUDP::send(const uint8_t *data, size_t size)
         }
     }
 
+    if (!send_queue_->enqueue_fill(size, std::move(callback)))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+void ReliableUDP::send_queued_frame(const uint8_t *data, size_t size)
+{
+    if (!running_)
+    {
+        return;
+    }
+
     auto units = create_trx_units(data, size);
     if (units.empty())
     {
         VIDEO_ERROR_PRINT("Failed to create TRX units for payload size %zu", size);
-        return false;
+        return;
     }
 
-    try
+    udp::endpoint target;
     {
-        for (auto &unit : units)
+        std::lock_guard<std::mutex> lock(target_mutex_);
+        if (!destination_set_)
         {
-            std::array<asio::const_buffer, 2> buffers = {asio::buffer(&unit.head, TRX_HEADER_SIZE),
-                                                         asio::buffer(unit.data, unit.head.units_len)};
-            send_socket_->send_to(buffers, target_endpoint_);
-            send_bytes_.fetch_add(static_cast<uint64_t>(TRX_HEADER_SIZE + unit.head.units_len),
-                                  std::memory_order_relaxed);
+            VIDEO_ERROR_PRINT("No destination set. need negotiate first");
+            for (auto &unit : units)
+            {
+                if (unit.data)
+                    send_pool_.deallocate(unit.data);
+            }
+            return;
+        }
+        target = target_endpoint_;
+    }
+
+    for (auto &unit : units)
+    {
+        if (!unit.data)
+            continue;
+
+        std::array<asio::const_buffer, 2> buffers = {asio::buffer(&unit.head, TRX_HEADER_SIZE),
+                                                     asio::buffer(unit.data, unit.head.units_len)};
+        asio::error_code ec;
+        {
+            std::lock_guard<std::mutex> lock(send_socket_mutex_);
+            send_socket_->send_to(buffers, target, 0, ec);
+        }
+
+        if (ec)
+        {
+            VIDEO_ERROR_PRINT("Error occurred while sending data: %s", ec.message().c_str());
+            break;
+        }
+
+        send_bytes_.fetch_add(static_cast<uint64_t>(TRX_HEADER_SIZE + unit.head.units_len), std::memory_order_relaxed);
+        send_pool_.deallocate(unit.data);
+        unit.data = nullptr;
+    }
+
+    for (auto &unit : units)
+    {
+        if (unit.data)
+        {
             send_pool_.deallocate(unit.data);
             unit.data = nullptr;
         }
-        return true;
-    }
-    catch (const std::exception &e)
-    {
-        for (auto &unit : units)
-        {
-            if (unit.data)
-            {
-                send_pool_.deallocate(unit.data);
-                unit.data = nullptr;
-            }
-        }
-        VIDEO_ERROR_PRINT("Error occurred while sending data: %s", e.what());
-        return false;
     }
 }
 
-void ReliableUDP::send_probe()
+void ReliableUDP::send_probe_packet(const TRXProbe &pkt, const char *label)
 {
     udp::endpoint target;
     {
@@ -917,20 +972,16 @@ void ReliableUDP::send_probe()
         target = target_endpoint_;
     }
 
-    TRXProbe pkt{};
-    pkt.magic = MAGIC_TRX_PROBE_NUMBER;
-    pkt.type = 0;
-    pkt.seq = probe_seq_++;
-    pkt.t1_ms = get_time_ms();
+    asio::error_code ec;
+    {
+        std::lock_guard<std::mutex> lock(send_socket_mutex_);
+        send_socket_->send_to(asio::buffer(&pkt, sizeof(TRXProbe)), target, 0, ec);
+    }
 
-    auto buf = std::make_shared<TRXProbe>(pkt);
-    send_socket_->async_send_to(asio::buffer(buf.get(), sizeof(TRXProbe)), target,
-                                [buf](const asio::error_code &ec, size_t) {
-                                    if (ec)
-                                    {
-                                        VIDEO_ERROR_PRINT("[Probe] Failed to send ping: %s", ec.message().c_str());
-                                    }
-                                });
+    if (ec)
+    {
+        VIDEO_ERROR_PRINT("[Probe] Failed to send %s: %s", label, ec.message().c_str());
+    }
 }
 
 void ReliableUDP::schedule_probe()
@@ -939,7 +990,12 @@ void ReliableUDP::schedule_probe()
     probe_timer_.async_wait(strand_.wrap([self = shared_from_this()](const asio::error_code &ec) {
         if (!ec)
         {
-            self->send_probe();
+            TRXProbe pkt{};
+            pkt.magic = MAGIC_TRX_PROBE_NUMBER;
+            pkt.type = 0;
+            pkt.seq = self->probe_seq_++;
+            pkt.t1_ms = get_time_ms();
+            self->send_probe_packet(pkt, "ping");
             self->schedule_probe();
         }
     }));
@@ -950,16 +1006,6 @@ void ReliableUDP::handle_probe_packet(const TRXProbe &pkt)
     if (pkt.type == 0)
     {
         // Ping received: reply with a pong.
-        udp::endpoint target;
-        {
-            std::lock_guard<std::mutex> lock(target_mutex_);
-            if (!destination_set_)
-            {
-                return;
-            }
-            target = target_endpoint_;
-        }
-
         TRXProbe pong{};
         pong.magic = MAGIC_TRX_PROBE_NUMBER;
         pong.type = 1;
@@ -967,14 +1013,7 @@ void ReliableUDP::handle_probe_packet(const TRXProbe &pkt)
         pong.t1_ms = pkt.t1_ms;
         pong.t2_delta_ms = static_cast<int32_t>(get_time_ms() - pkt.t1_ms);
 
-        auto buf = std::make_shared<TRXProbe>(pong);
-        send_socket_->async_send_to(asio::buffer(buf.get(), sizeof(TRXProbe)), target,
-                                    [buf](const asio::error_code &ec, size_t) {
-                                        if (ec)
-                                        {
-                                            VIDEO_ERROR_PRINT("[Probe] Failed to send pong: %s", ec.message().c_str());
-                                        }
-                                    });
+        send_probe_packet(pong, "pong");
     }
     else if (pkt.type == 1)
     {

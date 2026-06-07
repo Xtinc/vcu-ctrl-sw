@@ -2,31 +2,59 @@
 #define USER_QUEUE_ASYNC_H
 
 #include "MemPoolUDP.h"
+#include <array>
 #include <condition_variable>
 #include <functional>
 #include <thread>
 
 using RecvCallBack = std::function<void(const uint8_t *data, size_t size)>;
+using SendCallBack = std::function<void(const uint8_t *data, size_t size)>;
+using FillCallback = std::function<void(uint8_t *data, size_t size)>;
 
-/** @brief Asynchronous fixed-depth jitter buffer for fully reassembled frames.
- *
- * This queue trades latency for continuity. It keeps a steady frame cushion
- * near its configured target depth, reorders buffered frames by absolute
- * sequence number, and feeds the decoder at the long-term average receive cadence.
- *
- * Behaviour model:
- *  - Startup prefill waits until the configured startup depth is buffered.
- *  - Normal delivery is paced by a long-term receive-interval estimator.
- *  - Occupancy feedback nudges the delivery interval so buffered depth stays
- *    near the configured target depth instead of draining to zero or growing
- *    unbounded.
- *  - When a sequence gap blocks delivery, the queue waits for late arrival up
- *    to a jitter/reorder-aware deadline, then skips the missing span.
- *
- * Queue statistics are exposed through stats_text(); reading them never mutates
- * queue state. Counters reset only when the queue state is reset.
- */
-class UsrQueueAsync
+constexpr size_t SEND_QUEUE_DEPTH = 128;
+constexpr size_t SEND_QUEUE_MAX_PACKET_SIZE = 65535;
+
+class SendQueueAsync
+{
+    struct Slot
+    {
+        uint8_t *data = nullptr;
+        size_t size = 0;
+    };
+
+  public:
+    SendQueueAsync();
+    ~SendQueueAsync();
+
+    void start(SendCallBack callback);
+    void stop();
+    bool enqueue(const uint8_t *data, size_t size);
+    bool enqueue_fill(size_t size, FillCallback callback);
+
+  private:
+    void worker_thread();
+    void clear_queued_locked();
+    void reset_storage_locked();
+
+    std::array<Slot, SEND_QUEUE_DEPTH> slots_;
+    std::array<size_t, SEND_QUEUE_DEPTH> free_indices_;
+    std::array<size_t, SEND_QUEUE_DEPTH> queued_indices_;
+
+    size_t free_head_;
+    size_t free_tail_;
+    size_t free_count_;
+    size_t queue_head_;
+    size_t queue_tail_;
+    size_t queue_count_;
+    SendCallBack send_callback_;
+
+    std::thread thread_;
+    mutable std::mutex mutex_;
+    std::condition_variable cond_;
+    bool running_;
+};
+
+class RecvQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
     struct Tunables
@@ -64,8 +92,8 @@ class UsrQueueAsync
     };
 
   public:
-    UsrQueueAsync();
-    ~UsrQueueAsync();
+    RecvQueueAsync();
+    ~RecvQueueAsync();
 
     void start(RecvCallBack callback);
     void stop();

@@ -32,13 +32,4 @@ struct SLICHead
     uint32_t frame_idx : 24;
 };
 
-inline size_t pack_slice(uint8_t *dst, const uint8_t *payload, size_t payload_length, uint32_t frame_idx,
-                         uint8_t slice_tok, uint8_t slice_num)
-{
-    SLICHead head{slice_tok, slice_num, frame_idx};
-    std::memcpy(dst, &head, sizeof(head));
-    std::memcpy(dst + sizeof(head), payload, payload_length);
-    return sizeof(head) + payload_length;
-}
-
 #endif // VIDEO_TYPES_H

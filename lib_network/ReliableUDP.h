@@ -32,6 +32,8 @@ constexpr size_t TRX_XOR_FEC_REDUNDANCY = 1;
 constexpr size_t MAX_TRX_RECEIVE_FRAMES = 20;
 constexpr size_t MAX_GROUP_NUM_PER_FRAME = MAX_TRX_UDP_SIZE / (MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_UNIT_SIZE);
 static_assert(MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
+static_assert(SEND_QUEUE_MAX_PACKET_SIZE == MAX_TRX_UDP_SIZE,
+              "send queue packet size must match ReliableUDP frame cap");
 
 struct TRXProbe
 {
@@ -199,6 +201,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void stop();
     bool add_destination(const std::string &address, unsigned short port);
     bool send(const uint8_t *data, size_t size);
+    bool send_fill(size_t size, FillCallback callback);
     void set_receive_callback(RecvCallBack callback)
     {
         usr_queue_->start(callback);
@@ -231,7 +234,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
                                    size_t size);
     void generate_uuid();
     void schedule_probe();
-    void send_probe();
+    void send_probe_packet(const TRXProbe &pkt, const char *label);
+    void send_queued_frame(const uint8_t *data, size_t size);
     void handle_probe_packet(const TRXProbe &pkt);
 
   private:
@@ -264,11 +268,13 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 
-    std::unique_ptr<UsrQueueAsync> usr_queue_;
+    std::unique_ptr<RecvQueueAsync> usr_queue_;
+    std::unique_ptr<SendQueueAsync> send_queue_;
     std::atomic<uint64_t> lost_packets_;
     std::atomic<uint64_t> send_bytes_;
     std::atomic<uint64_t> recv_bytes_;
     std::mutex rate_mutex_;
+    std::mutex send_socket_mutex_;
     std::chrono::steady_clock::time_point last_send_rate_time_;
     std::chrono::steady_clock::time_point last_recv_rate_time_;
     std::chrono::steady_clock::time_point last_lost_rate_time_;
