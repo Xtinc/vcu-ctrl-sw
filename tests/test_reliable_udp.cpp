@@ -334,8 +334,8 @@ static bool test_jitter_callback_retains_until_release()
     }
     if (batch_sizes[0] != 1 || batch_sizes[1] != 2 || batch_sizes[2] != 1)
     {
-        std::cout << "  [callback_retain] unexpected batch sizes: " << batch_sizes[0] << ", " << batch_sizes[1]
-                  << ", " << batch_sizes[2] << '\n';
+        std::cout << "  [callback_retain] unexpected batch sizes: " << batch_sizes[0] << ", " << batch_sizes[1] << ", "
+                  << batch_sizes[2] << '\n';
         return false;
     }
     if (batch_tails[0] != 0 || batch_tails[1] != 1 || batch_tails[2] != 2)
@@ -1363,8 +1363,7 @@ static bool test_send_queue_fill()
     }
 
     release_worker.store(true, std::memory_order_release);
-    for (size_t retry = 0; retry < 1000 && full_q_delivered.load(std::memory_order_acquire) < SEND_QUEUE_DEPTH;
-         ++retry)
+    for (size_t retry = 0; retry < 1000 && full_q_delivered.load(std::memory_order_acquire) < SEND_QUEUE_DEPTH; ++retry)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -1757,6 +1756,8 @@ static void run_fec_test(const TestConfig &cfg)
         hdr.payload_len = static_cast<uint32_t>(payload_size);
         hdr.payload_crc = adler32_compute(payload_ptr, payload_size);
         std::memcpy(msg_buf.data(), &hdr, TEST_HDR_SIZE);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(1)); // avoid overwhelming the receiver with back-to-back sends
         if (sender->send(msg_buf.data(), total_size))
         {
             state.send_count++;
