@@ -78,19 +78,61 @@ bool DecMgr::start()
 
         m_receiver = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
         m_receiver->set_receive_callback([this](const std::vector<QueueFrame> &frames) {
-            for (const auto &frame : frames)
+            auto latest = std::prev(frames.cend());
+            if (latest->size < sizeof(SLICHead))
             {
-                if (frame.size < sizeof(SLICHead))
-                {
-                    continue;
-                }
-
-                const auto *head = reinterpret_cast<const SLICHead *>(frame.data);
-                push_stream(frame.data + sizeof(SLICHead), frame.size - sizeof(SLICHead),
-                            static_cast<StreamFlags>(head->slice_tok));
+                return true;
             }
+
+            const auto *tail_head = reinterpret_cast<const SLICHead *>(latest->data);
+            const auto tail_flag = static_cast<StreamFlags>(tail_head->slice_tok);
+
+            if (tail_flag == StreamFlags::Unknown)
+            {
+                return true;
+            }
+
+            if (tail_flag == StreamFlags::EndOfSlice)
+            {
+                return false;
+            }
+
+            const uint32_t tgt_idx = tail_head->frame_idx;
+            const uint32_t tgt_num = tail_head->slice_num;
+
+            auto begin = latest;
+            size_t count = 1;
+            while (begin != frames.cbegin())
+            {
+                auto prev = std::prev(begin);
+                const auto *head = reinterpret_cast<const SLICHead *>(prev->data);
+                if (head->frame_idx != tgt_idx)
+                {
+                    break;
+                }
+                begin = prev;
+                ++count;
+            }
+
+            if (count != tgt_num)
+            {
+                VIDEO_ERROR_PRINT("DecMgr: incomplete frame %u, got %zu/%u slices", tgt_idx, count, tgt_num);
+                return true;
+            }
+
+            for (auto it = begin; it != frames.cend(); ++it)
+            {
+                const auto *head = reinterpret_cast<const SLICHead *>(it->data);
+                if (!push_stream(it->data + sizeof(SLICHead), it->size - sizeof(SLICHead),
+                                 static_cast<StreamFlags>(head->slice_tok)))
+                {
+                    break;
+                }
+            }
+
             return true;
         });
+
         m_receiver->start();
 
         if (!m_cfg.udp_reply_addr.empty() && m_cfg.udp_reply_port > 0)

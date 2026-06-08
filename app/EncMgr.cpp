@@ -3,8 +3,6 @@
 #include "V4L2Source.h"
 #include "lib_network/ReliableUDP.h"
 
-#include <cstring>
-
 static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> weak_udp)
 {
     if (weak_udp.expired())
