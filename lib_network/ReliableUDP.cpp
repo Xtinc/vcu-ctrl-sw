@@ -33,6 +33,74 @@ static double calc_rate_bps(std::atomic<uint64_t> &total_bytes, std::mutex &rate
     return static_cast<double>(delta_bytes) * 8.0 / elapsed_seconds;
 }
 
+ClockSync::ClockSync()
+    : rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0), has_pending_probe_(false), pending_probe_seq_(0),
+      pending_probe_t1_ms_(0), pending_probe_sent_time_(std::chrono::steady_clock::now())
+{
+}
+
+int64_t ClockSync::rtt_ms() const
+{
+    return rtt_ms_.load(std::memory_order_relaxed);
+}
+
+int64_t ClockSync::offset_ms() const
+{
+    return offset_ms_.load(std::memory_order_relaxed);
+}
+
+bool ClockSync::is_time_synced() const
+{
+    return time_synced_.load(std::memory_order_relaxed);
+}
+
+TRXProbe ClockSync::make_ping(uint32_t now_ms)
+{
+    TRXProbe pkt{};
+    pkt.magic = MAGIC_TRX_PROBE_NUMBER;
+    pkt.type = 0;
+    pkt.seq = probe_seq_++;
+    pkt.t1_ms = now_ms;
+    return pkt;
+}
+
+TRXProbe ClockSync::make_pong(const TRXProbe &ping, uint32_t now_ms) const
+{
+    TRXProbe pong{};
+    pong.magic = MAGIC_TRX_PROBE_NUMBER;
+    pong.type = 1;
+    pong.seq = ping.seq;
+    pong.t1_ms = ping.t1_ms;
+    pong.t2_delta_ms = static_cast<int32_t>(now_ms - ping.t1_ms);
+    return pong;
+}
+
+void ClockSync::mark_ping_sent(const TRXProbe &ping, std::chrono::steady_clock::time_point sent_time)
+{
+    has_pending_probe_ = true;
+    pending_probe_seq_ = ping.seq;
+    pending_probe_t1_ms_ = ping.t1_ms;
+    pending_probe_sent_time_ = sent_time;
+}
+
+bool ClockSync::handle_pong(const TRXProbe &pong)
+{
+    if (!has_pending_probe_ || pong.seq != pending_probe_seq_ || pong.t1_ms != pending_probe_t1_ms_)
+    {
+        return false;
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - pending_probe_sent_time_;
+    const auto rtt = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    const auto offset = static_cast<int64_t>(pong.t2_delta_ms) - rtt / 2;
+
+    rtt_ms_.store(static_cast<int64_t>(rtt), std::memory_order_relaxed);
+    offset_ms_.store(offset, std::memory_order_relaxed);
+    time_synced_.store(true, std::memory_order_relaxed);
+    has_pending_probe_ = false;
+    return true;
+}
+
 // BackgroundService implementation
 BackgroundService &BackgroundService::instance()
 {
@@ -83,7 +151,7 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
       send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
       last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
       last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
-      probe_timer_(io_context_), rtt_ms_(-1), offset_ms_(0), time_synced_(false), probe_seq_(0)
+      probe_timer_(io_context_), clock_sync_()
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -188,12 +256,7 @@ bool ReliableUDP::add_destination(const std::string &address, unsigned short por
     VIDEO_INFO_PRINT("Destination set to %s:%u", endpoint.address().to_string().c_str(), endpoint.port());
 
     asio::post(strand_, [self = shared_from_this()]() {
-        TRXProbe pkt{};
-        pkt.magic = MAGIC_TRX_PROBE_NUMBER;
-        pkt.type = 0;
-        pkt.seq = self->probe_seq_++;
-        pkt.t1_ms = get_time_ms();
-        self->send_probe_packet(pkt, "ping");
+        self->send_ping_probe();
         self->schedule_probe();
     });
 
@@ -257,17 +320,17 @@ double ReliableUDP::lost_rate()
 
 int64_t ReliableUDP::rtt_ms() const
 {
-    return rtt_ms_.load(std::memory_order_relaxed);
+    return clock_sync_.rtt_ms();
 }
 
 int64_t ReliableUDP::offset_ms() const
 {
-    return offset_ms_.load(std::memory_order_relaxed);
+    return clock_sync_.offset_ms();
 }
 
 bool ReliableUDP::is_time_synced() const
 {
-    return time_synced_.load(std::memory_order_relaxed);
+    return clock_sync_.is_time_synced();
 }
 
 std::string ReliableUDP::queue_stats_text() const
@@ -960,14 +1023,24 @@ void ReliableUDP::send_queued_frame(const uint8_t *data, size_t size)
     }
 }
 
-void ReliableUDP::send_probe_packet(const TRXProbe &pkt, const char *label)
+void ReliableUDP::send_ping_probe()
+{
+    const auto pkt = clock_sync_.make_ping(get_time_ms());
+    const auto sent_time = std::chrono::steady_clock::now();
+    if (send_probe_packet(pkt, "ping"))
+    {
+        clock_sync_.mark_ping_sent(pkt, sent_time);
+    }
+}
+
+bool ReliableUDP::send_probe_packet(const TRXProbe &pkt, const char *label)
 {
     udp::endpoint target;
     {
         std::lock_guard<std::mutex> lock(target_mutex_);
         if (!destination_set_)
         {
-            return;
+            return false;
         }
         target = target_endpoint_;
     }
@@ -981,7 +1054,10 @@ void ReliableUDP::send_probe_packet(const TRXProbe &pkt, const char *label)
     if (ec)
     {
         VIDEO_ERROR_PRINT("[Probe] Failed to send %s: %s", label, ec.message().c_str());
+        return false;
     }
+
+    return true;
 }
 
 void ReliableUDP::schedule_probe()
@@ -990,12 +1066,7 @@ void ReliableUDP::schedule_probe()
     probe_timer_.async_wait(strand_.wrap([self = shared_from_this()](const asio::error_code &ec) {
         if (!ec)
         {
-            TRXProbe pkt{};
-            pkt.magic = MAGIC_TRX_PROBE_NUMBER;
-            pkt.type = 0;
-            pkt.seq = self->probe_seq_++;
-            pkt.t1_ms = get_time_ms();
-            self->send_probe_packet(pkt, "ping");
+            self->send_ping_probe();
             self->schedule_probe();
         }
     }));
@@ -1006,30 +1077,11 @@ void ReliableUDP::handle_probe_packet(const TRXProbe &pkt)
     if (pkt.type == 0)
     {
         // Ping received: reply with a pong.
-        TRXProbe pong{};
-        pong.magic = MAGIC_TRX_PROBE_NUMBER;
-        pong.type = 1;
-        pong.seq = pkt.seq;
-        pong.t1_ms = pkt.t1_ms;
-        pong.t2_delta_ms = static_cast<int32_t>(get_time_ms() - pkt.t1_ms);
-
+        const auto pong = clock_sync_.make_pong(pkt, get_time_ms());
         send_probe_packet(pong, "pong");
     }
     else if (pkt.type == 1)
     {
-        // Pong received: compute RTT and clock offset.
-        // Simplified NTP (T3 ~= T2 because pong is sent immediately):
-        //   RTT    = T4 - T1
-        //   offset = T2_delta - RTT/2
-        uint32_t t4_ms = get_time_ms();
-        int32_t rtt = static_cast<int32_t>(t4_ms - pkt.t1_ms);
-        int32_t offset = pkt.t2_delta_ms - rtt / 2;
-
-        if (rtt >= 0)
-        {
-            rtt_ms_.store(static_cast<int64_t>(rtt), std::memory_order_relaxed);
-            offset_ms_.store(static_cast<int64_t>(offset), std::memory_order_relaxed);
-            time_synced_.store(true, std::memory_order_relaxed);
-        }
+        clock_sync_.handle_pong(pkt);
     }
 }

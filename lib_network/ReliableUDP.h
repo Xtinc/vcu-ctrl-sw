@@ -45,6 +45,29 @@ struct TRXProbe
     int32_t t2_delta_ms; ///< pong: (int32_t)(receiver_time - t1_ms), range ±2^31 ms; ping: 0.
 };
 
+struct ClockSync
+{
+    ClockSync();
+
+    int64_t rtt_ms() const;
+    int64_t offset_ms() const;
+    bool is_time_synced() const;
+
+    TRXProbe make_ping(uint32_t now_ms);
+    TRXProbe make_pong(const TRXProbe &ping, uint32_t now_ms) const;
+    void mark_ping_sent(const TRXProbe &ping, std::chrono::steady_clock::time_point sent_time);
+    bool handle_pong(const TRXProbe &pong);
+
+    std::atomic<int64_t> rtt_ms_;
+    std::atomic<int64_t> offset_ms_;
+    std::atomic<bool> time_synced_;
+    uint8_t probe_seq_;
+    bool has_pending_probe_;
+    uint8_t pending_probe_seq_;
+    uint32_t pending_probe_t1_ms_;
+    std::chrono::steady_clock::time_point pending_probe_sent_time_;
+};
+
 struct TRXUnit
 {
     struct Header
@@ -233,8 +256,9 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void assemble_complete_message(uint16_t frame_seq, uint16_t group_num, uint16_t group_seq, uint8_t *data,
                                    size_t size);
     void generate_uuid();
+    void send_ping_probe();
     void schedule_probe();
-    void send_probe_packet(const TRXProbe &pkt, const char *label);
+    bool send_probe_packet(const TRXProbe &pkt, const char *label);
     void send_queued_frame(const uint8_t *data, size_t size);
     void handle_probe_packet(const TRXProbe &pkt);
 
@@ -282,10 +306,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     uint64_t last_recv_rate_bytes_;
 
     asio::steady_timer probe_timer_;
-    std::atomic<int64_t> rtt_ms_;
-    std::atomic<int64_t> offset_ms_;
-    std::atomic<bool> time_synced_;
-    uint8_t probe_seq_;
+    ClockSync clock_sync_;
 };
 
 #endif // RELIABLE_UDP_H

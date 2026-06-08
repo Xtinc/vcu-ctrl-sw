@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -1432,6 +1433,134 @@ static int run_jitter_tests()
     return failures == 0 ? 0 : 1;
 }
 
+static bool wait_for_rtt_sync(const std::shared_ptr<ReliableUDP> &a, const std::shared_ptr<ReliableUDP> &b,
+                              std::chrono::milliseconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        if ((a && a->is_time_synced()) || (b && b->is_time_synced()))
+        {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+static bool rtt_stats_are_reasonable(const ReliableUDP &udp)
+{
+    const auto rtt = udp.rtt_ms();
+    const auto offset = udp.offset_ms();
+    return rtt >= 0 && rtt < 200 && std::llabs(offset) < 200;
+}
+
+static bool test_rtt_bidirectional_sync()
+{
+    auto &ioc = BG_SERVICE;
+    auto a = std::make_shared<ReliableUDP>(ioc, 15101);
+    auto b = std::make_shared<ReliableUDP>(ioc, 15102);
+
+    a->start();
+    b->start();
+
+    const bool ok = a->add_destination("127.0.0.1", 15102) && b->add_destination("127.0.0.1", 15101) &&
+                    wait_for_rtt_sync(a, b, std::chrono::milliseconds(1500)) &&
+                    ((!a->is_time_synced() || rtt_stats_are_reasonable(*a)) &&
+                     (!b->is_time_synced() || rtt_stats_are_reasonable(*b)));
+
+    a->stop();
+    b->stop();
+    return ok;
+}
+
+static bool test_rtt_single_direction_stays_na()
+{
+    auto &ioc = BG_SERVICE;
+    auto a = std::make_shared<ReliableUDP>(ioc, 15103);
+    auto b = std::make_shared<ReliableUDP>(ioc, 15104);
+
+    a->start();
+    b->start();
+
+    const bool added = a->add_destination("127.0.0.1", 15104);
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+    const bool ok = added && !a->is_time_synced() && a->rtt_ms() == -1;
+
+    a->stop();
+    b->stop();
+    return ok;
+}
+
+static bool test_rtt_ignores_stale_pong()
+{
+    auto &ioc = BG_SERVICE;
+    auto a = std::make_shared<ReliableUDP>(ioc, 15105);
+
+    a->start();
+    const bool added = a->add_destination("127.0.0.1", 15106);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    asio::ip::udp::socket sock(ioc);
+    sock.open(asio::ip::udp::v4());
+
+    TRXProbe stale{};
+    stale.magic = MAGIC_TRX_PROBE_NUMBER;
+    stale.type = 1;
+    stale.seq = 99;
+    stale.t1_ms = 0;
+    stale.t2_delta_ms = 0;
+
+    asio::error_code ec;
+    sock.send_to(asio::buffer(&stale, sizeof(stale)), asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 15105),
+                 0, ec);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    const bool ok = added && !ec && !a->is_time_synced() && a->rtt_ms() == -1;
+
+    sock.close(ec);
+    a->stop();
+    return ok;
+}
+
+static int run_rtt_tests()
+{
+    struct Test
+    {
+        const char *name;
+        bool (*fn)();
+    };
+
+    const Test tests[] = {
+        {"bidirectional probe sync           ", test_rtt_bidirectional_sync},
+        {"single direction remains N/A       ", test_rtt_single_direction_stays_na},
+        {"stale pong ignored                 ", test_rtt_ignores_stale_pong},
+    };
+
+    std::cout << "\nReliableUDP RTT tests\n";
+    print_divider();
+
+    int failures = 0;
+    for (const auto &t : tests)
+    {
+        bool ok = t.fn();
+        std::cout << "  " << (ok ? "PASS" : "FAIL") << "  " << t.name << '\n';
+        if (!ok)
+            ++failures;
+    }
+
+    print_divider();
+    if (failures == 0)
+        std::cout << "  All RTT tests passed.\n";
+    else
+        std::cout << "  " << failures << " RTT test(s) FAILED.\n";
+    print_divider();
+    std::cout << '\n';
+
+    return failures == 0 ? 0 : 1;
+}
+
 struct TestConfig
 {
     size_t min_payload_bytes = 64;
@@ -1890,7 +2019,10 @@ int main(int argc, char *argv[])
         cfg.loss_rate_max = cfg.loss_rate_min;
     }
 
-    run_jitter_tests();
+    if (run_jitter_tests() != 0 || run_rtt_tests() != 0)
+    {
+        return 1;
+    }
 
     std::cout << "ReliableUDP loopback test\n";
     std::cout << "  Payload  : " << cfg.min_payload_bytes << " - " << cfg.max_payload_bytes << " bytes\n";
