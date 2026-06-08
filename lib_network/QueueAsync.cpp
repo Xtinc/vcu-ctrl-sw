@@ -241,6 +241,7 @@ void RecvQueueAsync::sanitize_tuning_locked()
 void RecvQueueAsync::reset_state_locked()
 {
     clear_buffered_frames_locked();
+    clear_delivered_frames_locked();
     primed_ = false;
     expected_seq_ = 0;
     next_delivery_time_ = ClockTP{};
@@ -267,6 +268,15 @@ void RecvQueueAsync::clear_buffered_frames_locked()
         release_frame_data(frame.data);
     }
     buffered_frames_.clear();
+}
+
+void RecvQueueAsync::clear_delivered_frames_locked()
+{
+    for (auto &frame : delivered_frames_)
+    {
+        release_frame_data(frame.data);
+    }
+    delivered_frames_.clear();
 }
 
 void RecvQueueAsync::start(RecvCallBack callback)
@@ -632,12 +642,14 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
                                     std::chrono::duration<double, std::milli>(compute_delivery_interval_locked()));
 
     ++counters_.deliver;
+    delivered_frames_.push_back({frame.data, frame.size});
 
+    bool should_release = true;
     lock.unlock();
     try
     {
         if (receive_callback_)
-            receive_callback_(frame.data, frame.size);
+            should_release = receive_callback_(delivered_frames_);
     }
     catch (const std::exception &e)
     {
@@ -648,7 +660,9 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
         VIDEO_ERROR_PRINT("[JitterBuf] receive callback threw unknown exception");
     }
     lock.lock();
-    release_frame_data(frame.data);
+
+    if (should_release)
+        clear_delivered_frames_locked();
 }
 
 void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
@@ -675,23 +689,31 @@ void RecvQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
     {
         auto frame = buffered_frames_.front();
         buffered_frames_.pop_front();
+        delivered_frames_.push_back({frame.data, frame.size});
+
+        bool should_release = true;
         lock.unlock();
 
         try
         {
             if (receive_callback_)
-                receive_callback_(frame.data, frame.size);
+                should_release = receive_callback_(delivered_frames_);
         }
         catch (const std::exception &e)
         {
             VIDEO_ERROR_PRINT("[JitterBuf] receive callback threw exception while draining: %s", e.what());
+            should_release = true;
         }
         catch (...)
         {
             VIDEO_ERROR_PRINT("[JitterBuf] receive callback threw unknown exception while draining");
+            should_release = true;
         }
 
         lock.lock();
-        release_frame_data(frame.data);
+        if (should_release)
+            clear_delivered_frames_locked();
     }
+
+    clear_delivered_frames_locked();
 }

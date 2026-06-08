@@ -30,8 +30,8 @@ static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> 
 
         const auto send_sz = slice_header_size + size;
         udp->send_fill(send_sz, [data, size, frame_idx, slice_num, eof](uint8_t *dst, size_t) {
-            SLICHead head{static_cast<uint8_t>(slice_num),
-                          static_cast<uint8_t>(eof ? StreamFlags::EndOfFrame : StreamFlags::EndOfSlice), frame_idx};
+            SLICHead head{static_cast<uint8_t>(eof ? StreamFlags::EndOfFrame : StreamFlags::EndOfSlice),
+                          static_cast<uint8_t>(slice_num), frame_idx};
             std::memcpy(dst, &head, sizeof(head));
             std::memcpy(dst + sizeof(head), data, size);
         });

@@ -6,8 +6,15 @@
 #include <condition_variable>
 #include <functional>
 #include <thread>
+#include <vector>
 
-using RecvCallBack = std::function<void(const uint8_t *data, size_t size)>;
+struct QueueFrame
+{
+    uint8_t *data = nullptr;
+    size_t size = 0;
+};
+
+using RecvCallBack = std::function<bool(const std::vector<QueueFrame> &frames)>;
 using SendCallBack = std::function<void(const uint8_t *data, size_t size)>;
 using FillCallback = std::function<void(uint8_t *data, size_t size)>;
 
@@ -16,12 +23,6 @@ constexpr size_t SEND_QUEUE_MAX_PACKET_SIZE = 65535;
 
 class SendQueueAsync
 {
-    struct Slot
-    {
-        uint8_t *data = nullptr;
-        size_t size = 0;
-    };
-
   public:
     SendQueueAsync();
     ~SendQueueAsync();
@@ -36,7 +37,7 @@ class SendQueueAsync
     void clear_queued_locked();
     void reset_storage_locked();
 
-    std::array<Slot, SEND_QUEUE_DEPTH> slots_;
+    std::array<QueueFrame, SEND_QUEUE_DEPTH> slots_;
     std::array<size_t, SEND_QUEUE_DEPTH> free_indices_;
     std::array<size_t, SEND_QUEUE_DEPTH> queued_indices_;
 
@@ -106,6 +107,7 @@ class RecvQueueAsync
     void sanitize_tuning_locked();
     void reset_state_locked();
     void clear_buffered_frames_locked();
+    void clear_delivered_frames_locked();
     void drain_locked(std::unique_lock<std::mutex> &lock);
     void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
     void update_depth_estimate_locked(double depth);
@@ -128,6 +130,7 @@ class RecvQueueAsync
     bool running_;
 
     std::list<BufferedFrame> buffered_frames_;
+    std::vector<QueueFrame> delivered_frames_;
     bool primed_;
     uint32_t expected_seq_;
     ClockTP next_delivery_time_;

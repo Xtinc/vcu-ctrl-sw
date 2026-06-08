@@ -74,6 +74,17 @@ static bool enqueue_with_retry(RecvQueueAsync &q, uint8_t *data, size_t size, ui
     return false;
 }
 
+template <typename Callback> static RecvCallBack single_frame_callback(Callback callback)
+{
+    return [callback](const std::vector<QueueFrame> &frames) {
+        for (const auto &frame : frames)
+        {
+            callback(frame.data, frame.size);
+        }
+        return true;
+    };
+}
+
 static std::string queue_stat_value(const std::string &stats, const std::string &key)
 {
     const auto pos = stats.find(key);
@@ -136,13 +147,13 @@ static bool test_jitter_inorder()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         received.push_back(v);
         cv.notify_one();
-    });
+    }));
 
     for (uint32_t i = 0; i < N; i++)
     {
@@ -182,13 +193,13 @@ static bool test_jitter_reorder_complete()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         received.push_back(v);
         cv.notify_one();
-    });
+    }));
 
     for (uint32_t i = 0; i < N; i += 2)
     {
@@ -234,13 +245,13 @@ static bool test_jitter_no_duplicates()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         received.push_back(v);
         cv.notify_one();
-    });
+    }));
 
     for (uint32_t i = 0; i < N; i++)
     {
@@ -274,6 +285,67 @@ static bool test_jitter_no_duplicates()
     return true;
 }
 
+static bool test_jitter_callback_retains_until_release()
+{
+    constexpr uint32_t N = 12;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<size_t> batch_sizes;
+    std::vector<uint32_t> batch_tails;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    RecvQueueAsync q;
+    q.start([&](const std::vector<QueueFrame> &frames) {
+        uint32_t tail = 0;
+        if (!frames.empty())
+            std::memcpy(&tail, frames.back().data, 4);
+
+        std::lock_guard<std::mutex> lk(mtx);
+        batch_sizes.push_back(frames.size());
+        batch_tails.push_back(tail);
+        cv.notify_one();
+
+        return frames.size() >= 2;
+    });
+
+    for (uint32_t i = 0; i < N; i++)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (!enqueue_with_retry(q, bufs[i].data(), 4, i))
+        {
+            q.stop();
+            return false;
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(2), [&] { return batch_sizes.size() >= 3; });
+    }
+    q.stop();
+
+    if (batch_sizes.size() < 3)
+    {
+        std::cout << "  [callback_retain] expected at least 3 callbacks, got " << batch_sizes.size() << '\n';
+        return false;
+    }
+    if (batch_sizes[0] != 1 || batch_sizes[1] != 2 || batch_sizes[2] != 1)
+    {
+        std::cout << "  [callback_retain] unexpected batch sizes: " << batch_sizes[0] << ", " << batch_sizes[1]
+                  << ", " << batch_sizes[2] << '\n';
+        return false;
+    }
+    if (batch_tails[0] != 0 || batch_tails[1] != 1 || batch_tails[2] != 2)
+    {
+        std::cout << "  [callback_retain] unexpected batch tails\n";
+        return false;
+    }
+    return true;
+}
+
 static bool test_jitter_stats_snapshot_is_read_only()
 {
     std::array<uint8_t, 4> buf{};
@@ -281,7 +353,7 @@ static bool test_jitter_stats_snapshot_is_read_only()
     std::memcpy(buf.data(), &value, 4);
 
     RecvQueueAsync q;
-    q.start([](const uint8_t *, size_t) {});
+    q.start(single_frame_callback([](const uint8_t *, size_t) {}));
 
     bool ok = true;
     ok = ok && q.enqueue(buf.data(), buf.size(), 0);
@@ -314,7 +386,7 @@ static bool test_jitter_inorder_prefill_not_reorder()
         std::memcpy(bufs[i].data(), &i, 4);
 
     RecvQueueAsync q;
-    q.start([](const uint8_t *, size_t) {});
+    q.start(single_frame_callback([](const uint8_t *, size_t) {}));
 
     for (uint32_t i = 0; i < N; i++)
     {
@@ -353,11 +425,11 @@ static bool test_jitter_depth_recovers()
 
     RecvQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
-    q.start([&](const uint8_t *, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ++delivered;
         cv.notify_one();
-    });
+    }));
 
     // Phase 1: 100 pairwise-swapped frames to push disorder up.
     constexpr uint32_t PHASE1 = 100;
@@ -434,13 +506,13 @@ static bool test_jitter_window_shuffle()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         received.push_back(v);
         cv.notify_one();
-    });
+    }));
 
     std::mt19937 rng(0xCAFEBEEF);
     for (uint32_t base = 0; base < N; base += WINDOW)
@@ -504,11 +576,11 @@ static bool test_jitter_adapt_up_down()
 
     RecvQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
-    q.start([&](const uint8_t *, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ++delivered;
         cv.notify_one();
-    });
+    }));
 
     // Phase 1: window-shuffle disorder.
     std::mt19937 rng(0xDEADC0DE);
@@ -583,13 +655,13 @@ static bool test_jitter_permanent_gap()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         received.push_back(v);
         cv.notify_one();
-    });
+    }));
 
     for (uint32_t i = 0; i < N; i++)
         if (i != SKIP)
@@ -658,11 +730,11 @@ static bool test_jitter_timing_uniformity()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ts.push_back(std::chrono::steady_clock::now());
         cv.notify_one();
-    });
+    }));
 
     // Send frames window-shuffled, each delayed by nominal interval ± jitter.
     std::mt19937 rng(0xABCD1234);
@@ -751,11 +823,11 @@ static bool test_jitter_adaptive_estimation()
 
     RecvQueueAsync q;
     const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
-    q.start([&](const uint8_t *, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ++delivered;
         cv.notify_one();
-    });
+    }));
 
     // Phase 1: high timing jitter with consecutive sequence numbers.
     // This directly exercises the jitter_ms_/recv_interval_ms estimator path.
@@ -841,14 +913,14 @@ static bool test_jitter_bimodal_jitter_uniformity()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         ts.push_back(std::chrono::steady_clock::now());
         received_seqs.push_back(v);
         cv.notify_one();
-    });
+    }));
 
     std::mt19937 rng(0xF00DCAFE);
     uint32_t send_count = 0;
@@ -959,14 +1031,14 @@ static bool test_jitter_burst_silence_uniformity()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         ts.push_back(std::chrono::steady_clock::now());
         received_seqs.push_back(v);
         cv.notify_one();
-    });
+    }));
 
     std::mt19937 rng(0xBEEFCAFE);
     for (uint32_t b = 0; b < BURST_COUNT; b++)
@@ -1087,14 +1159,14 @@ static bool test_jitter_large_window_order()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const uint8_t *data, size_t) {
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
         uint32_t v;
         std::memcpy(&v, data, 4);
         std::lock_guard<std::mutex> lk(mtx);
         received_seqs.push_back(v);
         ts.push_back(std::chrono::steady_clock::now());
         cv.notify_one();
-    });
+    }));
 
     std::mt19937 rng(0x12345678);
     std::uniform_real_distribution<double> jdist(0.0, MAX_JITTER_MS);
@@ -1323,6 +1395,7 @@ static int run_jitter_tests()
         {"in-order delivery preserves order   ", test_jitter_inorder},
         {"reorder: all frames received        ", test_jitter_reorder_complete},
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
+        {"callback retains until release      ", test_jitter_callback_retains_until_release},
         {"stats snapshot is read-only        ", test_jitter_stats_snapshot_is_read_only},
         {"in-order prefill is not reorder     ", test_jitter_inorder_prefill_not_reorder},
         {"fixed depth stays stable after reorder", test_jitter_depth_recovers},
@@ -1615,7 +1688,13 @@ static void run_fec_test(const TestConfig &cfg)
     // Pre-size the seen-bitmap generously (16-bit seq wraps at 65536)
     state.seq_seen.assign(65536, 0);
 
-    receiver->set_receive_callback([&state](const uint8_t *data, size_t size) { state.on_receive(data, size); });
+    receiver->set_receive_callback([&state](const std::vector<QueueFrame> &frames) {
+        for (const auto &frame : frames)
+        {
+            state.on_receive(frame.data, frame.size);
+        }
+        return true;
+    });
     receiver->start();
 
     LossyProxy proxy(ioc, cfg.proxy_port, cfg.receiver_port, cfg.loss_rate_min, cfg.loss_rate_max);

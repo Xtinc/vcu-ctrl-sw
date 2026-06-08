@@ -77,14 +77,19 @@ bool DecMgr::start()
         }
 
         m_receiver = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
-        m_receiver->set_receive_callback([this](const uint8_t *data, size_t size) {
-            if (size < sizeof(SLICHead))
+        m_receiver->set_receive_callback([this](const std::vector<QueueFrame> &frames) {
+            for (const auto &frame : frames)
             {
-                return;
-            }
+                if (frame.size < sizeof(SLICHead))
+                {
+                    continue;
+                }
 
-            const auto *head = reinterpret_cast<const SLICHead *>(data);
-            push_stream(data + sizeof(SLICHead), size - sizeof(SLICHead), static_cast<StreamFlags>(head->slice_tok));
+                const auto *head = reinterpret_cast<const SLICHead *>(frame.data);
+                push_stream(frame.data + sizeof(SLICHead), frame.size - sizeof(SLICHead),
+                            static_cast<StreamFlags>(head->slice_tok));
+            }
+            return true;
         });
         m_receiver->start();
 
