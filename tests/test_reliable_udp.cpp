@@ -640,8 +640,8 @@ static bool test_jitter_adapt_up_down()
 }
 
 /// A permanently missing frame (SKIP) must not stall delivery of all subsequent
-/// frames.  The jitter buffer must skip the gap (via depth_reached or the
-/// 200 ms flush timeout) and deliver every other frame exactly once.
+/// frames.  The jitter buffer must skip the gap via depth pressure or the
+/// adaptive gap wait and deliver every other frame exactly once.
 static bool test_jitter_permanent_gap()
 {
     constexpr uint32_t N = 20;
@@ -671,7 +671,7 @@ static bool test_jitter_permanent_gap()
             q.enqueue(bufs[i].data(), 4, i);
         }
 
-    // Wait up to 2× FLUSH_TIMEOUT (400 ms) for the gap to be skipped.
+    // Wait long enough for the default adaptive gap wait (~208 ms) to expire.
     const size_t expected = N - 1;
     {
         std::unique_lock<std::mutex> lk(mtx);

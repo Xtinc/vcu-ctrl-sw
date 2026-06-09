@@ -58,6 +58,15 @@ class SendQueueAsync
 class RecvQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
+    enum class WorkerState
+    {
+        WaitingForFrames,
+        Priming,
+        Pacing,
+        Delivering,
+        WaitingForGap,
+    };
+
     struct Tunables
     {
         size_t target_depth = 10;
@@ -104,6 +113,8 @@ class RecvQueueAsync
 
   private:
     void worker_thread();
+    WorkerState worker_state_locked(ClockTP now) const;
+    void handle_gap_locked(std::unique_lock<std::mutex> &lock, ClockTP now);
     void sanitize_tuning_locked();
     void reset_state_locked();
     void clear_buffered_frames_locked();

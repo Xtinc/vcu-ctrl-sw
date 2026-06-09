@@ -542,6 +542,51 @@ std::string RecvQueueAsync::stats_text() const
     return os.str();
 }
 
+RecvQueueAsync::WorkerState RecvQueueAsync::worker_state_locked(ClockTP now) const
+{
+    if (buffered_frames_.empty())
+        return WorkerState::WaitingForFrames;
+
+    if (!primed_)
+        return WorkerState::Priming;
+
+    if (now < next_delivery_time_)
+        return WorkerState::Pacing;
+
+    if (buffered_frames_.front().seq <= expected_seq_)
+        return WorkerState::Delivering;
+
+    return WorkerState::WaitingForGap;
+}
+
+void RecvQueueAsync::handle_gap_locked(std::unique_lock<std::mutex> &lock, ClockTP now)
+{
+    if (buffered_frames_.empty() || buffered_frames_.front().seq <= expected_seq_)
+        return;
+
+    if (!gap_active_)
+    {
+        gap_active_ = true;
+        gap_start_time_ = now;
+    }
+
+    const auto gap_deadline =
+        gap_start_time_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                              std::chrono::duration<double, std::milli>(compute_gap_wait_ms_locked()));
+    const size_t pressure_depth = tuning_.target_depth + static_cast<size_t>(std::ceil(disorder_guard_depth_frames_));
+    const bool depth_pressure = buffered_frames_.size() > pressure_depth;
+    if (depth_pressure || now >= gap_deadline)
+    {
+        skip_gap_locked(buffered_frames_.front().seq);
+        return;
+    }
+
+    cond_.wait_until(lock, gap_deadline, [this, pressure_depth] {
+        return !running_ || buffered_frames_.empty() || buffered_frames_.front().seq <= expected_seq_ ||
+               buffered_frames_.size() > pressure_depth;
+    });
+}
+
 void RecvQueueAsync::worker_thread()
 {
     set_current_thread_scheduler_policy();
@@ -559,70 +604,41 @@ void RecvQueueAsync::worker_thread()
             break;
         }
 
-        if (buffered_frames_.empty())
+        switch (worker_state_locked(now))
         {
+        case WorkerState::WaitingForFrames:
             gap_active_ = false;
             cond_.wait(lock, [this] { return !running_ || !buffered_frames_.empty(); });
-            continue;
-        }
-
-        if (!primed_)
-        {
+            break;
+        case WorkerState::Priming:
             if (buffered_frames_.size() < tuning_.startup_depth)
             {
                 cond_.wait(lock, [this] { return !running_ || buffered_frames_.size() >= tuning_.startup_depth; });
-                continue;
+                break;
             }
 
             primed_ = true;
             expected_seq_ = buffered_frames_.front().seq;
             next_delivery_time_ = now;
             gap_active_ = false;
-        }
-
-        if (std::chrono::steady_clock::now() < next_delivery_time_)
-        {
+            break;
+        case WorkerState::Pacing:
             cond_.wait_until(lock, next_delivery_time_);
-            continue;
-        }
+            break;
+        case WorkerState::Delivering:
+            if (buffered_frames_.front().seq == expected_seq_)
+            {
+                deliver_one_locked(lock);
+                break;
+            }
 
-        if (buffered_frames_.front().seq == expected_seq_)
-        {
-            deliver_one_locked(lock);
-            continue;
-        }
-
-        if (buffered_frames_.front().seq < expected_seq_)
-        {
             ++counters_.drop;
-            auto stale_front = buffered_frames_.begin();
-            drop_frame_locked(stale_front);
-            continue;
+            drop_frame_locked(buffered_frames_.begin());
+            break;
+        case WorkerState::WaitingForGap:
+            handle_gap_locked(lock, now);
+            break;
         }
-
-        if (!gap_active_)
-        {
-            gap_active_ = true;
-            gap_start_time_ = std::chrono::steady_clock::now();
-        }
-
-        const auto gap_deadline =
-            gap_start_time_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                  std::chrono::duration<double, std::milli>(compute_gap_wait_ms_locked()));
-        const size_t pressure_depth =
-            tuning_.target_depth + static_cast<size_t>(std::ceil(disorder_guard_depth_frames_));
-        const bool depth_pressure = buffered_frames_.size() > pressure_depth;
-        const auto gap_now = std::chrono::steady_clock::now();
-        if (depth_pressure || gap_now >= gap_deadline)
-        {
-            skip_gap_locked(buffered_frames_.front().seq);
-            continue;
-        }
-
-        cond_.wait_until(lock, gap_deadline, [this, pressure_depth] {
-            return !running_ || buffered_frames_.empty() || buffered_frames_.front().seq <= expected_seq_ ||
-                   buffered_frames_.size() > pressure_depth;
-        });
     }
 }
 
