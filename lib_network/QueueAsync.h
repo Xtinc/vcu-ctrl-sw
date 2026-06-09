@@ -71,14 +71,14 @@ class RecvQueueAsync
     {
         size_t min_depth = 4;
         size_t initial_depth = 10;
-        size_t max_depth = 48;
-        size_t max_buffered_frames = 128;
+        size_t max_depth = 64;
+        size_t max_buffered_frames = 256;
         double stale_timeout_ms = 2000.0;
         double default_frame_interval_ms = 16.0;
         double depth_feedback_gain = 0.08;
         double min_pacing_factor = 0.70;
         double max_pacing_factor = 1.30;
-        double depth_margin_frames = 2.0;
+        double depth_margin_frames = 0.5;
         double jitter_weight = 2.0;
         uint32_t pressure_bonus_frames = 30;
         double rise_alpha = 0.20;
@@ -171,9 +171,9 @@ class RecvQueueAsync
     size_t adaptive_depth_;
     double smoothed_depth_frames_;
     double raw_depth_frames_;
-    uint64_t last_pressure_total_;
+    bool pressure_event_pending_;
     uint32_t pressure_bonus_frames_remaining_;
-    Counters counters_;
+    mutable Counters counters_;
 };
 
 void set_current_thread_scheduler_policy();

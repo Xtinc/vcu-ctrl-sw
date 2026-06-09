@@ -359,7 +359,7 @@ static bool test_jitter_callback_retains_until_release()
     return true;
 }
 
-static bool test_jitter_stats_snapshot_is_read_only()
+static bool test_jitter_stats_counters_clear_after_read()
 {
     std::array<uint8_t, 4> buf{};
     uint32_t value = 1;
@@ -372,18 +372,19 @@ static bool test_jitter_stats_snapshot_is_read_only()
     ok = ok && q.enqueue(buf.data(), buf.size(), 0);
     q.enqueue(buf.data(), buf.size(), 0);
 
-    const std::string peek = q.stats_text();
-    if (queue_stat_u64(peek, "q_recv=") != 2 || queue_stat_u64(peek, "q_dup=") != 1 ||
-        queue_stat_current_depth(peek) != 1 || queue_stat_adaptive_depth(peek) == 0)
+    const std::string first = q.stats_text();
+    if (queue_stat_u64(first, "q_recv=") != 2 || queue_stat_u64(first, "q_dup=") != 1 ||
+        queue_stat_current_depth(first) != 1 || queue_stat_adaptive_depth(first) == 0)
     {
-        std::cout << "  [stats_snapshot] unexpected peek stats: " << peek << '\n';
+        std::cout << "  [stats_delta] unexpected first stats: " << first << '\n';
         ok = false;
     }
 
-    const std::string again = q.stats_text();
-    if (again != peek)
+    const std::string second = q.stats_text();
+    if (queue_stat_u64(second, "q_recv=") != 0 || queue_stat_u64(second, "q_dup=") != 0 ||
+        queue_stat_current_depth(second) != 1 || queue_stat_adaptive_depth(second) == 0)
     {
-        std::cout << "  [stats_snapshot] stats_text() mutated counters unexpectedly\n";
+        std::cout << "  [stats_delta] counters did not clear after stats_text(): " << second << '\n';
         ok = false;
     }
 
@@ -1408,7 +1409,7 @@ static int run_jitter_tests()
         {"reorder: all frames received        ", test_jitter_reorder_complete},
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
         {"callback retains until release      ", test_jitter_callback_retains_until_release},
-        {"stats snapshot is read-only        ", test_jitter_stats_snapshot_is_read_only},
+        {"stats counters clear after read    ", test_jitter_stats_counters_clear_after_read},
         {"in-order prefill is not reorder     ", test_jitter_inorder_prefill_not_reorder},
         {"auto depth bounded after reorder    ", test_jitter_depth_recovers},
         {"window-shuffle: order under auto depth", test_jitter_window_shuffle},

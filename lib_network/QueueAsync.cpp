@@ -211,7 +211,7 @@ RecvQueueAsync::RecvQueueAsync()
     : frame_pool_(64), running_(false), primed_(false), expected_seq_(0), gap_active_(false), has_arrival_ref_(false),
       last_rate_seq_(0), has_highest_arrival_seq_(false), highest_arrival_seq_(0), avg_interval_ms_(0.0),
       jitter_ms_(0.0), avg_depth_frames_(0.0), disorder_depth_frames_(0.0), disorder_guard_depth_frames_(0.0),
-      adaptive_depth_(0), smoothed_depth_frames_(0.0), raw_depth_frames_(0.0), last_pressure_total_(0),
+      adaptive_depth_(0), smoothed_depth_frames_(0.0), raw_depth_frames_(0.0), pressure_event_pending_(false),
       pressure_bonus_frames_remaining_(0)
 {
     sanitize_tuning_locked();
@@ -243,8 +243,8 @@ void RecvQueueAsync::sanitize_tuning_locked()
     tuning_.rise_alpha = clamp_value(tuning_.rise_alpha, 0.01, 1.0);
     tuning_.fall_alpha = clamp_value(tuning_.fall_alpha, 0.001, 1.0);
 
-    adaptive_depth_ = clamp_value(adaptive_depth_ == 0 ? tuning_.min_depth : adaptive_depth_,
-                                  tuning_.min_depth, tuning_.max_depth);
+    adaptive_depth_ =
+        clamp_value(adaptive_depth_ == 0 ? tuning_.min_depth : adaptive_depth_, tuning_.min_depth, tuning_.max_depth);
     if (smoothed_depth_frames_ <= 0.0)
         smoothed_depth_frames_ = static_cast<double>(adaptive_depth_);
     smoothed_depth_frames_ = clamp_value(smoothed_depth_frames_, static_cast<double>(tuning_.min_depth),
@@ -275,7 +275,7 @@ void RecvQueueAsync::reset_state_locked()
     adaptive_depth_ = tuning_.initial_depth;
     smoothed_depth_frames_ = static_cast<double>(adaptive_depth_);
     raw_depth_frames_ = static_cast<double>(adaptive_depth_);
-    last_pressure_total_ = 0;
+    pressure_event_pending_ = false;
     pressure_bonus_frames_remaining_ = 0;
     counters_ = Counters{};
 }
@@ -350,14 +350,13 @@ double RecvQueueAsync::frame_interval_ms_locked() const
 
 double RecvQueueAsync::pressure_bonus_locked()
 {
-    const uint64_t pressure_total = counters_.skip + counters_.late + counters_.overflow;
-    if (pressure_total != last_pressure_total_)
+    if (pressure_event_pending_)
     {
-        last_pressure_total_ = pressure_total;
+        pressure_event_pending_ = false;
         pressure_bonus_frames_remaining_ = std::max(pressure_bonus_frames_remaining_, tuning_.pressure_bonus_frames);
     }
 
-    return pressure_bonus_frames_remaining_ > 0 ? 2.0 : 0.0;
+    return pressure_bonus_frames_remaining_ > 0 ? 1.0 : 0.0;
 }
 
 void RecvQueueAsync::update_adaptive_depth_locked()
@@ -366,8 +365,8 @@ void RecvQueueAsync::update_adaptive_depth_locked()
     const double jitter_frames = jitter_ms_ / base_interval_ms;
     const double disorder_frames = std::max(disorder_depth_frames_, disorder_guard_depth_frames_);
 
-    raw_depth_frames_ = disorder_frames + tuning_.jitter_weight * jitter_frames +
-                        tuning_.depth_margin_frames + pressure_bonus_locked();
+    raw_depth_frames_ =
+        disorder_frames + tuning_.jitter_weight * jitter_frames + tuning_.depth_margin_frames + pressure_bonus_locked();
 
     const size_t desired_depth =
         clamp_value(static_cast<size_t>(std::ceil(raw_depth_frames_)), tuning_.min_depth, tuning_.max_depth);
@@ -545,6 +544,7 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     if (primed_ && abs_seq < expected_seq_)
     {
         ++counters_.late;
+        pressure_event_pending_ = true;
         update_adaptive_depth_locked();
         return false;
     }
@@ -578,6 +578,7 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         auto tail = std::prev(buffered_frames_.end());
         ++counters_.drop;
         ++counters_.overflow;
+        pressure_event_pending_ = true;
         drop_frame_locked(tail);
         update_adaptive_depth_locked();
     }
@@ -596,10 +597,11 @@ std::string RecvQueueAsync::stats_text() const
     os << std::fixed << std::setprecision(2) << "q_avg_fi=" << interval_ms << "ms, q_jitter=" << jitter_ms_ << "ms/"
        << (jitter_ms_ / interval_ms) << "f, q_dis=" << disorder_depth_frames_ << "f/" << counters_.max_disorder_depth
        << ", q_depth=" << buffered_frames_.size() << '/' << avg_depth_frames_ << '/' << adaptive_depth_
-       << ", q_depth_raw=" << raw_depth_frames_
-       << ", q_recv=" << counters_.recv << ", q_dlv=" << counters_.deliver << ", q_skip=" << counters_.skip
-       << ", q_drop=" << counters_.drop << ", q_dup=" << counters_.duplicate << ", q_late=" << counters_.late
-       << ", q_reorder=" << counters_.reorder << ", q_stale=" << counters_.stale << ", q_ovf=" << counters_.overflow;
+       << ", q_depth_raw=" << raw_depth_frames_ << ", q_recv=" << counters_.recv << ", q_dlv=" << counters_.deliver
+       << ", q_skip=" << counters_.skip << ", q_drop=" << counters_.drop << ", q_dup=" << counters_.duplicate
+       << ", q_late=" << counters_.late << ", q_reorder=" << counters_.reorder << ", q_stale=" << counters_.stale
+       << ", q_ovf=" << counters_.overflow;
+    counters_ = {};
     return os.str();
 }
 
@@ -757,6 +759,7 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
         disorder_depth_frames_);
 
     counters_.skip += missing;
+    pressure_event_pending_ = true;
     update_adaptive_depth_locked();
 
     expected_seq_ = next_available_seq;
