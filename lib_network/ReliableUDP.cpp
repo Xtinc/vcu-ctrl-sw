@@ -497,28 +497,67 @@ void ReliableUDP::create_small_rtx_group(std::vector<TRXUnit> &all_units, const 
                                          size_t current_group_size, uint16_t current_group_id, uint16_t uid,
                                          uint16_t current_frame_id, uint16_t total_groups)
 {
-    TRXUnit unit;
-    unit.head.group_seq = current_group_id;
-    unit.head.units_idx = 0;
-    unit.head.units_num = 2;
-    unit.head.group_len = static_cast<uint16_t>(current_group_size);
-    unit.head.frame_seq = current_frame_id;
-    unit.head.group_num = total_groups;
-    unit.head.units_len = static_cast<uint16_t>(current_group_size);
-    unit.head.conn_uuid = uid;
-    unit.head.check_sum = TRXUnit::adler_8(&unit.head);
+    const size_t packet_size = (current_group_size + MAX_XOR_PACKET_NUM_PER_GROUP - 1) / MAX_XOR_PACKET_NUM_PER_GROUP;
+    if (packet_size > MAX_TRX_DATA_SIZE)
+    {
+        VIDEO_ERROR_PRINT("Packet size %zu exceeds MAX_DATA_SIZE %zu", packet_size, MAX_TRX_DATA_SIZE);
+        return;
+    }
 
-    unit.data = static_cast<uint8_t *>(send_pool_.allocate(current_group_size));
-    memcpy(unit.data, data, current_group_size);
+    uint8_t *data_blocks[MAX_XOR_PACKET_NUM_PER_GROUP]{};
+    all_units.reserve(all_units.size() + TRX_XOR_FEC_GROUP_UNIT_NUMS);
 
-    auto redundant_unit = unit;
-    redundant_unit.head.units_idx = 1;
-    redundant_unit.head.check_sum = TRXUnit::adler_8(&redundant_unit.head);
-    redundant_unit.data = static_cast<uint8_t *>(send_pool_.allocate(current_group_size));
-    memcpy(redundant_unit.data, data, current_group_size);
+    size_t group_offset = 0;
+    for (size_t i = 0; i < MAX_XOR_PACKET_NUM_PER_GROUP; ++i)
+    {
+        TRXUnit unit;
+        unit.head.group_seq = current_group_id;
+        unit.head.units_idx = static_cast<uint8_t>(i);
+        unit.head.units_num = static_cast<uint8_t>(TRX_XOR_FEC_GROUP_UNIT_NUMS);
+        unit.head.group_len = static_cast<uint16_t>(current_group_size);
+        unit.head.frame_seq = current_frame_id;
+        unit.head.group_num = static_cast<uint8_t>(total_groups);
+        unit.head.units_len = static_cast<uint16_t>(packet_size);
+        unit.head.conn_uuid = uid;
+        unit.head.check_sum = TRXUnit::adler_8(&unit.head);
 
-    all_units.push_back(unit);
-    all_units.push_back(redundant_unit);
+        unit.data = static_cast<uint8_t *>(send_pool_.allocate(packet_size));
+
+        size_t current_size = 0;
+        if (group_offset < current_group_size)
+        {
+            current_size = std::min(packet_size, current_group_size - group_offset);
+        }
+
+        memcpy(unit.data, data + group_offset, current_size);
+        if (current_size != packet_size)
+        {
+            memset(unit.data + current_size, 0, packet_size - current_size);
+        }
+
+        group_offset += current_size;
+        data_blocks[i] = unit.data;
+        all_units.push_back(unit);
+    }
+
+    TRXUnit parity_unit;
+    parity_unit.head.group_seq = current_group_id;
+    parity_unit.head.units_idx = static_cast<uint8_t>(MAX_XOR_PACKET_NUM_PER_GROUP);
+    parity_unit.head.units_num = static_cast<uint8_t>(TRX_XOR_FEC_GROUP_UNIT_NUMS);
+    parity_unit.head.group_len = static_cast<uint16_t>(current_group_size);
+    parity_unit.head.frame_seq = current_frame_id;
+    parity_unit.head.group_num = static_cast<uint8_t>(total_groups);
+    parity_unit.head.units_len = static_cast<uint16_t>(packet_size);
+    parity_unit.head.conn_uuid = uid;
+    parity_unit.head.check_sum = TRXUnit::adler_8(&parity_unit.head);
+
+    parity_unit.data = static_cast<uint8_t *>(send_pool_.allocate(packet_size));
+    for (size_t i = 0; i < packet_size; ++i)
+    {
+        parity_unit.data[i] = data_blocks[0][i] ^ data_blocks[1][i];
+    }
+
+    all_units.push_back(parity_unit);
 }
 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
@@ -632,12 +671,10 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
     it->set_received(idx);
 
     auto data_packets_count = 0;
-    bool use_rs_fec = false;
 
     if (units_num == TRX_RS_FEC_GROUP_UNIT_NUMS)
     {
         data_packets_count = MAX_RS_PACKET_NUM_PER_GROUP;
-        use_rs_fec = true;
     }
     else
     {
@@ -654,16 +691,8 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         it->units.push_back(unit);
         auto sentinel = it->units.front();
         sentinel.data = nullptr;
-        if (use_rs_fec)
-        {
-            auto units_copy = std::move(it->units);
-            try_recover_group(units_copy, data_packets_count);
-        }
-        else
-        {
-            assemble_complete_message(unit.head.frame_seq, unit.head.group_num, unit.head.group_seq, unit.data,
-                                      unit.head.group_len);
-        }
+        auto units_copy = std::move(it->units);
+        try_recover_group(units_copy, data_packets_count);
         it->units.clear();
         it->units.push_back(sentinel);
     }
@@ -731,7 +760,7 @@ void ReliableUDP::reset_receive_state_for_new_epoch(uint16_t uid)
 
 void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_packets_count)
 {
-    if (units.empty() || !rs_)
+    if (units.empty())
     {
         return;
     }
@@ -739,6 +768,100 @@ void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_pa
     std::sort(units.begin(), units.end(),
               [](const TRXUnit &a, const TRXUnit &b) { return a.head.units_idx < b.head.units_idx; });
 
+    if (static_cast<uint8_t>(units[0].head.units_num) == TRX_XOR_FEC_GROUP_UNIT_NUMS)
+    {
+        try_recover_xor_group(units);
+    }
+    else
+    {
+        try_recover_rs_group(units, data_packets_count);
+    }
+}
+
+void ReliableUDP::try_recover_xor_group(std::vector<TRXUnit> &units)
+{
+    uint16_t group_len = units[0].head.group_len;
+    size_t packet_size = units[0].head.units_len;
+    unsigned char *data_blocks[MAX_XOR_PACKET_NUM_PER_GROUP]{};
+    unsigned char *parity_block = nullptr;
+    for (const auto &unit : units)
+    {
+        if (unit.head.units_idx < MAX_XOR_PACKET_NUM_PER_GROUP)
+        {
+            data_blocks[unit.head.units_idx] = unit.data;
+        }
+        else if (unit.head.units_idx == MAX_XOR_PACKET_NUM_PER_GROUP)
+        {
+            parity_block = unit.data;
+        }
+    }
+
+    std::vector<uint8_t *> temp_blocks;
+    auto cleanup = [&]() {
+        for (auto *temp_block : temp_blocks)
+        {
+            recv_pool_.deallocate(temp_block);
+        }
+        for (auto &unit : units)
+        {
+            recv_pool_.deallocate(unit.data);
+        }
+    };
+
+    for (size_t i = 0; i < MAX_XOR_PACKET_NUM_PER_GROUP; ++i)
+    {
+        if (!data_blocks[i])
+        {
+            if (!parity_block)
+            {
+                cleanup();
+                return;
+            }
+
+            const size_t other_idx = 1u - i;
+            if (!data_blocks[other_idx])
+            {
+                cleanup();
+                return;
+            }
+
+            auto *recovered = static_cast<uint8_t *>(recv_pool_.allocate(packet_size));
+            if (!recovered)
+            {
+                cleanup();
+                return;
+            }
+            for (size_t j = 0; j < packet_size; ++j)
+            {
+                recovered[j] = parity_block[j] ^ data_blocks[other_idx][j];
+            }
+            data_blocks[i] = recovered;
+            temp_blocks.push_back(recovered);
+        }
+    }
+
+    auto *assembled = static_cast<uint8_t *>(recv_pool_.allocate(group_len));
+    if (!assembled)
+    {
+        cleanup();
+        return;
+    }
+
+    size_t offset = 0;
+    for (size_t i = 0; i < MAX_XOR_PACKET_NUM_PER_GROUP; ++i)
+    {
+        size_t current_len = (i < MAX_XOR_PACKET_NUM_PER_GROUP - 1u) ? packet_size : (group_len - i * packet_size);
+        std::memcpy(assembled + offset, data_blocks[i], current_len);
+        offset += current_len;
+    }
+    cleanup();
+
+    assemble_complete_message(units[0].head.frame_seq, units[0].head.group_num, units[0].head.group_seq, assembled,
+                              group_len);
+}
+
+void ReliableUDP::try_recover_rs_group(std::vector<TRXUnit> &units, uint8_t data_packets_count)
+{
     uint16_t group_len = units[0].head.group_len;
     size_t packet_size = units[0].head.units_len;
     unsigned char *data_blocks[MAX_RS_PACKET_NUM_PER_GROUP]{};

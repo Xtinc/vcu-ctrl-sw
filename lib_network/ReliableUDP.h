@@ -27,11 +27,12 @@ constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
 constexpr size_t MAX_TRX_UDP_SIZE = 65535;
 constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;
 constexpr size_t TRX_RS_FEC_REDUNDANCY = 3;
-constexpr size_t MAX_XOR_PACKET_NUM_PER_GROUP = 1;
+constexpr size_t MAX_XOR_PACKET_NUM_PER_GROUP = 2;
 constexpr size_t TRX_XOR_FEC_REDUNDANCY = 1;
 constexpr size_t MAX_TRX_RECEIVE_FRAMES = 20;
 constexpr size_t MAX_GROUP_NUM_PER_FRAME = MAX_TRX_UDP_SIZE / (MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_UNIT_SIZE);
 static_assert(MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
+static_assert(MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
 static_assert(SEND_QUEUE_MAX_PACKET_SIZE == MAX_TRX_UDP_SIZE,
               "send queue packet size must match ReliableUDP frame cap");
 
@@ -195,8 +196,12 @@ constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
  *
  * | Frame payload size            | Mode | Data pkts | Redundancy pkts | Recoverable losses |
  * |-------------------------------|------|-----------|-----------------|--------------------|
- * | <= MAX_TRX_DATA_SIZE          | XOR  | 1         | 1 (full copy)   | 1                  |
+ * | <= MAX_TRX_DATA_SIZE          | XOR  | 2         | 1               | 1                  |
  * | >  MAX_TRX_DATA_SIZE          | RS   | 12        | 3               | up to 3            |
+ *
+ * XOR mode splits a small payload into two padded halves and sends one parity
+ * packet (`half0 ^ half1`), so any two of the three packets reconstruct the
+ * original payload.
  *
  * RS mode uses Reed-Solomon(12, 3): any 12 received packets (data or parity)
  * are sufficient to reconstruct the full group.
@@ -253,6 +258,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void process_received_unit(const TRXUnit &unit);
     void reset_receive_state_for_new_epoch(uint16_t uid);
     void try_recover_group(std::vector<TRXUnit> &units, uint8_t data_packets_count);
+    void try_recover_xor_group(std::vector<TRXUnit> &units);
+    void try_recover_rs_group(std::vector<TRXUnit> &units, uint8_t data_packets_count);
     void assemble_complete_message(uint16_t frame_seq, uint16_t group_num, uint16_t group_seq, uint8_t *data,
                                    size_t size);
     void generate_uuid();

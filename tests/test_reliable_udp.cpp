@@ -1689,6 +1689,84 @@ class LossyProxy
     std::atomic<uint64_t> forwarded_;
 };
 
+class SmallUnitDropProxy
+{
+  public:
+    SmallUnitDropProxy(asio::io_context &ioc, uint16_t listen_port, uint16_t dst_port, uint8_t drop_idx)
+        : socket_(ioc, asio::ip::udp::endpoint(asio::ip::udp::v4(), listen_port)),
+          dst_(asio::ip::make_address("127.0.0.1"), dst_port), buf_(new uint8_t[MAX_TRX_UDP_SIZE]),
+          drop_idx_(drop_idx), dropped_(0), forwarded_(0)
+    {
+        do_receive();
+    }
+
+    ~SmallUnitDropProxy()
+    {
+        asio::error_code ec;
+        socket_.close(ec);
+        delete[] buf_;
+    }
+
+    SmallUnitDropProxy(const SmallUnitDropProxy &) = delete;
+    SmallUnitDropProxy &operator=(const SmallUnitDropProxy &) = delete;
+
+    uint64_t dropped() const
+    {
+        return dropped_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t forwarded() const
+    {
+        return forwarded_.load(std::memory_order_relaxed);
+    }
+
+  private:
+    void do_receive()
+    {
+        socket_.async_receive_from(asio::buffer(buf_, MAX_TRX_UDP_SIZE), sender_ep_,
+                                   [this](const asio::error_code &ec, size_t n) {
+                                       if (ec == asio::error::operation_aborted)
+                                       {
+                                           return;
+                                       }
+
+                                       if (!ec && n > 0)
+                                       {
+                                           bool drop = false;
+                                           if (n > TRX_HEADER_SIZE)
+                                           {
+                                               TRXUnit::Header head{};
+                                               std::memcpy(&head, buf_, TRX_HEADER_SIZE);
+                                               drop = TRXUnit::validate(&head) &&
+                                                      head.units_num ==
+                                                          MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY &&
+                                                      head.units_idx == drop_idx_;
+                                           }
+
+                                           if (drop)
+                                           {
+                                               dropped_.fetch_add(1, std::memory_order_relaxed);
+                                           }
+                                           else
+                                           {
+                                               forwarded_.fetch_add(1, std::memory_order_relaxed);
+                                               asio::error_code send_ec;
+                                               socket_.send_to(asio::buffer(buf_, n), dst_, 0, send_ec);
+                                           }
+                                       }
+                                       do_receive();
+                                   });
+    }
+
+    asio::ip::udp::socket socket_;
+    asio::ip::udp::endpoint sender_ep_;
+    asio::ip::udp::endpoint dst_;
+    uint8_t *buf_;
+    uint8_t drop_idx_;
+    std::atomic<uint64_t> dropped_;
+    std::atomic<uint64_t> forwarded_;
+};
+
 /// Receiver-side state shared between the callback thread and the sender thread.
 struct TestState
 {
@@ -1745,6 +1823,134 @@ struct TestState
         recv_cv.notify_one();
     }
 };
+
+static std::vector<uint8_t> make_xor_test_payload(size_t size, uint8_t seq)
+{
+    std::vector<uint8_t> payload(size);
+    for (size_t i = 0; i < payload.size(); ++i)
+    {
+        payload[i] = static_cast<uint8_t>((seq + i * 37u + size * 11u) & 0xFFu);
+    }
+    if (!payload.empty())
+    {
+        payload[0] = seq;
+    }
+    return payload;
+}
+
+static bool run_one_small_xor_case(uint8_t drop_idx, size_t payload_size, uint16_t port_base)
+{
+    auto &ioc = BG_SERVICE;
+    const uint16_t receiver_port = port_base;
+    const uint16_t proxy_port = static_cast<uint16_t>(port_base + 1);
+    const uint16_t sender_port = static_cast<uint16_t>(port_base + 2);
+
+    auto receiver = std::make_shared<ReliableUDP>(ioc, receiver_port);
+
+    std::mutex recv_mtx;
+    std::condition_variable recv_cv;
+    constexpr size_t frame_count = 16;
+    std::vector<uint8_t> seen(frame_count, 0);
+    size_t deliveries = 0;
+    size_t errors = 0;
+
+    receiver->set_receive_callback([&](const std::vector<QueueFrame> &frames) {
+        std::lock_guard<std::mutex> lk(recv_mtx);
+        for (const auto &frame : frames)
+        {
+            if (frame.size != payload_size || frame.size == 0)
+            {
+                ++errors;
+                continue;
+            }
+            const uint8_t seq = frame.data[0];
+            if (seq >= frame_count || seen[seq])
+            {
+                ++errors;
+                continue;
+            }
+            const auto expected = make_xor_test_payload(payload_size, seq);
+            if (!std::equal(expected.begin(), expected.end(), frame.data))
+            {
+                ++errors;
+                continue;
+            }
+            seen[seq] = 1;
+            ++deliveries;
+        }
+        recv_cv.notify_one();
+        return true;
+    });
+    receiver->start();
+
+    SmallUnitDropProxy proxy(ioc, proxy_port, receiver_port, drop_idx);
+
+    auto sender = std::make_shared<ReliableUDP>(ioc, sender_port);
+    sender->start();
+
+    const bool added = sender->add_destination("127.0.0.1", proxy_port);
+    bool sent = added;
+    for (size_t i = 0; i < frame_count && sent; ++i)
+    {
+        const auto payload = make_xor_test_payload(payload_size, static_cast<uint8_t>(i));
+        sent = sender->send(payload.data(), payload.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(recv_mtx);
+        recv_cv.wait_for(lk, std::chrono::seconds(4), [&] { return deliveries >= frame_count || errors > 0; });
+    }
+
+    sender->stop();
+    receiver->stop();
+
+    return sent && proxy.dropped() >= frame_count && proxy.forwarded() >= frame_count * 2 && deliveries == frame_count &&
+           errors == 0;
+}
+
+static int run_small_xor_tests()
+{
+    struct TestCase
+    {
+        uint8_t drop_idx;
+        size_t payload_size;
+    };
+
+    const TestCase cases[] = {
+        {0, 1},
+        {1, 2},
+        {2, 3},
+        {0, 97},
+        {1, 128},
+        {2, MAX_TRX_DATA_SIZE - 1},
+    };
+
+    std::cout << "\nReliableUDP small XOR FEC tests\n";
+    print_divider();
+
+    int failures = 0;
+    uint16_t port_base = 15200;
+    for (const auto &t : cases)
+    {
+        const bool ok = run_one_small_xor_case(t.drop_idx, t.payload_size, port_base);
+        port_base = static_cast<uint16_t>(port_base + 3);
+        std::cout << "  " << (ok ? "PASS" : "FAIL") << "  drop unit " << static_cast<unsigned>(t.drop_idx)
+                  << ", payload " << t.payload_size << " bytes\n";
+        if (!ok)
+            ++failures;
+    }
+
+    print_divider();
+    if (failures == 0)
+        std::cout << "  All small XOR FEC tests passed.\n";
+    else
+        std::cout << "  " << failures << " small XOR FEC test(s) FAILED.\n";
+    print_divider();
+    std::cout << '\n';
+
+    return failures == 0 ? 0 : 1;
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -2032,7 +2238,7 @@ int main(int argc, char *argv[])
         cfg.loss_rate_max = cfg.loss_rate_min;
     }
 
-    if (run_jitter_tests() != 0 || run_rtt_tests() != 0)
+    if (run_jitter_tests() != 0 || run_rtt_tests() != 0 || run_small_xor_tests() != 0)
     {
         return 1;
     }
