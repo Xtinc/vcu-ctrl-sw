@@ -6,7 +6,7 @@
  *
  *   1. Jitter-buffer unit tests (UsrQueueAsync, no network)
  *      Verify in-order delivery, reorder recovery, duplicate suppression,
- *      fixed-depth buffering, pacing smoothness, jitter/disorder estimation,
+ *      automatic-depth buffering, pacing smoothness, jitter/disorder estimation,
  *      and gap-skip behaviour.
  *
  *   2. FEC loopback integration test (full ReliableUDP stack)
@@ -60,7 +60,7 @@ static void print_divider()
     std::cout << std::string(62, '-') << '\n';
 }
 
-// For tests that validate ordering/fixed-depth smoothing (not overload behavior), retry
+// For tests that validate ordering/automatic-depth smoothing (not overload behavior), retry
 // enqueue when the current reorder window is temporarily full.
 static bool enqueue_with_retry(RecvQueueAsync &q, uint8_t *data, size_t size, uint32_t seq,
                                std::chrono::milliseconds timeout = std::chrono::milliseconds(500))
@@ -124,11 +124,23 @@ static uint64_t queue_stat_current_depth(const std::string &stats)
     return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(0, slash)));
 }
 
-static uint64_t queue_stat_target_depth(const std::string &stats)
+static uint64_t queue_stat_adaptive_depth(const std::string &stats)
 {
     const auto value = queue_stat_value(stats, "q_depth=");
     const auto slash = value.rfind('/');
     return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(slash + 1)));
+}
+
+static double queue_stat_raw_depth(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_depth_raw=");
+    return value.empty() ? 0.0 : std::stod(value);
+}
+
+static bool queue_adaptive_depth_is_valid(const std::string &stats)
+{
+    const auto depth = queue_stat_adaptive_depth(stats);
+    return depth >= 1 && depth <= 128 && queue_stat_raw_depth(stats) >= 0.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +374,7 @@ static bool test_jitter_stats_snapshot_is_read_only()
 
     const std::string peek = q.stats_text();
     if (queue_stat_u64(peek, "q_recv=") != 2 || queue_stat_u64(peek, "q_dup=") != 1 ||
-        queue_stat_current_depth(peek) != 1 || queue_stat_target_depth(peek) == 0)
+        queue_stat_current_depth(peek) != 1 || queue_stat_adaptive_depth(peek) == 0)
     {
         std::cout << "  [stats_snapshot] unexpected peek stats: " << peek << '\n';
         ok = false;
@@ -410,8 +422,8 @@ static bool test_jitter_inorder_prefill_not_reorder()
     return true;
 }
 
-/// After a disorder phase and a clean phase, the fixed target depth must remain
-/// unchanged while the queue continues to drain all frames correctly.
+/// After a disorder phase and a clean phase, the automatic target depth must
+/// stay bounded while the queue continues to drain all frames correctly.
 static bool test_jitter_depth_recovers()
 {
     constexpr uint32_t N = 200;
@@ -425,7 +437,6 @@ static bool test_jitter_depth_recovers()
     size_t delivered = 0;
 
     RecvQueueAsync q;
-    const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start(single_frame_callback([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ++delivered;
@@ -477,9 +488,10 @@ static bool test_jitter_depth_recovers()
         std::cout << "  [depth_recovers] expected " << N << " frames, got " << delivered << '\n';
         return false;
     }
-    if (queue_stat_target_depth(q.stats_text()) != fixed_depth || fixed_depth == 0)
+    const std::string stats = q.stats_text();
+    if (!queue_adaptive_depth_is_valid(stats))
     {
-        std::cout << "  [depth_recovers] fixed target depth changed unexpectedly\n";
+        std::cout << "  [depth_recovers] invalid automatic target depth: " << stats << '\n';
         return false;
     }
     return true;
@@ -490,9 +502,9 @@ static bool test_jitter_depth_recovers()
 /// router has per-packet variable queuing latency.
 ///
 /// Checks:
-///   1. All N frames are eventually delivered (fixed-depth buffering tolerates short reorder windows).
+///   1. All N frames are eventually delivered (automatic-depth buffering tolerates short reorder windows).
 ///   2. The delivered sequence is non-decreasing (buffer restores order).
-///   3. This remains valid under a fixed target depth; only the disorder estimate adapts.
+///   3. This remains valid while the automatic target depth adapts.
 static bool test_jitter_window_shuffle()
 {
     constexpr uint32_t N = 300;
@@ -558,8 +570,8 @@ static bool test_jitter_window_shuffle()
     return true;
 }
 
-// Fixed-depth buffering must survive both disordered and ordered phases without
-// changing its configured target cushion.
+// Automatic buffering must survive both disordered and ordered phases while
+// keeping its target depth bounded.
 static bool test_jitter_adapt_up_down()
 {
     constexpr uint32_t PHASE1 = 200;
@@ -576,7 +588,6 @@ static bool test_jitter_adapt_up_down()
     size_t delivered = 0;
 
     RecvQueueAsync q;
-    const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start(single_frame_callback([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ++delivered;
@@ -631,9 +642,10 @@ static bool test_jitter_adapt_up_down()
         std::cout << "  [adapt_up_down] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (queue_stat_target_depth(q.stats_text()) != fixed_depth || fixed_depth == 0)
+    const std::string stats = q.stats_text();
+    if (!queue_adaptive_depth_is_valid(stats))
     {
-        std::cout << "  [adapt_up_down] fixed target depth changed unexpectedly\n";
+        std::cout << "  [adapt_up_down] invalid automatic target depth: " << stats << '\n';
         return false;
     }
     return true;
@@ -807,7 +819,7 @@ static bool test_jitter_timing_uniformity()
 }
 
 /// Verify timing estimators remain stable under two traffic phases while the
-/// queue target depth itself stays fixed.
+/// automatic queue target depth stays bounded.
 static bool test_jitter_adaptive_estimation()
 {
     constexpr uint32_t PHASE1 = 200;
@@ -823,7 +835,6 @@ static bool test_jitter_adaptive_estimation()
     size_t delivered = 0;
 
     RecvQueueAsync q;
-    const size_t fixed_depth = static_cast<size_t>(queue_stat_target_depth(q.stats_text()));
     q.start(single_frame_callback([&](const uint8_t *, size_t) {
         std::lock_guard<std::mutex> lk(mtx);
         ++delivered;
@@ -876,9 +887,10 @@ static bool test_jitter_adaptive_estimation()
         return false;
     }
 
-    if (queue_stat_target_depth(q.stats_text()) != fixed_depth || fixed_depth == 0)
+    const std::string stats = q.stats_text();
+    if (!queue_adaptive_depth_is_valid(stats))
     {
-        std::cout << "  [adaptive_estimation] fixed target depth changed unexpectedly\n";
+        std::cout << "  [adaptive_estimation] invalid automatic target depth: " << stats << '\n';
         return false;
     }
 
@@ -1398,9 +1410,9 @@ static int run_jitter_tests()
         {"callback retains until release      ", test_jitter_callback_retains_until_release},
         {"stats snapshot is read-only        ", test_jitter_stats_snapshot_is_read_only},
         {"in-order prefill is not reorder     ", test_jitter_inorder_prefill_not_reorder},
-        {"fixed depth stays stable after reorder", test_jitter_depth_recovers},
-        {"window-shuffle: order under fixed depth", test_jitter_window_shuffle},
-        {"fixed depth survives mixed phases   ", test_jitter_adapt_up_down},
+        {"auto depth bounded after reorder    ", test_jitter_depth_recovers},
+        {"window-shuffle: order under auto depth", test_jitter_window_shuffle},
+        {"auto depth survives mixed phases    ", test_jitter_adapt_up_down},
         {"permanent gap skipped, rest deliver ", test_jitter_permanent_gap},
         {"output timing uniform under jitter  ", test_jitter_timing_uniformity},
         {"timing estimators stable by phase   ", test_jitter_adaptive_estimation},

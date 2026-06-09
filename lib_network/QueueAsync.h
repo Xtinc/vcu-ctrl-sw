@@ -69,14 +69,20 @@ class RecvQueueAsync
 
     struct Tunables
     {
-        size_t target_depth = 10;
-        size_t startup_depth = 10;
+        size_t min_depth = 4;
+        size_t initial_depth = 10;
+        size_t max_depth = 48;
         size_t max_buffered_frames = 128;
         double stale_timeout_ms = 2000.0;
         double default_frame_interval_ms = 16.0;
         double depth_feedback_gain = 0.08;
         double min_pacing_factor = 0.70;
         double max_pacing_factor = 1.30;
+        double depth_margin_frames = 2.0;
+        double jitter_weight = 2.0;
+        uint32_t pressure_bonus_frames = 30;
+        double rise_alpha = 0.20;
+        double fall_alpha = 0.02;
     };
 
     struct BufferedFrame
@@ -122,6 +128,9 @@ class RecvQueueAsync
     void drain_locked(std::unique_lock<std::mutex> &lock);
     void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
     void update_depth_estimate_locked(double depth);
+    void update_adaptive_depth_locked();
+    double frame_interval_ms_locked() const;
+    double pressure_bonus_locked();
     void note_disorder_locked(uint32_t abs_seq);
     void purge_stale_locked(ClockTP now);
     void drop_frame_locked(std::list<BufferedFrame>::iterator it);
@@ -159,6 +168,11 @@ class RecvQueueAsync
     double avg_depth_frames_;
     double disorder_depth_frames_;
     double disorder_guard_depth_frames_;
+    size_t adaptive_depth_;
+    double smoothed_depth_frames_;
+    double raw_depth_frames_;
+    uint64_t last_pressure_total_;
+    uint32_t pressure_bonus_frames_remaining_;
     Counters counters_;
 };
 
