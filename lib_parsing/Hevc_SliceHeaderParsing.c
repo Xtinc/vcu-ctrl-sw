@@ -22,6 +22,7 @@ void AL_HEVC_SetDefaultSliceHeader(AL_THevcSliceHdr* pSlice)
   uint8_t nuh_temporal_id_plus1 = pSlice->nuh_temporal_id_plus1;
   uint8_t RapFlag = pSlice->RapPicFlag;
   uint8_t IdrFlag = pSlice->IdrPicFlag;
+  int SliceSegAddr = pSlice->slice_segment_address;
   AL_THevcPps const* pPPS = pSlice->pPPS;
   AL_THevcSps* pSPS = pSlice->pSPS;
 
@@ -36,6 +37,7 @@ void AL_HEVC_SetDefaultSliceHeader(AL_THevcSliceHdr* pSlice)
   pSlice->nuh_temporal_id_plus1 = nuh_temporal_id_plus1;
   pSlice->RapPicFlag = RapFlag;
   pSlice->IdrPicFlag = IdrFlag;
+  pSlice->slice_segment_address = SliceSegAddr;
   pSlice->pPPS = pPPS;
   pSlice->pSPS = pSPS;
 
