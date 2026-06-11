@@ -737,7 +737,6 @@ bool V4L2Source::qbuf_idx(unsigned int idx)
     if (ioctl_retry(m_fd, VIDIOC_QBUF, &b.buf) < 0)
     {
         VIDEO_ERROR_PRINT("Failed to queue buffer idx=%d: %s", idx, std::strerror(errno));
-        enter_error_state();
         return false;
     }
 

@@ -936,17 +936,12 @@ bool RTEncoderV4L2::submit_source_buffer(AL_TBuffer *pBuf)
 
 void RTEncoderV4L2::release_sources(AL_TBuffer const *pSrc)
 {
-    SourceReleaseCallback release_cb;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        release_cb = m_release_cb;
-    }
-
     try
     {
-        if (release_cb)
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_release_cb)
         {
-            release_cb(pSrc);
+            m_release_cb(pSrc);
         }
     }
     catch (const std::exception &e)
