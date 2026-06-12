@@ -107,6 +107,44 @@ class RecvQueueAsync
         uint32_t max_disorder_depth = 0;
     };
 
+    struct ArrivalEstimator
+    {
+        bool has_ref = false;
+        uint32_t last_seq = 0;
+        ClockTP last_time = ClockTP{};
+        double interval_ms = 0.0;
+        double jitter_ms = 0.0;
+
+        void reset();
+        void note(uint32_t abs_seq, ClockTP arrival, size_t max_seq_delta);
+    };
+
+    struct ReorderEstimator
+    {
+        bool has_highest_seq = false;
+        uint32_t highest_seq = 0;
+        double depth_frames = 0.0;
+        double guard_depth_frames = 0.0;
+
+        void reset();
+        void note(uint32_t abs_seq, size_t max_seq_delta, Counters &counters);
+        double effective_depth_frames() const;
+    };
+
+    struct DepthController
+    {
+        size_t adaptive_depth = 0;
+        double smoothed_depth_frames = 0.0;
+        double raw_depth_frames = 0.0;
+        uint32_t pressure_frames_remaining = 0;
+
+        void reset(size_t initial_depth);
+        void sanitize(const Tunables &tuning);
+        void trigger_pressure(const Tunables &tuning);
+        void consume_pressure();
+        void update(const Tunables &tuning, double reorder_frames, double jitter_frames);
+    };
+
   public:
     RecvQueueAsync();
     ~RecvQueueAsync();
@@ -127,11 +165,9 @@ class RecvQueueAsync
     void clear_delivered_frames_locked();
     void drain_locked(std::unique_lock<std::mutex> &lock);
     void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
-    void update_depth_estimate_locked(double depth);
     void update_adaptive_depth_locked();
+    void trigger_pressure_locked();
     double frame_interval_ms_locked() const;
-    double pressure_bonus_locked();
-    void note_disorder_locked(uint32_t abs_seq);
     void purge_stale_locked(ClockTP now);
     void drop_frame_locked(std::list<BufferedFrame>::iterator it);
     void release_frame_data(uint8_t *data);
@@ -158,21 +194,9 @@ class RecvQueueAsync
     ClockTP gap_start_time_;
     Tunables tuning_;
 
-    bool has_arrival_ref_;
-    uint32_t last_rate_seq_;
-    ClockTP last_rate_time_;
-    bool has_highest_arrival_seq_;
-    uint32_t highest_arrival_seq_;
-    double avg_interval_ms_;
-    double jitter_ms_;
-    double avg_depth_frames_;
-    double disorder_depth_frames_;
-    double disorder_guard_depth_frames_;
-    size_t adaptive_depth_;
-    double smoothed_depth_frames_;
-    double raw_depth_frames_;
-    bool pressure_event_pending_;
-    uint32_t pressure_bonus_frames_remaining_;
+    ArrivalEstimator arrival_;
+    ReorderEstimator reorder_;
+    DepthController depth_;
     mutable Counters counters_;
 };
 
