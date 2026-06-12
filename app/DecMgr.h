@@ -206,6 +206,9 @@ class DecMgr
     void return_frame(AL_TBuffer *frame);
     bool create_decoder();
     bool do_rebuild();
+    void drain_display();
+    void reset_display(bool drain_first);
+    bool ensure_display_resolution_locked(uint32_t w, uint32_t h);
 
   private:
     DecMgrConfig m_cfg;

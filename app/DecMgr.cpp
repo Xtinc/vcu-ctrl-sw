@@ -59,14 +59,7 @@ bool DecMgr::start()
             m_receiver->stop();
             m_receiver.reset();
         }
-        {
-            std::lock_guard<std::mutex> lk(m_display_mutex);
-            if (m_display)
-                m_display->drain();
-            m_display.reset();
-            m_display_width = 0;
-            m_display_height = 0;
-        }
+        reset_display(true);
         {
             std::lock_guard<std::mutex> lk(m_dec_mutex);
             m_decoder.reset();
@@ -171,31 +164,16 @@ void DecMgr::stop()
     if (!m_running.exchange(false))
         return;
 
-    // Stop receiver — no more push_stream() after this point.
     if (m_receiver)
     {
         m_receiver->stop();
         m_receiver.reset();
     }
 
-    // Flush decoder; no lock — callbacks need m_dec_mutex.
     if (m_decoder && !m_decoder->flush())
         VIDEO_ERROR_PRINT("DecMgr: decoder flush timed out; output may be incomplete");
 
-    // Drain display — after this no more return_frame() calls.
-    {
-        std::lock_guard<std::mutex> lk(m_display_mutex);
-        if (m_display)
-            m_display->drain();
-    }
-
-    // Destroy display then decoder (display first to maintain lifetime order).
-    {
-        std::lock_guard<std::mutex> lk(m_display_mutex);
-        m_display.reset();
-        m_display_width = 0;
-        m_display_height = 0;
-    }
+    reset_display(true);
     {
         std::lock_guard<std::mutex> lk(m_dec_mutex);
         m_decoder.reset();
@@ -216,11 +194,9 @@ bool DecMgr::push_stream(const void *data, size_t size, StreamFlags flags)
         return false;
     }
 
-    // Fast path.  Single producer thread; no concurrent mutation of m_decoder.
     if (m_decoder && m_decoder->push_stream(data, size, sdk_flags))
         return true;
 
-    // Decoder failed or unavailable — rebuild and retry.
     VIDEO_ERROR_PRINT("DecMgr: decoder error detected, rebuilding");
     if (!do_rebuild())
         return false;
@@ -233,11 +209,7 @@ bool DecMgr::do_rebuild()
     if (m_decoder)
         m_decoder->flush();
 
-    {
-        std::lock_guard<std::mutex> lk(m_display_mutex);
-        if (m_display)
-            m_display->drain();
-    }
+    drain_display();
 
     {
         std::lock_guard<std::mutex> lk(m_dec_mutex);
@@ -247,12 +219,7 @@ bool DecMgr::do_rebuild()
     if (!create_decoder())
     {
         VIDEO_ERROR_PRINT("DecMgr: decoder rebuild failed — pipeline stopped");
-        {
-            std::lock_guard<std::mutex> lk(m_display_mutex);
-            m_display.reset();
-            m_display_width = 0;
-            m_display_height = 0;
-        }
+        reset_display(false);
         m_running.store(false);
         return false;
     }
@@ -356,13 +323,11 @@ void DecMgr::on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info)
 
     if (m_display_width != w || m_display_height != h)
     {
-        if (!m_display->set_output_resolution(w, h))
+        if (!ensure_display_resolution_locked(w, h))
         {
             return_frame(frame);
             return;
         }
-        m_display_width = w;
-        m_display_height = h;
     }
 
     m_display->show(frame, info);
@@ -370,8 +335,43 @@ void DecMgr::on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info)
 
 void DecMgr::return_frame(AL_TBuffer *frame)
 {
+    std::lock_guard<std::mutex> lk(m_dec_mutex);
     if (m_decoder)
         m_decoder->return_display_frame(frame);
+}
+
+void DecMgr::drain_display()
+{
+    std::lock_guard<std::mutex> lk(m_display_mutex);
+    if (m_display)
+        m_display->drain();
+}
+
+void DecMgr::reset_display(bool drain_first)
+{
+    std::lock_guard<std::mutex> lk(m_display_mutex);
+    if (drain_first && m_display)
+        m_display->drain();
+
+    m_display.reset();
+    m_display_width = 0;
+    m_display_height = 0;
+}
+
+bool DecMgr::ensure_display_resolution_locked(uint32_t w, uint32_t h)
+{
+    if (!m_display)
+        return false;
+
+    if (m_display_width == w && m_display_height == h)
+        return true;
+
+    if (!m_display->set_output_resolution(w, h))
+        return false;
+
+    m_display_width = w;
+    m_display_height = h;
+    return true;
 }
 
 bool DecMgr::create_decoder()
