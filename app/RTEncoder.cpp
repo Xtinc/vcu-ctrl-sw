@@ -861,12 +861,7 @@ void RTEncoderV4L2::set_release_callback(SourceReleaseCallback releaseCb)
 
 DMAFdArray RTEncoderV4L2::acquire_dma_buffers(unsigned int count)
 {
-    auto available_cnt = m_source_buf_pool->available_count();
-    if (count > available_cnt)
-    {
-        VIDEO_ERROR_PRINT("Requested DMA fd count %u exceeds pool capacity %zu", count, available_cnt);
-        return {};
-    }
+    constexpr auto kAcquireBufferTimeout = std::chrono::seconds(1);
 
     bool ok = true;
     DMAFdArray descs;
@@ -874,10 +869,10 @@ DMAFdArray RTEncoderV4L2::acquire_dma_buffers(unsigned int count)
 
     for (unsigned int i = 0; i < count; ++i)
     {
-        auto *pBuf = m_source_buf_pool->get_buffer();
+        auto *pBuf = m_source_buf_pool->get_buffer_for(kAcquireBufferTimeout);
         if (!pBuf)
         {
-            VIDEO_ERROR_PRINT("Failed to acquire %uth source buffer from pool.", i);
+            VIDEO_ERROR_PRINT("Timed out waiting for %uth source buffer from pool.", i);
             ok = false;
             break;
         }

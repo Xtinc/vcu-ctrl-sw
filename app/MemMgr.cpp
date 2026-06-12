@@ -183,6 +183,23 @@ AL_TBuffer *BufPool::get_buffer(bool block)
     return pBuf;
 }
 
+AL_TBuffer *BufPool::get_buffer_for(std::chrono::milliseconds timeout)
+{
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    const bool ready = m_cond.wait_for(lock, timeout, [this] { return !m_fifo.empty() || m_decommitted; });
+    if (!ready || m_fifo.empty())
+    {
+        return nullptr;
+    }
+
+    auto *pBuf = m_fifo.front();
+    m_fifo.pop_front();
+    lock.unlock();
+    AL_Buffer_Ref(pBuf);
+    return pBuf;
+}
+
 size_t BufPool::available_count()
 {
     std::lock_guard<std::mutex> lock(m_mutex);

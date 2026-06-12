@@ -9,6 +9,7 @@ extern "C"
 #include "lib_common/PixMapBuffer.h"
 }
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -45,6 +46,7 @@ class BufPool
     bool init(AL_TAllocator *pAllocator, uint32_t uNumBuf);
     bool add_metadata(AL_TMetaData *pMetaData);
     AL_TBuffer *get_buffer(bool block = true);
+    AL_TBuffer *get_buffer_for(std::chrono::milliseconds timeout);
     size_t available_count();
     void commit();
     void decommit();
