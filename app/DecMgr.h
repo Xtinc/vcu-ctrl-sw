@@ -115,9 +115,10 @@ struct DecMgrConfig
  *
  * @par Resolution Changes
  * Dynamic resolution changes are handled transparently:
- * - prepare_fb re-imports DMA-buf with new dimensions
- * - Atomic flip commits carry updated CRTC_W/H
- * - No modeset or display restart required
+ * - DecMgr detects decoded-frame dimension changes from AL_TInfoDecode::tDim
+ * - Display drains queued frames, selects the closest KMS mode that can contain
+ *   the stream size, and performs a full modeset on the next frame
+ * - prepare_fb re-imports DMA-buf with the current frame dimensions
  *
  * @par Thread Safety
  * - fps() may be called from any thread at any time.
@@ -209,9 +210,12 @@ class DecMgr
   private:
     DecMgrConfig m_cfg;
     mutable std::mutex m_dec_mutex;
+    mutable std::mutex m_display_mutex;
     std::unique_ptr<RTDecoder> m_decoder;
     std::unique_ptr<DRMDisplay> m_display;
     std::shared_ptr<ReliableUDP> m_receiver;
+    uint32_t m_display_width{0};
+    uint32_t m_display_height{0};
     std::atomic<bool> m_running{false};
 };
 

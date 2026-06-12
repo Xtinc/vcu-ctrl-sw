@@ -55,15 +55,35 @@ static uint32_t mode_vrefresh_mHz(const drmModeModeInfo *m)
     return static_cast<uint32_t>(num / (static_cast<uint64_t>(m->htotal) * m->vtotal));
 }
 
+static ClockEntry::Nanos mode_frame_duration(const drmModeModeInfo *m)
+{
+    if (!m->htotal || !m->vtotal || !m->clock)
+        return ClockEntry::Nanos{16'666'666LL};
+    return ClockEntry::Nanos(static_cast<int64_t>(m->htotal) * m->vtotal * 1'000'000LL / m->clock);
+}
+
 static int score_drm_mode(const drmModeModeInfo *m, int desired_width, int desired_height, int desired_refresh)
 {
-    if (desired_width > 0 && m->hdisplay != static_cast<uint16_t>(desired_width))
+    if (desired_width > 0 && m->hdisplay < desired_width)
         return 0;
-    if (desired_height > 0 && m->vdisplay != static_cast<uint16_t>(desired_height))
+    if (desired_height > 0 && m->vdisplay < desired_height)
         return 0;
 
     const uint32_t refresh_mHz = mode_vrefresh_mHz(m);
-    int s = (m->type & DRM_MODE_TYPE_PREFERRED) ? 100 : 0;
+    int s = 1000000;
+    if (desired_width > 0 && desired_height > 0)
+    {
+        const int extra_w = static_cast<int>(m->hdisplay) - desired_width;
+        const int extra_h = static_cast<int>(m->vdisplay) - desired_height;
+        // Prefer the smallest mode that can contain the stream frame.
+        s -= extra_w + extra_h;
+        s -= (extra_w * extra_h) / 1024;
+    }
+    else
+    {
+        s += (m->type & DRM_MODE_TYPE_PREFERRED) ? 100 : 0;
+    }
+
     if (desired_refresh > 0)
     {
         const int d = static_cast<int>(refresh_mHz) - desired_refresh * 1000;
@@ -99,6 +119,8 @@ static const drmModeModeInfo *select_best_mode(const drmModeConnector *conn, int
 
     if (!best)
     {
+        if (desired_width > 0 || desired_height > 0)
+            return nullptr;
         for (int i = 0; i < conn->count_modes; ++i)
             if (conn->modes[i].type & DRM_MODE_TYPE_PREFERRED)
                 return &conn->modes[i];
@@ -412,9 +434,7 @@ void DRMDisplayBase::init_drm()
         if (best)
         {
             m_selected_mode = *best;
-            if (best->htotal && best->vtotal && best->clock)
-                m_frame_ns =
-                    ClockEntry::Nanos(static_cast<int64_t>(best->htotal) * best->vtotal * 1'000'000LL / best->clock);
+            m_frame_ns = mode_frame_duration(best);
             VIDEO_DEBUG_PRINT("DRMDisplay: selected mode %dx%d@%uHz (clock=%ukHz) -> frame %.3f ms", best->hdisplay,
                               best->vdisplay, best->vrefresh, best->clock, m_frame_ns.count() * 1e-6);
         }
@@ -914,6 +934,63 @@ void DRMDisplay::drain()
 {
     DRMDisplayBase::drain();
     clear_cache();
+}
+
+bool DRMDisplay::set_output_resolution(uint32_t w, uint32_t h)
+{
+    if (w == 0 || h == 0)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: invalid output resolution %ux%u", w, h);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_selected_mode.hdisplay >= w && m_selected_mode.vdisplay >= h &&
+            m_cfg.desired_width == static_cast<int>(w) &&
+            m_cfg.desired_height == static_cast<int>(h))
+        {
+            return true;
+        }
+    }
+
+    drain();
+
+    auto *conn = drmModeGetConnector(m_drm_fd, m_conn_id);
+    if (!conn)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: connector %u not found while switching to %ux%u", m_conn_id, w, h);
+        return false;
+    }
+
+    const drmModeModeInfo *best =
+        select_best_mode(conn, static_cast<int>(w), static_cast<int>(h), m_cfg.desired_refresh);
+    if (!best)
+    {
+        VIDEO_ERROR_PRINT("DRMDisplay: no connector mode can contain stream resolution %ux%u", w, h);
+        drmModeFreeConnector(conn);
+        return false;
+    }
+
+    const drmModeModeInfo selected = *best;
+    drmModeFreeConnector(conn);
+
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_selected_mode = selected;
+        m_frame_ns = mode_frame_duration(&m_selected_mode);
+        m_cfg.desired_width = static_cast<int>(w);
+        m_cfg.desired_height = static_cast<int>(h);
+        m_modeset_done = false;
+        m_last_flip_tp = {};
+        m_commit_tp = {};
+        m_wait_phase_adjust = {};
+        m_in_flight_retries = 0;
+    }
+
+    VIDEO_INFO_PRINT("DRMDisplay: stream %ux%u -> mode %dx%d@%uHz", w, h, selected.hdisplay, selected.vdisplay,
+                     selected.vrefresh);
+    return true;
 }
 
 void DRMDisplay::clear_cache() noexcept

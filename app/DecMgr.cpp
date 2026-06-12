@@ -60,16 +60,28 @@ bool DecMgr::start()
             m_receiver.reset();
         }
         {
+            std::lock_guard<std::mutex> lk(m_display_mutex);
+            if (m_display)
+                m_display->drain();
+            m_display.reset();
+            m_display_width = 0;
+            m_display_height = 0;
+        }
+        {
             std::lock_guard<std::mutex> lk(m_dec_mutex);
             m_decoder.reset();
         }
-        m_display.reset();
         m_running.store(false);
     };
 
     try
     {
-        m_display = std::make_unique<DRMDisplay>(to_drm_config(m_cfg), [this](AL_TBuffer *f) { return_frame(f); });
+        {
+            std::lock_guard<std::mutex> lk(m_display_mutex);
+            m_display = std::make_unique<DRMDisplay>(to_drm_config(m_cfg), [this](AL_TBuffer *f) { return_frame(f); });
+            m_display_width = 0;
+            m_display_height = 0;
+        }
 
         if (!create_decoder())
         {
@@ -171,13 +183,21 @@ void DecMgr::stop()
         VIDEO_ERROR_PRINT("DecMgr: decoder flush timed out; output may be incomplete");
 
     // Drain display — after this no more return_frame() calls.
-    if (m_display)
-        m_display->drain();
+    {
+        std::lock_guard<std::mutex> lk(m_display_mutex);
+        if (m_display)
+            m_display->drain();
+    }
 
     // Destroy display then decoder (display first to maintain lifetime order).
     {
-        std::lock_guard<std::mutex> lk(m_dec_mutex);
+        std::lock_guard<std::mutex> lk(m_display_mutex);
         m_display.reset();
+        m_display_width = 0;
+        m_display_height = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_dec_mutex);
         m_decoder.reset();
     }
 }
@@ -213,8 +233,11 @@ bool DecMgr::do_rebuild()
     if (m_decoder)
         m_decoder->flush();
 
-    if (m_display)
-        m_display->drain();
+    {
+        std::lock_guard<std::mutex> lk(m_display_mutex);
+        if (m_display)
+            m_display->drain();
+    }
 
     {
         std::lock_guard<std::mutex> lk(m_dec_mutex);
@@ -224,7 +247,12 @@ bool DecMgr::do_rebuild()
     if (!create_decoder())
     {
         VIDEO_ERROR_PRINT("DecMgr: decoder rebuild failed — pipeline stopped");
-        m_display.reset();
+        {
+            std::lock_guard<std::mutex> lk(m_display_mutex);
+            m_display.reset();
+            m_display_width = 0;
+            m_display_height = 0;
+        }
         m_running.store(false);
         return false;
     }
@@ -304,8 +332,40 @@ int64_t DecMgr::offset_ms() const
 
 void DecMgr::on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info)
 {
-    if (m_display)
-        m_display->show(frame, info);
+    if (!frame)
+        return;
+
+    const int info_w = info.tDim.iWidth;
+    const int info_h = info.tDim.iHeight;
+    if (info_w <= 0 || info_h <= 0)
+    {
+        VIDEO_ERROR_PRINT("DecMgr: invalid decoded frame dimensions %dx%d", info_w, info_h);
+        return_frame(frame);
+        return;
+    }
+
+    const auto w = static_cast<uint32_t>(info_w);
+    const auto h = static_cast<uint32_t>(info_h);
+
+    std::lock_guard<std::mutex> lk(m_display_mutex);
+    if (!m_display)
+    {
+        return_frame(frame);
+        return;
+    }
+
+    if (m_display_width != w || m_display_height != h)
+    {
+        if (!m_display->set_output_resolution(w, h))
+        {
+            return_frame(frame);
+            return;
+        }
+        m_display_width = w;
+        m_display_height = h;
+    }
+
+    m_display->show(frame, info);
 }
 
 void DecMgr::return_frame(AL_TBuffer *frame)

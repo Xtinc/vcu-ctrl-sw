@@ -234,6 +234,7 @@ class DRMDisplay : public DRMDisplayBase
     ~DRMDisplay() override;
 
     void drain() override;
+    bool set_output_resolution(uint32_t w, uint32_t h);
     void show(AL_TBuffer *frame, const AL_TInfoDecode &info);
 
   private:
