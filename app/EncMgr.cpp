@@ -80,6 +80,8 @@ const char *EncMgr::state_to_cstr(State s)
         return "EncoderFault";
     case State::WaitingSource:
         return "WaitingSource";
+    case State::Paused:
+        return "Paused";
     case State::Stopping:
         return "Stopping";
     }
@@ -110,6 +112,7 @@ bool EncMgr::start()
         VIDEO_ERROR_PRINT("EncMgr::start() called while already running");
         return false;
     }
+    m_paused.store(false);
 
     try
     {
@@ -158,6 +161,31 @@ void EncMgr::stop()
         m_sender->stop();
         m_sender.reset();
     }
+}
+
+bool EncMgr::pause()
+{
+    if (!m_running.load())
+        return false;
+
+    m_paused.store(true);
+    m_wait_cv.notify_all();
+    return true;
+}
+
+bool EncMgr::resume()
+{
+    if (!m_running.load())
+        return false;
+
+    m_paused.store(false);
+    m_wait_cv.notify_all();
+    return true;
+}
+
+bool EncMgr::is_paused() const
+{
+    return m_running.load() && m_paused.load();
 }
 
 bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
@@ -395,6 +423,10 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
     {
         return State::Stopping;
     }
+    if (m_paused.load())
+    {
+        return State::Paused;
+    }
 
     auto detected_w = width;
     auto detected_h = height;
@@ -422,6 +454,7 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
         return State::WaitingSource;
     }
 
+    m_encoder->request_IDR();
     return State::Streaming;
 }
 
@@ -429,7 +462,7 @@ EncMgr::State EncMgr::on_streaming()
 {
     bool source_changed = false;
 
-    while (m_running.load())
+    while (m_running.load() && !m_paused.load())
     {
         const DQResult result = m_source->dqueue();
         switch (result.s)
@@ -458,6 +491,8 @@ done:
         return State::Stopping;
     if (!m_encoder->is_running())
         return State::EncoderFault;
+    if (m_paused.load())
+        return State::Paused;
     if (source_changed)
         return State::SourceChanged;
     return State::WaitingSource;
@@ -467,6 +502,8 @@ EncMgr::State EncMgr::on_source_changed(int &width, int &height)
 {
     if (!m_running.load())
         return State::Stopping;
+    if (m_paused.load())
+        return State::Paused;
 
     if (!handle_source_change(width, height))
         return State::Stopping;
@@ -484,6 +521,8 @@ EncMgr::State EncMgr::on_encoder_fault(int width, int height)
         return State::Stopping;
 
     VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
+    if (m_paused.load())
+        return State::Paused;
     return State::Opening;
 }
 
@@ -491,16 +530,20 @@ EncMgr::State EncMgr::on_waiting_source()
 {
     if (!m_running.load())
         return State::Stopping;
+    if (m_paused.load())
+        return State::Paused;
 
     VIDEO_INFO_PRINT("EncMgr: waiting for source on %s", m_cfg.v4l2_subdev.c_str());
 
     std::unique_lock<std::mutex> lock(m_wait_mutex);
     m_wait_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.source_check_interval_ms),
-                       [this] { return !m_running.load(); });
+                       [this] { return !m_running.load() || m_paused.load(); });
     lock.unlock();
 
     if (!m_running.load())
         return State::Stopping;
+    if (m_paused.load())
+        return State::Paused;
 
     int w = 0, h = 0;
     if (query_source_resolution(w, h))
@@ -510,6 +553,23 @@ EncMgr::State EncMgr::on_waiting_source()
     }
 
     return State::WaitingSource;
+}
+
+EncMgr::State EncMgr::on_paused()
+{
+    close_source();
+
+    VIDEO_INFO_PRINT("EncMgr: paused");
+
+    std::unique_lock<std::mutex> lock(m_wait_mutex);
+    m_wait_cv.wait(lock, [this] { return !m_running.load() || !m_paused.load(); });
+    lock.unlock();
+
+    if (!m_running.load())
+        return State::Stopping;
+
+    VIDEO_INFO_PRINT("EncMgr: resuming, returning to Opening");
+    return State::Opening;
 }
 
 void EncMgr::loop_thread_func()
@@ -539,6 +599,9 @@ void EncMgr::loop_thread_func()
             break;
         case State::WaitingSource:
             next = on_waiting_source();
+            break;
+        case State::Paused:
+            next = on_paused();
             break;
         case State::Stopping:
             next = State::Stopping;

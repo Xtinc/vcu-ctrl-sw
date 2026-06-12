@@ -52,10 +52,12 @@ struct EncMgrConfig
  *     query_source ok          -> Streaming
  *     no source detected       -> WaitingSource
  *     open_source fail         -> WaitingSource (wait for user to fix)
+ *     pause()                  -> Paused
  *     stop()                   -> Stopping
  *   Streaming:
  *     dqueue/submit loop active
  *     stop() / normal exit     -> Stopping
+ *     pause()                  -> Paused (close V4L2Source, keep encoder alive)
  *     V4L2 device error        -> WaitingSource
  *     encoder fault            -> EncoderFault
  *     V4L2_EVENT_SOURCE_CHANGE -> SourceChanged
@@ -63,14 +65,22 @@ struct EncMgrConfig
  *     set_resolution() ok      -> Opening  (no delay)
  *     set_resolution() fail    -> rebuild_encoder() -> Opening  (no delay)
  *     rebuild_encoder() fail   -> Stopping
+ *     pause()                  -> Paused (skip stale source-change handling)
  *     stop()                   -> Stopping
  *   EncoderFault:
  *     rebuild_encoder() ok     -> Opening  (no delay)
+ *     rebuild_encoder() ok and pause requested -> Paused
  *     rebuild_encoder() fail   -> Stopping
  *     stop()                   -> Stopping
  *   WaitingSource:
  *     Wait on condition variable with timeout, periodically check probe_subdev_format()
  *     source detected          -> Opening  (no delay)
+ *     pause()                  -> Paused
+ *     stop()                   -> Stopping
+ *   Paused:
+ *     Software pause state; V4L2Source is closed and source probing is suspended.
+ *     Physical source loss/restore/change is ignored until resume().
+ *     resume()                 -> Opening  (probe current source state)
  *     stop()                   -> Stopping
  *   Stopping:
  *     terminal state; flush encoder EOS, destroy encoder, exit loop thread
@@ -103,6 +113,7 @@ class EncMgr
         SourceChanged, ///< V4L2_EVENT_SOURCE_CHANGE received; resolve new resolution
         EncoderFault,  ///< Encoder stopped unexpectedly; rebuild before next open
         WaitingSource, ///< No source detected; wait on condition variable with periodic check
+        Paused,        ///< Software pause: source closed, encoder kept alive, no source probing
         Stopping,      ///< Terminal: exit loop thread
     };
 
@@ -136,6 +147,27 @@ class EncMgr
      * Safe to call from any thread or after a previous stop().
      */
     void stop();
+
+    /**
+     * @brief Pause capture without stopping or flushing the encoder.
+     *
+     * Closes the V4L2 source and suspends source probing. The encoder and UDP sender
+     * stay alive. Safe to call repeatedly while running.
+     * @return true if the manager is running, false otherwise.
+     */
+    bool pause();
+
+    /**
+     * @brief Resume capture after pause.
+     *
+     * Wakes the loop thread and returns it to Opening, where the current source state
+     * is probed again. Safe to call repeatedly while running.
+     * @return true if the manager is running, false otherwise.
+     */
+    bool resume();
+
+    /** @brief Return whether software pause is currently requested. */
+    bool is_paused() const;
 
     /**
      * @brief Dynamically update the target (and optionally peak) bitrate.
@@ -183,6 +215,7 @@ class EncMgr
     State on_source_changed(int &width, int &height);
     State on_encoder_fault(int width, int height);
     State on_waiting_source();
+    State on_paused();
     static const char *state_to_cstr(State s);
 
     bool open_source(int width, int height);
@@ -203,6 +236,7 @@ class EncMgr
 
     std::thread m_loop_thread;
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_paused{false};
     mutable std::mutex m_enc_mutex;
 
     std::mutex m_wait_mutex;
