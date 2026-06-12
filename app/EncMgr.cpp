@@ -113,6 +113,7 @@ bool EncMgr::start()
         return false;
     }
     m_paused.store(false);
+    m_streaming.store(false);
 
     try
     {
@@ -134,6 +135,7 @@ bool EncMgr::start()
     {
         VIDEO_ERROR_PRINT("EncMgr: start failed: %s", e.what());
         m_running.store(false);
+        m_streaming.store(false);
 
         if (m_sender)
         {
@@ -148,6 +150,7 @@ bool EncMgr::start()
 
 void EncMgr::stop()
 {
+    m_streaming.store(false);
     m_running.store(false);
     m_wait_cv.notify_all();
 
@@ -238,18 +241,18 @@ void EncMgr::request_IDR()
 
 std::pair<double, double> EncMgr::fps() const
 {
-    if (!m_running.load())
+    if (!is_streaming())
         return {0.0, 0.0};
 
     std::lock_guard<std::mutex> lock(m_enc_mutex);
-    if (!m_running.load() || !m_encoder)
+    if (!is_streaming() || !m_encoder)
         return {0.0, 0.0};
     return m_encoder->fps();
 }
 
 double EncMgr::send_rate() const
 {
-    if (!m_running.load())
+    if (!is_streaming())
         return 0.0;
 
     auto sender = m_sender;
@@ -261,7 +264,7 @@ double EncMgr::send_rate() const
 
 int64_t EncMgr::rtt_ms() const
 {
-    if (!m_running.load())
+    if (!is_streaming())
         return -1;
 
     auto sender = m_sender;
@@ -273,7 +276,7 @@ int64_t EncMgr::rtt_ms() const
 
 int64_t EncMgr::offset_ms() const
 {
-    if (!m_running.load())
+    if (!is_streaming())
         return 0;
 
     auto sender = m_sender;
@@ -281,6 +284,11 @@ int64_t EncMgr::offset_ms() const
         return 0;
 
     return sender->offset_ms();
+}
+
+bool EncMgr::is_streaming() const
+{
+    return m_running.load() && m_streaming.load();
 }
 
 bool EncMgr::open_source(int width, int height)
@@ -461,6 +469,7 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
 EncMgr::State EncMgr::on_streaming()
 {
     bool source_changed = false;
+    m_streaming.store(true);
 
     while (m_running.load() && !m_paused.load())
     {
@@ -485,6 +494,7 @@ EncMgr::State EncMgr::on_streaming()
         }
     }
 done:
+    m_streaming.store(false);
     close_source();
 
     if (!m_running.load())

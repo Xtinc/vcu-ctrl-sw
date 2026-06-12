@@ -224,6 +224,7 @@ class EncMgr
     bool ensure_encoder_at(int width, int height);
     bool handle_source_change(int &width, int &height);
     bool query_source_resolution(int &width, int &height) const;
+    bool is_streaming() const;
 
     void loop_thread_func();
 
@@ -237,6 +238,7 @@ class EncMgr
     std::thread m_loop_thread;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_paused{false};
+    std::atomic<bool> m_streaming{false};
     mutable std::mutex m_enc_mutex;
 
     std::mutex m_wait_mutex;
