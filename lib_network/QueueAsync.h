@@ -3,11 +3,8 @@
 
 #include "ClockWait.h"
 #include "MemPoolUDP.h"
-#include <array>
-#include <condition_variable>
 #include <functional>
 #include <thread>
-#include <vector>
 
 struct QueueFrame
 {
@@ -56,6 +53,48 @@ class SendQueueAsync
     bool running_;
 };
 
+class RJEstimator
+{
+    using ClockTP = ClockEntry::ClockTP;
+
+  public:
+    RJEstimator();
+    ~RJEstimator();
+
+    void reset();
+    void note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max_seq_delta);
+
+    double interval_avg;
+    double jitter_avg;
+    double jitter_tail;
+
+  private:
+    bool has_reference;
+    bool has_interval;
+    uint32_t last_seq;
+    ClockTP last_time;
+    Histogram<20> jitter_hist;
+};
+
+class ROEstimator
+{
+  public:
+    ROEstimator();
+    ~ROEstimator();
+
+    void reset();
+    void note(uint32_t abs_seq, size_t max_seq_delta);
+
+    uint32_t reorder_cnt;
+    uint32_t max_disorder_depth;
+    double depth_frames;
+    double guard_depth_frames;
+
+  private:
+    bool has_reference;
+    uint32_t highest_seq;
+};
+
 class RecvQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
@@ -76,14 +115,13 @@ class RecvQueueAsync
         size_t max_depth = 128;
         size_t max_buffered_frames = 256;
         double stale_timeout_ms = 2000.0;
-        double default_frame_interval_ms = 16.0;
+        double default_frame_interval_ms = 2.0;
         double depth_feedback_gain = 0.08;
-        double min_pacing_factor = 0.70;
-        double max_pacing_factor = 1.30;
+        double min_pacing_factor = 0.60;
+        double max_pacing_factor = 2.00;
         double depth_margin_frames = 0.5;
         double jitter_weight = 2.0;
         uint32_t pressure_bonus_frames = 30;
-        double fall_alpha = 0.02;
     };
 
     struct BufferedFrame
@@ -105,36 +143,9 @@ class RecvQueueAsync
         uint64_t reorder = 0;
         uint64_t stale = 0;
         uint64_t overflow = 0;
-        uint32_t max_disorder_depth = 0;
     };
 
-    struct ArrivalEstimator
-    {
-        bool has_ref = false;
-        uint32_t last_seq = 0;
-        ClockTP last_time = ClockTP{};
-        double interval_ms = 0.0;
-        double jitter_ms = 0.0;
-        double tail_late_jitter_ms = 0.0;
-        Histogram<20> late_jitter_hist;
-
-        void reset();
-        void note(uint32_t abs_seq, ClockTP arrival, size_t max_seq_delta);
-    };
-
-    struct ReorderEstimator
-    {
-        bool has_highest_seq = false;
-        uint32_t highest_seq = 0;
-        double depth_frames = 0.0;
-        double guard_depth_frames = 0.0;
-
-        void reset();
-        void note(uint32_t abs_seq, size_t max_seq_delta, Counters &counters);
-        double effective_depth_frames() const;
-    };
-
-    struct DepthController
+    struct BFController
     {
         size_t adaptive_depth = 0;
         double decay_depth_frames = 0.0;
@@ -145,7 +156,7 @@ class RecvQueueAsync
         void sanitize(const Tunables &tuning);
         void trigger_pressure(const Tunables &tuning);
         void consume_pressure();
-        void update(const Tunables &tuning, double reorder_frames, double jitter_frames);
+        void note(const Tunables &tuning, double reorder_frames, double jitter_frames);
     };
 
   public:
@@ -169,11 +180,9 @@ class RecvQueueAsync
     void drain_locked(std::unique_lock<std::mutex> &lock);
     void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
     void update_adaptive_depth_locked();
-    void trigger_pressure_locked();
     double frame_interval_ms_locked() const;
     void purge_stale_locked(ClockTP now);
     void drop_frame_locked(std::list<BufferedFrame>::iterator it);
-    void release_frame_data(uint8_t *data);
     double bootstrap_interval_locked() const;
     double compute_delivery_interval_locked() const;
     double compute_gap_wait_ms_locked() const;
@@ -197,9 +206,9 @@ class RecvQueueAsync
     ClockTP gap_start_time_;
     Tunables tuning_;
 
-    ArrivalEstimator arrival_;
-    ReorderEstimator reorder_;
-    DepthController depth_;
+    RJEstimator arrival_est_;
+    ROEstimator reorder_est_;
+    BFController buffer_ctl_;
     mutable Counters counters_;
 };
 

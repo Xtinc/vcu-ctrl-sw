@@ -2,5 +2,7 @@ build
 cmake-build
 *.md
 *.json
+*.txt
 .vs
 vcu*
+/reliable_udp_jitter_out

@@ -25,6 +25,15 @@ namespace
 using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t TEST_MAGIC = 0x524a5443u; // RJTC
+constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v2";
+constexpr const char *ARRIVAL_CSV_HEADER = "elapsed_ms,seq,interval_ms,latency_ms,size_bytes";
+constexpr const char *QUEUE_STATS_CSV_HEADER =
+    "elapsed_ms,q_avg_fi_ms,q_jitter_ms,q_jitter_frames,q_disorder_frames,q_max_disorder_depth,"
+    "q_tail_jitter_ms,q_tail_jitter_frames,"
+    "q_buffered_frames,q_adaptive_depth,q_depth_raw,q_depth_error_frames,q_pressure_frames,q_pacing_factor,"
+    "q_recv_delta,q_dlv_delta,"
+    "q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta,"
+    "recv_rate_bps,lost_rate";
 
 #pragma pack(push, 1)
 struct JitterMsgHdr
@@ -60,6 +69,9 @@ struct ParsedQueueStats
     uint64_t q_buffered_frames = 0;
     uint64_t q_adaptive_depth = 0;
     double q_depth_raw = 0.0;
+    double q_depth_error_frames = 0.0;
+    uint64_t q_pressure_frames = 0;
+    double q_pacing_factor = 0.0;
     uint64_t q_recv_delta = 0;
     uint64_t q_dlv_delta = 0;
     uint64_t q_skip_delta = 0;
@@ -202,6 +214,20 @@ static std::string stat_value(const std::string &stats, const std::string &key)
     return trim_copy(stats.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
 }
 
+static std::string require_stat_value(const std::string &stats, const std::string &key)
+{
+    const auto value = stat_value(stats, key);
+    if (value.empty())
+        throw std::runtime_error("queue_stats_text() missing field " + key + " in: " + stats);
+    return value;
+}
+
+static void require_separator(const std::string &value, char separator, const std::string &field)
+{
+    if (value.find(separator) == std::string::npos)
+        throw std::runtime_error("queue_stats_text() field " + field + " has unexpected value: " + value);
+}
+
 static double parse_double_prefix(const std::string &value)
 {
     if (value.empty())
@@ -220,42 +246,45 @@ static ParsedQueueStats parse_queue_stats(const std::string &stats)
 {
     ParsedQueueStats out;
 
-    out.q_avg_fi_ms = parse_double_prefix(stat_value(stats, "q_avg_fi="));
+    out.q_avg_fi_ms = parse_double_prefix(require_stat_value(stats, "q_avg_fi="));
 
-    const std::string jitter = stat_value(stats, "q_jitter=");
+    const std::string jitter = require_stat_value(stats, "q_jitter=");
+    require_separator(jitter, '/', "q_jitter");
     const auto jitter_slash = jitter.find('/');
     out.q_jitter_ms = parse_double_prefix(jitter);
-    if (jitter_slash != std::string::npos)
-        out.q_jitter_frames = parse_double_prefix(jitter.substr(jitter_slash + 1));
+    out.q_jitter_frames = parse_double_prefix(jitter.substr(jitter_slash + 1));
 
-    const std::string tail_jitter = stat_value(stats, "q_tail_jitter=");
+    const std::string tail_jitter = require_stat_value(stats, "q_tail_jitter=");
+    require_separator(tail_jitter, '/', "q_tail_jitter");
     const auto tail_jitter_slash = tail_jitter.find('/');
     out.q_tail_jitter_ms = parse_double_prefix(tail_jitter);
-    if (tail_jitter_slash != std::string::npos)
-        out.q_tail_jitter_frames = parse_double_prefix(tail_jitter.substr(tail_jitter_slash + 1));
+    out.q_tail_jitter_frames = parse_double_prefix(tail_jitter.substr(tail_jitter_slash + 1));
 
-    const std::string disorder = stat_value(stats, "q_dis=");
+    const std::string disorder = require_stat_value(stats, "q_dis=");
+    require_separator(disorder, '/', "q_dis");
     const auto disorder_slash = disorder.find('/');
     out.q_disorder_frames = parse_double_prefix(disorder);
-    if (disorder_slash != std::string::npos)
-        out.q_max_disorder_depth = parse_u64_prefix(disorder.substr(disorder_slash + 1));
+    out.q_max_disorder_depth = parse_u64_prefix(disorder.substr(disorder_slash + 1));
 
-    const std::string depth = stat_value(stats, "q_depth=");
+    const std::string depth = require_stat_value(stats, "q_depth=");
+    require_separator(depth, '/', "q_depth");
     const auto first_slash = depth.find('/');
     out.q_buffered_frames = parse_u64_prefix(depth);
-    if (first_slash != std::string::npos)
-        out.q_adaptive_depth = parse_u64_prefix(depth.substr(first_slash + 1));
+    out.q_adaptive_depth = parse_u64_prefix(depth.substr(first_slash + 1));
 
-    out.q_depth_raw = parse_double_prefix(stat_value(stats, "q_depth_raw="));
-    out.q_recv_delta = parse_u64_prefix(stat_value(stats, "q_recv="));
-    out.q_dlv_delta = parse_u64_prefix(stat_value(stats, "q_dlv="));
-    out.q_skip_delta = parse_u64_prefix(stat_value(stats, "q_skip="));
-    out.q_drop_delta = parse_u64_prefix(stat_value(stats, "q_drop="));
-    out.q_dup_delta = parse_u64_prefix(stat_value(stats, "q_dup="));
-    out.q_late_delta = parse_u64_prefix(stat_value(stats, "q_late="));
-    out.q_reorder_delta = parse_u64_prefix(stat_value(stats, "q_reorder="));
-    out.q_stale_delta = parse_u64_prefix(stat_value(stats, "q_stale="));
-    out.q_ovf_delta = parse_u64_prefix(stat_value(stats, "q_ovf="));
+    out.q_depth_raw = parse_double_prefix(require_stat_value(stats, "q_depth_raw="));
+    out.q_depth_error_frames = parse_double_prefix(require_stat_value(stats, "q_depth_err="));
+    out.q_pressure_frames = parse_u64_prefix(require_stat_value(stats, "q_pressure="));
+    out.q_pacing_factor = parse_double_prefix(require_stat_value(stats, "q_pace="));
+    out.q_recv_delta = parse_u64_prefix(require_stat_value(stats, "q_recv="));
+    out.q_dlv_delta = parse_u64_prefix(require_stat_value(stats, "q_dlv="));
+    out.q_skip_delta = parse_u64_prefix(require_stat_value(stats, "q_skip="));
+    out.q_drop_delta = parse_u64_prefix(require_stat_value(stats, "q_drop="));
+    out.q_dup_delta = parse_u64_prefix(require_stat_value(stats, "q_dup="));
+    out.q_late_delta = parse_u64_prefix(require_stat_value(stats, "q_late="));
+    out.q_reorder_delta = parse_u64_prefix(require_stat_value(stats, "q_reorder="));
+    out.q_stale_delta = parse_u64_prefix(require_stat_value(stats, "q_stale="));
+    out.q_ovf_delta = parse_u64_prefix(require_stat_value(stats, "q_ovf="));
 
     return out;
 }
@@ -324,11 +353,7 @@ static void handle_received_frames(RunState &state, const std::vector<QueueFrame
 
 static void write_stats_header(std::ofstream &csv)
 {
-    csv << "elapsed_ms,q_avg_fi_ms,q_jitter_ms,q_jitter_frames,q_disorder_frames,q_max_disorder_depth,"
-           "q_tail_jitter_ms,q_tail_jitter_frames,"
-           "q_buffered_frames,q_adaptive_depth,q_depth_raw,q_recv_delta,q_dlv_delta,"
-           "q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta,"
-           "recv_rate_bps,lost_rate\n";
+    csv << QUEUE_STATS_CSV_HEADER << '\n';
 }
 
 static void stats_sampler(std::shared_ptr<ReliableUDP> receiver, RunState &state, const Config &cfg,
@@ -349,6 +374,7 @@ static void stats_sampler(std::shared_ptr<ReliableUDP> receiver, RunState &state
             << parsed.q_disorder_frames << ',' << parsed.q_max_disorder_depth << ',' << parsed.q_tail_jitter_ms << ','
             << parsed.q_tail_jitter_frames << ',' << parsed.q_buffered_frames << ','
             << parsed.q_adaptive_depth << ',' << parsed.q_depth_raw << ','
+            << parsed.q_depth_error_frames << ',' << parsed.q_pressure_frames << ',' << parsed.q_pacing_factor << ','
             << parsed.q_recv_delta << ',' << parsed.q_dlv_delta << ',' << parsed.q_skip_delta << ','
             << parsed.q_drop_delta << ',' << parsed.q_dup_delta << ',' << parsed.q_late_delta << ','
             << parsed.q_reorder_delta << ',' << parsed.q_stale_delta << ',' << parsed.q_ovf_delta << ','
@@ -416,6 +442,7 @@ static void write_summary(const Config &cfg, const RunState &state, const std::s
 
     summary << std::fixed << std::setprecision(3);
     summary << "ReliableUDP TC jitter analysis\n";
+    summary << "csv_contract_version=" << CSV_CONTRACT_VERSION << '\n';
     summary << "duration_sec=" << cfg.duration_sec << '\n';
     summary << "elapsed_sec=" << elapsed_seconds << '\n';
     summary << "rate_mbps=" << cfg.rate_mbps << '\n';
@@ -431,6 +458,7 @@ static void write_summary(const Config &cfg, const RunState &state, const std::s
     summary << "duplicate_count=" << duplicates << '\n';
     summary << "observed_message_loss_pct=" << loss_pct << '\n';
     summary << "plot_command=python3 tests/plot_reliable_udp_jitter.py " << cfg.out_dir << '\n';
+    summary << "primary_figures=network_vs_controller.png,latency_ideal_vs_actual.png,parameter_influence.png\n";
 }
 
 static void run_test(const Config &cfg)
@@ -449,7 +477,7 @@ static void run_test(const Config &cfg)
     state.arrival_csv.open(arrival_path.c_str(), std::ios::out | std::ios::trunc);
     if (!state.arrival_csv)
         throw std::runtime_error("failed to open " + arrival_path);
-    state.arrival_csv << "elapsed_ms,seq,interval_ms,latency_ms,size_bytes\n";
+    state.arrival_csv << ARRIVAL_CSV_HEADER << '\n';
 
     std::ofstream stats_csv(stats_path.c_str(), std::ios::out | std::ios::trunc);
     if (!stats_csv)

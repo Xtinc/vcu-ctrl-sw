@@ -40,10 +40,9 @@ add_executable(dumb_test
 target_include_directories(dumb_test PRIVATE ${APP_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${LIBDRM_INCLUDE_DIRS})
 target_link_libraries(dumb_test PRIVATE liballegro_decode_static lib_network_obj ${LIBDRM_LIBRARIES})
 
-# --- ReliableUDP loopback + FEC unit test ---
-# Sends random-sized messages through a configurable lossy UDP proxy to a
-# local receiver and verifies every delivered message passes an Adler-32
-# integrity check.  No external hardware or Allegro SDK required.
+# --- ReliableUDP protocol + FEC integration tests ---
+# Covers RTT probes, deterministic XOR-FEC recovery cases, and random-sized
+# messages through a configurable lossy UDP proxy.
 #
 # Usage:
 #   ./test_reliable_udp [--min-bytes N] [--max-bytes N]
@@ -52,6 +51,20 @@ target_link_libraries(dumb_test PRIVATE liballegro_decode_static lib_network_obj
 add_executable(test_reliable_udp
     test_reliable_udp.cpp)
 target_link_libraries(test_reliable_udp PRIVATE lib_network_obj lib_rtos_obj Threads::Threads)
+
+# --- RecvQueueAsync jitter/reorder unit tests ---
+# Exercises in-order delivery, reorder recovery, duplicate suppression,
+# adaptive depth, gap skip, output pacing smoothness, and SendQueue fill.
+add_executable(test_reliable_udp_jitter
+    test_reliable_udp_jitter.cpp)
+target_link_libraries(test_reliable_udp_jitter PRIVATE lib_network_obj lib_rtos_obj Threads::Threads)
+
+# --- RJEstimator unit test ---
+# Feeds synthetic 2-100ms arrival intervals into the jitter estimator and
+# validates interval tracking, jitter response, and outlier isolation.
+add_executable(test_rj_estimator
+    test_rj_estimator.cpp)
+target_link_libraries(test_rj_estimator PRIVATE lib_network_obj lib_rtos_obj Threads::Threads)
 
 # --- ReliableUDP TC jitter measurement utility ---
 # Generates a local ReliableUDP stream and writes CSV metrics for offline

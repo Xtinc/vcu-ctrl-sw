@@ -15,15 +15,12 @@
 template <size_t N> class Histogram
 {
     static_assert(N > 2, "Histogram must have at least 3 buckets");
-
-    // Collect this many raw samples before switching to EMA mode.
     static constexpr size_t BOOTSTRAP_MIN = (N < 32) ? 32 : N;
-
-    // EMA decay factor. Effective window 1/(1-DECAY) ≈ 100 samples.
-    static constexpr double DECAY = 0.99;
+    static constexpr double DEFAULT_DECAY = 0.99;
 
   public:
-    Histogram() : count(0), boot_n(0), observed_min(0.0), observed_max(0.0)
+    explicit Histogram(double decay = DEFAULT_DECAY)
+        : count(0), boot_n(0), observed_min(0.0), observed_max(0.0), decay_f(sanitize_decay(decay))
     {
         bcnts.fill(0.0);
         scale.fill(0.0);
@@ -111,11 +108,18 @@ template <size_t N> class Histogram
             scale[N] = val;
 
         for (auto &c : bcnts)
-            c *= DECAY;
-        bcnts[bucket_of(val)] += 1.0 - DECAY;
+            c *= decay_f;
+        bcnts[bucket_of(val)] += 1.0 - decay_f;
 
         if (++count % 100 == 0)
             equalize();
+    }
+
+    static double sanitize_decay(double decay)
+    {
+        if (!std::isfinite(decay))
+            return DEFAULT_DECAY;
+        return std::max(0.0, std::min(decay, 0.999999));
     }
 
     size_t bucket_of(double val) const
@@ -182,6 +186,7 @@ template <size_t N> class Histogram
     size_t boot_n;
     double observed_min;
     double observed_max;
+    double decay_f;
 };
 
 /**

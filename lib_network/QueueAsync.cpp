@@ -5,7 +5,34 @@
 #include <iomanip>
 #include <sstream>
 
-constexpr static auto MIN_FRAME_INTERVAL_MS = 1.0;
+namespace
+{
+constexpr auto MIN_FRAME_INTERVAL_MS = 1.0;
+
+// Estimator windows are measured in accepted frame samples.  A small window is
+// used for active observations; a large window is used only to forget old tails.
+constexpr double FAST_ESTIMATE_WINDOW_FRAMES = 10.0;
+constexpr double SLOW_ESTIMATE_WINDOW_FRAMES = 50.0;
+constexpr double TAIL_HISTOGRAM_WINDOW_FRAMES = 1000.0;
+
+// Control-shape constants.  These are not EMA time scales: they define the
+// estimator tail quantile and interval outlier guard.
+constexpr double JITTER_TAIL_QUANTILE = 0.95;
+constexpr double MIN_INTERVAL_RATIO = 0.20;
+constexpr double MAX_INTERVAL_RATIO = 5.00;
+
+constexpr double DEPTH_SETTLE_EPSILON_FRAMES = 0.25;
+
+constexpr double ema_gain(double window_frames)
+{
+    return 1.0 / window_frames;
+}
+
+constexpr double ema_decay(double window_frames)
+{
+    return 1.0 - ema_gain(window_frames);
+}
+} // namespace
 
 template <typename T> static T clamp_value(const T value, const T low, const T high)
 {
@@ -21,7 +48,6 @@ void set_current_thread_scheduler_policy()
     pthread_setname_np(thread, "video_thd");
 }
 
-// SendQueueAsync implementation
 SendQueueAsync::SendQueueAsync()
     : free_head_(0), free_tail_(0), free_count_(0), queue_head_(0), queue_tail_(0), queue_count_(0), running_(false)
 {
@@ -206,23 +232,31 @@ void SendQueueAsync::worker_thread()
     }
 }
 
-// UsrQueueAsync implementation
-void RecvQueueAsync::ArrivalEstimator::reset()
+RJEstimator::RJEstimator()
+    : interval_avg(0.0), jitter_avg(0.0), jitter_tail(0.0), has_reference(false), has_interval(false), last_seq(0),
+      last_time(ClockTP{}), jitter_hist(ema_decay(TAIL_HISTOGRAM_WINDOW_FRAMES))
 {
-    has_ref = false;
-    last_seq = 0;
-    last_time = ClockTP{};
-    interval_ms = 0.0;
-    jitter_ms = 0.0;
-    tail_late_jitter_ms = 0.0;
-    late_jitter_hist.reset();
 }
 
-void RecvQueueAsync::ArrivalEstimator::note(uint32_t abs_seq, ClockTP arrival, size_t max_seq_delta)
+RJEstimator::~RJEstimator() = default;
+
+void RJEstimator::reset()
 {
-    if (!has_ref)
+    has_reference = false;
+    has_interval = false;
+    last_seq = 0;
+    last_time = ClockTP{};
+    interval_avg = 0.0;
+    jitter_avg = 0.0;
+    jitter_tail = 0.0;
+    jitter_hist.reset();
+}
+
+void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max_seq_delta)
+{
+    if (!has_reference)
     {
-        has_ref = true;
+        has_reference = true;
         last_seq = abs_seq;
         last_time = arrival;
         return;
@@ -232,31 +266,44 @@ void RecvQueueAsync::ArrivalEstimator::note(uint32_t abs_seq, ClockTP arrival, s
     if (seq_delta <= 0)
         return;
 
+    auto sample_valid = false;
+    auto sample_interval = 0.0;
     if (seq_delta <= static_cast<int64_t>(max_seq_delta))
     {
-        const double diff_ms = std::chrono::duration<double, std::milli>(arrival - last_time).count();
-        if (diff_ms > 0.0 && diff_ms < 1000.0)
+        const auto diff = std::chrono::duration<double, std::milli>(arrival - last_time).count();
+        if (diff > 0.0 && diff < 1000.0 * MIN_FRAME_INTERVAL_MS)
         {
-            constexpr double ALPHA_RATE = 0.02;
-            constexpr double ALPHA_JITTER = 0.10;
-            const double sample_interval_ms = diff_ms / static_cast<double>(seq_delta);
-            if (interval_ms < MIN_FRAME_INTERVAL_MS)
-            {
-                interval_ms = sample_interval_ms;
-                jitter_ms = 0.0;
-                tail_late_jitter_ms = 0.0;
-            }
-            else
-            {
-                const double late_sample_ms = std::max(0.0, sample_interval_ms - interval_ms);
-                const double deviation = std::abs(sample_interval_ms - interval_ms);
-                late_jitter_hist.add(late_sample_ms);
-                interval_ms += ALPHA_RATE * (sample_interval_ms - interval_ms);
-                jitter_ms += ALPHA_JITTER * (deviation - jitter_ms);
+            sample_interval = diff / static_cast<double>(seq_delta);
+            sample_valid = sample_interval >= MIN_FRAME_INTERVAL_MS;
+        }
+    }
 
-                const double q95_ms = late_jitter_hist.quantile(0.95);
-                tail_late_jitter_ms = std::isfinite(q95_ms) ? q95_ms : jitter_ms;
-            }
+    if (sample_valid)
+    {
+        if (has_interval)
+        {
+            const double late_sample_ms = std::max(0.0, sample_interval - interval_avg);
+            const double deviation = std::abs(sample_interval - interval_avg);
+            jitter_hist.add(late_sample_ms);
+            jitter_avg += ema_gain(FAST_ESTIMATE_WINDOW_FRAMES) * (deviation - jitter_avg);
+
+            const double q95_ms = jitter_hist.quantile(JITTER_TAIL_QUANTILE);
+            const double tail_sample_ms = std::isfinite(q95_ms) ? std::max(q95_ms, late_sample_ms) : late_sample_ms;
+            jitter_tail += (tail_sample_ms >= jitter_tail ? 1.0 : ema_gain(SLOW_ESTIMATE_WINDOW_FRAMES)) *
+                           (tail_sample_ms - jitter_tail);
+
+            const double min_sample_ms = interval_avg * MIN_INTERVAL_RATIO;
+            const double max_sample_ms = interval_avg * MAX_INTERVAL_RATIO;
+            if (sample_interval >= min_sample_ms && sample_interval <= max_sample_ms)
+                interval_avg += ema_gain(SLOW_ESTIMATE_WINDOW_FRAMES) * (sample_interval - interval_avg);
+        }
+        else
+        {
+            interval_avg = sample_interval;
+            jitter_avg = 0.0;
+            jitter_tail = 0.0;
+            has_interval = true;
+            sample_valid = false;
         }
     }
 
@@ -264,58 +311,59 @@ void RecvQueueAsync::ArrivalEstimator::note(uint32_t abs_seq, ClockTP arrival, s
     last_time = arrival;
 }
 
-void RecvQueueAsync::ReorderEstimator::reset()
+ROEstimator::ROEstimator()
+    : reorder_cnt(0), max_disorder_depth(0), depth_frames(0.0), guard_depth_frames(0.0), has_reference(false),
+      highest_seq(0)
 {
-    has_highest_seq = false;
+}
+
+ROEstimator::~ROEstimator() = default;
+
+void ROEstimator::reset()
+{
+    has_reference = false;
     highest_seq = 0;
+    reorder_cnt = 0;
+    max_disorder_depth = 0;
     depth_frames = 0.0;
     guard_depth_frames = 0.0;
 }
 
-void RecvQueueAsync::ReorderEstimator::note(uint32_t abs_seq, size_t max_seq_delta, Counters &counters)
+void ROEstimator::note(uint32_t abs_seq, size_t max_seq_delta)
 {
-    constexpr double ALPHA_DISORDER = 0.10;
-    constexpr double DECAY_DISORDER = 0.02;
-    constexpr double DECAY_DISORDER_GUARD = 0.01;
-
-    double sample = 0.0;
-    if (!has_highest_seq)
+    if (!has_reference)
     {
-        has_highest_seq = true;
+        has_reference = true;
         highest_seq = abs_seq;
         return;
     }
 
     const int64_t seq_delta = static_cast<int64_t>(abs_seq) - static_cast<int64_t>(highest_seq);
-    if (seq_delta < 0 && -seq_delta <= static_cast<int64_t>(max_seq_delta))
+    if (seq_delta > 0)
     {
-        sample = static_cast<double>(-seq_delta);
-        ++counters.reorder;
-        counters.max_disorder_depth = std::max(counters.max_disorder_depth, static_cast<uint32_t>(sample));
-    }
-    else if (seq_delta > 0)
-    {
+        const double forward_gap = static_cast<double>(seq_delta - 1);
         highest_seq = abs_seq;
+        depth_frames *= ema_decay(SLOW_ESTIMATE_WINDOW_FRAMES);
+        guard_depth_frames *= ema_decay(SLOW_ESTIMATE_WINDOW_FRAMES);
+        guard_depth_frames = std::max(guard_depth_frames, forward_gap);
+        return;
     }
 
-    if (sample > 0.0)
-    {
-        depth_frames += ALPHA_DISORDER * (sample - depth_frames);
-        guard_depth_frames = std::max(guard_depth_frames, sample);
-    }
-    else
-    {
-        depth_frames += DECAY_DISORDER * (0.0 - depth_frames);
-        guard_depth_frames += DECAY_DISORDER_GUARD * (0.0 - guard_depth_frames);
-    }
+    if (seq_delta == 0)
+        return;
+
+    const auto disorder_depth = static_cast<uint32_t>(-seq_delta);
+    if (disorder_depth > max_seq_delta)
+        return;
+
+    const double sample = static_cast<double>(disorder_depth);
+    ++reorder_cnt;
+    max_disorder_depth = std::max(max_disorder_depth, disorder_depth);
+    depth_frames += ema_gain(FAST_ESTIMATE_WINDOW_FRAMES) * (sample - depth_frames);
+    guard_depth_frames = std::max(guard_depth_frames, sample);
 }
 
-double RecvQueueAsync::ReorderEstimator::effective_depth_frames() const
-{
-    return std::max(depth_frames, guard_depth_frames);
-}
-
-void RecvQueueAsync::DepthController::reset(size_t initial_depth)
+void RecvQueueAsync::BFController::reset(size_t initial_depth)
 {
     adaptive_depth = initial_depth;
     decay_depth_frames = static_cast<double>(initial_depth);
@@ -323,7 +371,7 @@ void RecvQueueAsync::DepthController::reset(size_t initial_depth)
     pressure_frames_remaining = 0;
 }
 
-void RecvQueueAsync::DepthController::sanitize(const Tunables &tuning)
+void RecvQueueAsync::BFController::sanitize(const Tunables &tuning)
 {
     adaptive_depth =
         clamp_value(adaptive_depth == 0 ? tuning.min_depth : adaptive_depth, tuning.min_depth, tuning.max_depth);
@@ -334,20 +382,19 @@ void RecvQueueAsync::DepthController::sanitize(const Tunables &tuning)
     raw_depth_frames = std::max(raw_depth_frames, static_cast<double>(tuning.min_depth));
 }
 
-void RecvQueueAsync::DepthController::trigger_pressure(const Tunables &tuning)
+void RecvQueueAsync::BFController::trigger_pressure(const Tunables &tuning)
 {
     pressure_frames_remaining = std::max(pressure_frames_remaining, tuning.pressure_bonus_frames);
 }
 
-void RecvQueueAsync::DepthController::consume_pressure()
+void RecvQueueAsync::BFController::consume_pressure()
 {
     if (pressure_frames_remaining > 0)
         --pressure_frames_remaining;
 }
 
-void RecvQueueAsync::DepthController::update(const Tunables &tuning, double reorder_frames, double jitter_frames)
+void RecvQueueAsync::BFController::note(const Tunables &tuning, double reorder_frames, double jitter_frames)
 {
-    constexpr double DEPTH_SETTLE_EPSILON = 0.25;
     const double pressure_frames = pressure_frames_remaining > 0 ? 1.0 : 0.0;
     raw_depth_frames =
         reorder_frames + tuning.jitter_weight * jitter_frames + tuning.depth_margin_frames + pressure_frames;
@@ -362,10 +409,11 @@ void RecvQueueAsync::DepthController::update(const Tunables &tuning, double reor
         return;
     }
 
-    decay_depth_frames += tuning.fall_alpha * (static_cast<double>(target_depth) - decay_depth_frames);
+    decay_depth_frames +=
+        ema_gain(SLOW_ESTIMATE_WINDOW_FRAMES) * (static_cast<double>(target_depth) - decay_depth_frames);
     decay_depth_frames =
         clamp_value(decay_depth_frames, static_cast<double>(tuning.min_depth), static_cast<double>(tuning.max_depth));
-    if (decay_depth_frames - static_cast<double>(target_depth) <= DEPTH_SETTLE_EPSILON)
+    if (decay_depth_frames - static_cast<double>(target_depth) <= DEPTH_SETTLE_EPSILON_FRAMES)
         decay_depth_frames = static_cast<double>(target_depth);
 
     adaptive_depth = clamp_value(static_cast<size_t>(std::ceil(decay_depth_frames)), target_depth, tuning.max_depth);
@@ -400,9 +448,8 @@ void RecvQueueAsync::sanitize_tuning_locked()
         tuning_.max_pacing_factor = tuning_.min_pacing_factor;
     tuning_.depth_margin_frames = std::max(0.0, tuning_.depth_margin_frames);
     tuning_.jitter_weight = std::max(0.0, tuning_.jitter_weight);
-    tuning_.fall_alpha = clamp_value(tuning_.fall_alpha, 0.001, 1.0);
 
-    depth_.sanitize(tuning_);
+    buffer_ctl_.sanitize(tuning_);
 }
 
 void RecvQueueAsync::reset_state_locked()
@@ -415,9 +462,9 @@ void RecvQueueAsync::reset_state_locked()
     gap_active_ = false;
     gap_start_time_ = ClockTP{};
 
-    arrival_.reset();
-    reorder_.reset();
-    depth_.reset(tuning_.initial_depth);
+    arrival_est_.reset();
+    reorder_est_.reset();
+    buffer_ctl_.reset(tuning_.initial_depth);
     counters_ = Counters{};
 }
 
@@ -425,7 +472,7 @@ void RecvQueueAsync::clear_buffered_frames_locked()
 {
     for (auto &frame : buffered_frames_)
     {
-        release_frame_data(frame.data);
+        frame_pool_.deallocate(frame.data);
     }
     buffered_frames_.clear();
 }
@@ -434,7 +481,7 @@ void RecvQueueAsync::clear_delivered_frames_locked()
 {
     for (auto &frame : delivered_frames_)
     {
-        release_frame_data(frame.data);
+        frame_pool_.deallocate(frame.data);
     }
     delivered_frames_.clear();
 }
@@ -480,27 +527,24 @@ double RecvQueueAsync::frame_interval_ms_locked() const
 void RecvQueueAsync::update_adaptive_depth_locked()
 {
     const double base_interval_ms = frame_interval_ms_locked();
-    const double jitter_frames = arrival_.tail_late_jitter_ms / base_interval_ms;
-    depth_.update(tuning_, reorder_.effective_depth_frames(), jitter_frames);
-}
-
-void RecvQueueAsync::trigger_pressure_locked()
-{
-    depth_.trigger_pressure(tuning_);
-    update_adaptive_depth_locked();
+    const double jitter_frames = arrival_est_.jitter_tail / base_interval_ms;
+    const double reorder_frames = std::max(reorder_est_.depth_frames, reorder_est_.guard_depth_frames);
+    buffer_ctl_.note(tuning_, reorder_frames, jitter_frames);
 }
 
 void RecvQueueAsync::update_estimators_locked(uint32_t abs_seq, ClockTP arrival)
 {
-    arrival_.note(abs_seq, arrival, tuning_.max_buffered_frames);
-    reorder_.note(abs_seq, tuning_.max_buffered_frames, counters_);
+    const uint32_t prev_reorder_cnt = reorder_est_.reorder_cnt;
+    arrival_est_.note(abs_seq, arrival, tuning_.max_buffered_frames);
+    reorder_est_.note(abs_seq, tuning_.max_buffered_frames);
+    counters_.reorder += reorder_est_.reorder_cnt - prev_reorder_cnt;
     update_adaptive_depth_locked();
 }
 
 double RecvQueueAsync::bootstrap_interval_locked() const
 {
-    if (arrival_.interval_ms >= MIN_FRAME_INTERVAL_MS)
-        return arrival_.interval_ms;
+    if (arrival_est_.interval_avg >= MIN_FRAME_INTERVAL_MS)
+        return arrival_est_.interval_avg;
 
     if (buffered_frames_.size() >= 2)
     {
@@ -519,7 +563,7 @@ double RecvQueueAsync::compute_delivery_interval_locked() const
 {
     const double base_interval_ms = std::max(MIN_FRAME_INTERVAL_MS, bootstrap_interval_locked());
     const double depth_error =
-        static_cast<double>(buffered_frames_.size()) - static_cast<double>(depth_.adaptive_depth);
+        static_cast<double>(buffered_frames_.size()) - static_cast<double>(buffer_ctl_.adaptive_depth);
     const double correction = clamp_value(1.0 - tuning_.depth_feedback_gain * depth_error, tuning_.min_pacing_factor,
                                           tuning_.max_pacing_factor);
     return std::max(MIN_FRAME_INTERVAL_MS, base_interval_ms * correction);
@@ -528,7 +572,7 @@ double RecvQueueAsync::compute_delivery_interval_locked() const
 double RecvQueueAsync::compute_gap_wait_ms_locked() const
 {
     const double base_interval_ms = std::max(tuning_.default_frame_interval_ms, bootstrap_interval_locked());
-    const double wait_ms = base_interval_ms * static_cast<double>(depth_.adaptive_depth + 1);
+    const double wait_ms = base_interval_ms * static_cast<double>(buffer_ctl_.adaptive_depth + 1);
     return clamp_value(wait_ms, base_interval_ms, tuning_.stale_timeout_ms);
 }
 
@@ -536,11 +580,6 @@ void RecvQueueAsync::drop_frame_locked(std::list<BufferedFrame>::iterator it)
 {
     uint8_t *data = it->data;
     buffered_frames_.erase(it);
-    release_frame_data(data);
-}
-
-void RecvQueueAsync::release_frame_data(uint8_t *data)
-{
     frame_pool_.deallocate(data);
 }
 
@@ -579,7 +618,8 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     if (primed_ && abs_seq < expected_seq_)
     {
         ++counters_.late;
-        trigger_pressure_locked();
+        buffer_ctl_.trigger_pressure(tuning_);
+        update_adaptive_depth_locked();
         return false;
     }
 
@@ -610,7 +650,8 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         ++counters_.drop;
         ++counters_.overflow;
         drop_frame_locked(tail);
-        trigger_pressure_locked();
+        buffer_ctl_.trigger_pressure(tuning_);
+        update_adaptive_depth_locked();
     }
 
     cond_.notify_one();
@@ -622,17 +663,24 @@ std::string RecvQueueAsync::stats_text() const
     std::lock_guard<std::mutex> lock(mutex_);
 
     const double interval_ms = frame_interval_ms_locked();
-    const double tail_jitter_frames = arrival_.tail_late_jitter_ms / interval_ms;
+    const double jitter_frames = arrival_est_.jitter_avg / interval_ms;
+    const double tail_jitter_frames = arrival_est_.jitter_tail / interval_ms;
+    const double effective_disorder_frames = std::max(reorder_est_.depth_frames, reorder_est_.guard_depth_frames);
+    const double depth_error_frames =
+        static_cast<double>(buffered_frames_.size()) - static_cast<double>(buffer_ctl_.adaptive_depth);
+    const double pacing_factor = clamp_value(1.0 - tuning_.depth_feedback_gain * depth_error_frames,
+                                             tuning_.min_pacing_factor, tuning_.max_pacing_factor);
 
     std::ostringstream os;
-    os << std::fixed << std::setprecision(2) << "q_avg_fi=" << interval_ms << "ms, q_jitter=" << arrival_.jitter_ms
-       << "ms/" << (arrival_.jitter_ms / interval_ms) << "f, q_tail_jitter=" << arrival_.tail_late_jitter_ms << "ms/"
-       << tail_jitter_frames << "f, q_jitter_q=0.95, q_dis=" << reorder_.depth_frames << "f/"
-       << counters_.max_disorder_depth << ", q_depth=" << buffered_frames_.size() << '/' << depth_.adaptive_depth
-       << ", q_depth_raw=" << depth_.raw_depth_frames << ", q_recv=" << counters_.recv
-       << ", q_dlv=" << counters_.deliver << ", q_skip=" << counters_.skip << ", q_drop=" << counters_.drop
-       << ", q_dup=" << counters_.duplicate << ", q_late=" << counters_.late << ", q_reorder=" << counters_.reorder
-       << ", q_stale=" << counters_.stale << ", q_ovf=" << counters_.overflow;
+    os << std::fixed << std::setprecision(2) << "q_avg_fi=" << interval_ms << "ms, q_jitter=" << arrival_est_.jitter_avg
+       << "ms/" << jitter_frames << "f, q_tail_jitter=" << arrival_est_.jitter_tail << "ms/" << tail_jitter_frames
+       << "f, q_dis=" << effective_disorder_frames << "f/" << reorder_est_.max_disorder_depth
+       << ", q_depth=" << buffered_frames_.size() << '/' << buffer_ctl_.adaptive_depth
+       << ", q_depth_err=" << depth_error_frames << ", q_depth_raw=" << buffer_ctl_.raw_depth_frames
+       << ", q_pressure=" << buffer_ctl_.pressure_frames_remaining << ", q_pace=" << pacing_factor
+       << ", q_recv=" << counters_.recv << ", q_dlv=" << counters_.deliver << ", q_skip=" << counters_.skip
+       << ", q_drop=" << counters_.drop << ", q_dup=" << counters_.duplicate << ", q_late=" << counters_.late
+       << ", q_reorder=" << counters_.reorder << ", q_stale=" << counters_.stale << ", q_ovf=" << counters_.overflow;
     counters_ = {};
     return os.str();
 }
@@ -668,7 +716,7 @@ void RecvQueueAsync::handle_gap_locked(std::unique_lock<std::mutex> &lock, Clock
     const auto gap_deadline =
         gap_start_time_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                               std::chrono::duration<double, std::milli>(compute_gap_wait_ms_locked()));
-    const size_t pressure_depth = depth_.adaptive_depth;
+    const size_t pressure_depth = buffer_ctl_.adaptive_depth;
     const bool depth_pressure = buffered_frames_.size() > pressure_depth;
     if (depth_pressure || now >= gap_deadline)
     {
@@ -706,9 +754,9 @@ void RecvQueueAsync::worker_thread()
             cond_.wait(lock, [this] { return !running_ || !buffered_frames_.empty(); });
             break;
         case WorkerState::Priming:
-            if (buffered_frames_.size() < depth_.adaptive_depth)
+            if (buffered_frames_.size() < buffer_ctl_.adaptive_depth)
             {
-                cond_.wait(lock, [this] { return !running_ || buffered_frames_.size() >= depth_.adaptive_depth; });
+                cond_.wait(lock, [this] { return !running_ || buffered_frames_.size() >= buffer_ctl_.adaptive_depth; });
                 break;
             }
 
@@ -748,7 +796,7 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
     const ClockTP now = std::chrono::steady_clock::now();
     expected_seq_ = frame.seq + 1;
     gap_active_ = false;
-    depth_.consume_pressure();
+    buffer_ctl_.consume_pressure();
     update_adaptive_depth_locked();
     next_delivery_time_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                     std::chrono::duration<double, std::milli>(compute_delivery_interval_locked()));
@@ -786,11 +834,12 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
     const double interval_ms = frame_interval_ms_locked();
     VIDEO_DEBUG_PRINT(
         "[JitterBuf] gap skip expected=%u next=%u miss=%u depth=%zu avg_fi=%.2fms jitter=%.2fms disorder=%.2f",
-        expected_seq_, next_available_seq, missing, buffered_frames_.size(), interval_ms, arrival_.jitter_ms,
-        reorder_.depth_frames);
+        expected_seq_, next_available_seq, missing, buffered_frames_.size(), interval_ms, arrival_est_.jitter_avg,
+        reorder_est_.depth_frames);
 
     counters_.skip += missing;
-    trigger_pressure_locked();
+    buffer_ctl_.trigger_pressure(tuning_);
+    update_adaptive_depth_locked();
 
     expected_seq_ = next_available_seq;
     gap_active_ = false;
