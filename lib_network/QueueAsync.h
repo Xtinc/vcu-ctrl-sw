@@ -1,6 +1,7 @@
 #ifndef USER_QUEUE_ASYNC_H
 #define USER_QUEUE_ASYNC_H
 
+#include "ClockWait.h"
 #include "MemPoolUDP.h"
 #include <array>
 #include <condition_variable>
@@ -58,20 +59,21 @@ class SendQueueAsync
 class RecvQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
+
     enum class WorkerState
     {
-        WaitingForFrames,
+        Waiting,
         Priming,
         Pacing,
         Delivering,
-        WaitingForGap,
+        Gapping,
     };
 
     struct Tunables
     {
-        size_t min_depth = 4;
-        size_t initial_depth = 10;
-        size_t max_depth = 64;
+        size_t min_depth = 1;
+        size_t initial_depth = 8;
+        size_t max_depth = 128;
         size_t max_buffered_frames = 256;
         double stale_timeout_ms = 2000.0;
         double default_frame_interval_ms = 16.0;
@@ -81,7 +83,6 @@ class RecvQueueAsync
         double depth_margin_frames = 0.5;
         double jitter_weight = 2.0;
         uint32_t pressure_bonus_frames = 30;
-        double rise_alpha = 0.20;
         double fall_alpha = 0.02;
     };
 
@@ -114,6 +115,8 @@ class RecvQueueAsync
         ClockTP last_time = ClockTP{};
         double interval_ms = 0.0;
         double jitter_ms = 0.0;
+        double tail_late_jitter_ms = 0.0;
+        Histogram<20> late_jitter_hist;
 
         void reset();
         void note(uint32_t abs_seq, ClockTP arrival, size_t max_seq_delta);
@@ -134,7 +137,7 @@ class RecvQueueAsync
     struct DepthController
     {
         size_t adaptive_depth = 0;
-        double smoothed_depth_frames = 0.0;
+        double decay_depth_frames = 0.0;
         double raw_depth_frames = 0.0;
         uint32_t pressure_frames_remaining = 0;
 

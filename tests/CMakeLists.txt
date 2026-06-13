@@ -52,3 +52,10 @@ target_link_libraries(dumb_test PRIVATE liballegro_decode_static lib_network_obj
 add_executable(test_reliable_udp
     test_reliable_udp.cpp)
 target_link_libraries(test_reliable_udp PRIVATE lib_network_obj lib_rtos_obj Threads::Threads)
+
+# --- ReliableUDP TC jitter measurement utility ---
+# Generates a local ReliableUDP stream and writes CSV metrics for offline
+# analysis while external tc/netem rules inject jitter.
+add_executable(test_reliable_udp_jitter_tc
+    test_reliable_udp_jitter_tc.cpp)
+target_link_libraries(test_reliable_udp_jitter_tc PRIVATE lib_network_obj lib_rtos_obj Threads::Threads)

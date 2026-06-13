@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <mutex>
 
 template <size_t N> class Histogram
@@ -24,6 +25,16 @@ template <size_t N> class Histogram
   public:
     Histogram() : count(0), boot_n(0), observed_min(0.0), observed_max(0.0)
     {
+        bcnts.fill(0.0);
+        scale.fill(0.0);
+    }
+
+    void reset()
+    {
+        count = 0;
+        boot_n = 0;
+        observed_min = 0.0;
+        observed_max = 0.0;
         bcnts.fill(0.0);
         scale.fill(0.0);
     }

@@ -137,6 +137,23 @@ static double queue_stat_raw_depth(const std::string &stats)
     return value.empty() ? 0.0 : std::stod(value);
 }
 
+static double queue_stat_tail_jitter_ms(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_tail_jitter=");
+    const auto end = value.find("ms");
+    return value.empty() ? 0.0 : std::stod(value.substr(0, end));
+}
+
+static double queue_stat_tail_jitter_frames(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_tail_jitter=");
+    const auto slash = value.find('/');
+    if (slash == std::string::npos)
+        return 0.0;
+    const auto end = value.find('f', slash + 1);
+    return std::stod(value.substr(slash + 1, end == std::string::npos ? std::string::npos : end - slash - 1));
+}
+
 static bool queue_adaptive_depth_is_valid(const std::string &stats)
 {
     const auto depth = queue_stat_adaptive_depth(stats);
@@ -898,6 +915,218 @@ static bool test_jitter_adaptive_estimation()
     return true;
 }
 
+/// Fast/early compressed arrivals should not increase the one-sided tail jitter
+/// used for buffering depth.
+static bool test_jitter_one_sided_fast_arrivals()
+{
+    constexpr uint32_t WARMUP = 50;
+    constexpr uint32_t FAST = 90;
+    constexpr uint32_t TOTAL = WARMUP + FAST;
+
+    std::vector<std::array<uint8_t, 4>> bufs(TOTAL);
+    for (uint32_t i = 0; i < TOTAL; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t delivered = 0;
+
+    RecvQueueAsync q;
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    }));
+
+    for (uint32_t i = 0; i < WARMUP; i++)
+    {
+        if (!enqueue_with_retry(q, bufs[i].data(), 4, i))
+        {
+            q.stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(6));
+    }
+
+    for (uint32_t i = WARMUP; i < TOTAL; i++)
+    {
+        if (!enqueue_with_retry(q, bufs[i].data(), 4, i))
+        {
+            q.stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(5), [&] { return delivered >= TOTAL; });
+    }
+
+    const std::string stats = q.stats_text();
+    q.stop();
+
+    if (delivered < TOTAL)
+    {
+        std::cout << "  [one_sided_fast] expected " << TOTAL << " frames, got " << delivered << '\n';
+        return false;
+    }
+    if (queue_stat_tail_jitter_frames(stats) > 0.75 || queue_stat_adaptive_depth(stats) > 6)
+    {
+        std::cout << "  [one_sided_fast] compressed arrivals raised tail jitter/depth: " << stats << '\n';
+        return false;
+    }
+    return true;
+}
+
+/// Periodic slow arrivals should raise the one-sided P95 tail jitter and the
+/// raw automatic depth estimate.
+static bool test_jitter_one_sided_slow_tail()
+{
+    constexpr uint32_t WARMUP = 40;
+    constexpr uint32_t BURST = 96;
+    constexpr uint32_t TOTAL = WARMUP + BURST;
+
+    std::vector<std::array<uint8_t, 4>> bufs(TOTAL);
+    for (uint32_t i = 0; i < TOTAL; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t delivered = 0;
+
+    RecvQueueAsync q;
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    }));
+
+    for (uint32_t i = 0; i < WARMUP; i++)
+    {
+        if (!enqueue_with_retry(q, bufs[i].data(), 4, i))
+        {
+            q.stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    for (uint32_t i = WARMUP; i < TOTAL; i++)
+    {
+        if (!enqueue_with_retry(q, bufs[i].data(), 4, i))
+        {
+            q.stop();
+            return false;
+        }
+        const auto d = ((i - WARMUP) % 8 == 7) ? std::chrono::milliseconds(18) : std::chrono::milliseconds(2);
+        std::this_thread::sleep_for(d);
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(8), [&] { return delivered >= TOTAL; });
+    }
+
+    const std::string stats = q.stats_text();
+    q.stop();
+
+    if (delivered < TOTAL)
+    {
+        std::cout << "  [one_sided_slow] expected " << TOTAL << " frames, got " << delivered << '\n';
+        return false;
+    }
+    if (queue_stat_tail_jitter_ms(stats) < 4.0 || queue_stat_raw_depth(stats) <= 4.0)
+    {
+        std::cout << "  [one_sided_slow] slow tail did not raise jitter/depth: " << stats << '\n';
+        return false;
+    }
+    return true;
+}
+
+/// After a slow-tail phase, sustained steady arrivals should decay the tail
+/// estimate without producing late or overflow drops.
+static bool test_jitter_one_sided_tail_recovers()
+{
+    constexpr uint32_t WARMUP = 40;
+    constexpr uint32_t BURST = 96;
+    constexpr uint32_t RECOVER = 220;
+    constexpr uint32_t TOTAL = WARMUP + BURST + RECOVER;
+
+    std::vector<std::array<uint8_t, 4>> bufs(TOTAL);
+    for (uint32_t i = 0; i < TOTAL; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t delivered = 0;
+
+    RecvQueueAsync q;
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    }));
+
+    uint32_t seq = 0;
+    for (; seq < WARMUP; seq++)
+    {
+        if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq))
+        {
+            q.stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    for (; seq < WARMUP + BURST; seq++)
+    {
+        if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq))
+        {
+            q.stop();
+            return false;
+        }
+        const auto d = ((seq - WARMUP) % 8 == 7) ? std::chrono::milliseconds(18) : std::chrono::milliseconds(2);
+        std::this_thread::sleep_for(d);
+    }
+
+    const std::string burst_stats = q.stats_text();
+    const double burst_tail_ms = queue_stat_tail_jitter_ms(burst_stats);
+
+    for (; seq < TOTAL; seq++)
+    {
+        if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq))
+        {
+            q.stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(10), [&] { return delivered >= TOTAL; });
+    }
+
+    const std::string recovered_stats = q.stats_text();
+    q.stop();
+
+    const double recovered_tail_ms = queue_stat_tail_jitter_ms(recovered_stats);
+    if (delivered < TOTAL)
+    {
+        std::cout << "  [one_sided_recover] expected " << TOTAL << " frames, got " << delivered << '\n';
+        return false;
+    }
+    if (burst_tail_ms < 4.0 || recovered_tail_ms >= burst_tail_ms * 0.70 ||
+        queue_stat_u64(recovered_stats, "q_late=") != 0 || queue_stat_u64(recovered_stats, "q_ovf=") != 0)
+    {
+        std::cout << "  [one_sided_recover] bad recovery: burst=" << burst_stats
+                  << " recovered=" << recovered_stats << '\n';
+        return false;
+    }
+    return true;
+}
+
 /// Verify output timing uniformity under heavy disorder (WINDOW=8) combined
 /// with a bimodal arrival pattern: odd frames arrive after ~2 ms, even frames
 /// after ~30 ms, simulating a router that alternately fast-paths and queues.
@@ -1417,6 +1646,9 @@ static int run_jitter_tests()
         {"permanent gap skipped, rest deliver ", test_jitter_permanent_gap},
         {"output timing uniform under jitter  ", test_jitter_timing_uniformity},
         {"timing estimators stable by phase   ", test_jitter_adaptive_estimation},
+        {"one-sided fast arrivals stay shallow", test_jitter_one_sided_fast_arrivals},
+        {"one-sided slow tail raises depth    ", test_jitter_one_sided_slow_tail},
+        {"one-sided tail recovers             ", test_jitter_one_sided_tail_recovers},
         {"bimodal jitter: uniform output      ", test_jitter_bimodal_jitter_uniformity},
         {"burst+silence: output smoothed      ", test_jitter_burst_silence_uniformity},
         {"large window: strict order + CV     ", test_jitter_large_window_order},

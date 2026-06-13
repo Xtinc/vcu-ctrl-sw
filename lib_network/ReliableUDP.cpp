@@ -610,13 +610,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         reset_receive_state_for_new_epoch(uid);
     }
 
-    const bool normal_wrap = last_group_id_ > 3 * 0xffffu / 4 && seq < 0xffffu / 4;
-    if (uid == active_conn_uuid_ && last_group_id_ > seq && !normal_wrap)
-    {
-        reset_receive_state_for_new_epoch(uid);
-    }
-
-    if (normal_wrap)
+    if (last_group_id_ > 3 * 0xffffu / 4 && seq < 0xffffu / 4)
     {
         group_cycle_++;
     }
