@@ -47,7 +47,7 @@ static bool enqueue_with_retry(RecvQueueAsync &q, uint8_t *data, size_t size, ui
 
 template <typename Callback> static RecvCallBack single_frame_callback(Callback callback)
 {
-    return [callback](const std::vector<QueueFrame> &frames) {
+    return [callback](const std::vector<QueueFrame> &frames, bool) {
         for (const auto &frame : frames)
         {
             callback(frame.data, frame.size);
@@ -316,7 +316,7 @@ static bool test_jitter_callback_retains_until_release()
     std::condition_variable cv;
 
     RecvQueueAsync q;
-    q.start([&](const std::vector<QueueFrame> &frames) {
+    q.start([&](const std::vector<QueueFrame> &frames, bool) {
         uint32_t tail = 0;
         if (!frames.empty())
             std::memcpy(&tail, frames.back().data, 4);
@@ -1724,6 +1724,69 @@ static bool test_send_queue_fill()
     return recovered;
 }
 
+static bool test_qs_estimator_stable_allows_immediate()
+{
+    QSEstimator qs;
+    const auto base = std::chrono::steady_clock::now();
+    QSEstimator::Events events;
+
+    bool allowed = false;
+    for (int i = 0; i <= 61; ++i)
+    {
+        allowed = qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+    }
+
+    return allowed && qs.allow_immediate;
+}
+
+static bool test_qs_estimator_continuity_break_revokes_immediate()
+{
+    QSEstimator qs;
+    const auto base = std::chrono::steady_clock::now();
+    QSEstimator::Events events;
+
+    for (int i = 0; i <= 61; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+
+    QSEstimator::Events broken;
+    broken.skip = 1;
+    if (qs.note_delivery(base + std::chrono::seconds(62), 1000.0, 100.0, broken))
+        return false;
+
+    for (int i = 63; i < 123; ++i)
+    {
+        if (qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events))
+            return false;
+    }
+
+    return qs.note_delivery(base + std::chrono::seconds(123), 1000.0, 100.0, events);
+}
+
+static bool test_qs_estimator_delivery_jitter_revokes_immediate()
+{
+    QSEstimator qs;
+    const auto base = std::chrono::steady_clock::now();
+    QSEstimator::Events events;
+
+    for (int i = 0; i <= 61; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+
+    return !qs.note_delivery(base + std::chrono::milliseconds(63500), 1000.0, 100.0, events) &&
+           !qs.allow_immediate;
+}
+
+static bool test_qs_estimator_residence_delay_revokes_immediate()
+{
+    QSEstimator qs;
+    const auto base = std::chrono::steady_clock::now();
+    QSEstimator::Events events;
+
+    for (int i = 0; i <= 61; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+
+    return !qs.note_delivery(base + std::chrono::seconds(62), 1000.0, 1500.0, events) && !qs.allow_immediate;
+}
+
 static int run_jitter_tests()
 {
     struct Test
@@ -1753,6 +1816,10 @@ static int run_jitter_tests()
         {"bimodal jitter: uniform output      ", test_jitter_bimodal_jitter_uniformity},
         {"burst+silence: output smoothed      ", test_jitter_burst_silence_uniformity},
         {"large window: strict order + CV     ", test_jitter_large_window_order},
+        {"QS stable allows immediate          ", test_qs_estimator_stable_allows_immediate},
+        {"QS continuity break revokes         ", test_qs_estimator_continuity_break_revokes_immediate},
+        {"QS delivery jitter revokes          ", test_qs_estimator_delivery_jitter_revokes_immediate},
+        {"QS residence delay revokes          ", test_qs_estimator_residence_delay_revokes_immediate},
         {"send queue fill API                 ", test_send_queue_fill},
     };
 

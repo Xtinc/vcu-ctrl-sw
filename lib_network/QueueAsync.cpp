@@ -21,6 +21,9 @@ constexpr double JITTER_TAIL_QUANTILE = 0.95;
 constexpr size_t FEEDFORWARD_INTERVAL_WINDOW_FRAMES = 16;
 
 constexpr double DEPTH_SETTLE_EPSILON_FRAMES = 0.25;
+constexpr double QS_STABLE_WINDOW_SECONDS = 60.0;
+constexpr double QS_MAX_DELIVERY_JITTER_FRAMES = 1.0;
+constexpr double QS_MAX_RESIDENCE_FRAMES = 1.0;
 
 constexpr double ema_gain(double window_frames)
 {
@@ -366,6 +369,53 @@ void ROEstimator::note(uint32_t abs_seq, size_t max_seq_delta)
     guard_depth_frames = std::max(guard_depth_frames, sample);
 }
 
+void QSEstimator::reset()
+{
+    allow_immediate = false;
+    has_last_delivery_ = false;
+    last_delivery_time_ = ClockTP{};
+    stable_since_ = ClockTP{};
+}
+
+bool QSEstimator::note_delivery(ClockTP now, double expected_interval_ms, double residence_ms, const Events &events)
+{
+    expected_interval_ms = std::max(MIN_FRAME_INTERVAL_MS, expected_interval_ms);
+    residence_ms = std::max(0.0, residence_ms);
+
+    if (events.skip > 0 || events.drop > 0 || events.late > 0 || events.stale > 0 || events.overflow > 0)
+    {
+        reset();
+        return allow_immediate;
+    }
+
+    bool stable_sample = residence_ms / expected_interval_ms < QS_MAX_RESIDENCE_FRAMES;
+    if (has_last_delivery_)
+    {
+        const double actual_interval_ms = std::chrono::duration<double, std::milli>(now - last_delivery_time_).count();
+        stable_sample = stable_sample && actual_interval_ms >= 0.0 && actual_interval_ms < 10000.0 &&
+                        std::abs(actual_interval_ms - expected_interval_ms) / expected_interval_ms <
+                            QS_MAX_DELIVERY_JITTER_FRAMES;
+    }
+
+    if (!stable_sample)
+    {
+        reset();
+        return allow_immediate;
+    }
+
+    has_last_delivery_ = true;
+    last_delivery_time_ = now;
+
+    if (stable_since_ == ClockTP{} || now < stable_since_)
+        stable_since_ = now;
+
+    const double stable_seconds = std::chrono::duration<double>(now - stable_since_).count();
+    if (stable_seconds >= QS_STABLE_WINDOW_SECONDS)
+        allow_immediate = true;
+
+    return allow_immediate;
+}
+
 void RecvQueueAsync::BFController::reset(size_t initial_depth)
 {
     adaptive_depth = initial_depth;
@@ -466,6 +516,8 @@ void RecvQueueAsync::reset_state_locked()
     arrival_est_.reset();
     reorder_est_.reset();
     buffer_ctl_.reset(tuning_.initial_depth);
+    qs_est_.reset();
+    qs_events_ = {};
     counters_ = Counters{};
 }
 
@@ -577,6 +629,10 @@ void RecvQueueAsync::purge_stale_locked(ClockTP now)
 
         ++counters_.drop;
         ++counters_.stale;
+        QSEstimator::Events events;
+        events.drop = 1;
+        events.stale = 1;
+        note_qs_event_locked(events);
         auto to_drop = it++;
         drop_frame_locked(to_drop);
     }
@@ -598,6 +654,9 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     if (primed_ && abs_seq < expected_seq_)
     {
         ++counters_.late;
+        QSEstimator::Events events;
+        events.late = 1;
+        note_qs_event_locked(events);
         buffer_ctl_.trigger_pressure(tuning_);
         update_adaptive_depth_locked();
         return false;
@@ -633,6 +692,10 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         auto tail = std::prev(buffered_frames_.end());
         ++counters_.drop;
         ++counters_.overflow;
+        QSEstimator::Events events;
+        events.drop = 1;
+        events.overflow = 1;
+        note_qs_event_locked(events);
         drop_frame_locked(tail);
         buffer_ctl_.trigger_pressure(tuning_);
         update_adaptive_depth_locked();
@@ -746,6 +809,9 @@ void RecvQueueAsync::worker_thread()
         if (buffered_frames_.front().seq < expected_seq_)
         {
             ++counters_.drop;
+            QSEstimator::Events events;
+            events.drop = 1;
+            note_qs_event_locked(events);
             drop_frame_locked(buffered_frames_.begin());
             continue;
         }
@@ -766,6 +832,11 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
     buffered_frames_.pop_front();
 
     const ClockTP now = std::chrono::steady_clock::now();
+    const double expected_interval_ms = estimated_interval_ms_locked();
+    const double residence_ms = std::chrono::duration<double, std::milli>(now - frame.arrival).count();
+    const bool allow_immediate = qs_est_.note_delivery(now, expected_interval_ms, residence_ms, qs_events_);
+    qs_events_ = {};
+
     expected_seq_ = frame.seq + 1;
     gap_start_time_ = ClockTP{};
     buffer_ctl_.consume_pressure();
@@ -781,7 +852,7 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
     try
     {
         if (receive_callback_)
-            should_release = receive_callback_(delivered_frames_);
+            should_release = receive_callback_(delivered_frames_, allow_immediate);
     }
     catch (const std::exception &e)
     {
@@ -810,6 +881,9 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
         reorder_est_.depth_frames);
 
     counters_.skip += missing;
+    QSEstimator::Events events;
+    events.skip = missing;
+    note_qs_event_locked(events);
     buffer_ctl_.trigger_pressure(tuning_);
     update_adaptive_depth_locked();
 
@@ -832,7 +906,7 @@ void RecvQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
         try
         {
             if (receive_callback_)
-                should_release = receive_callback_(delivered_frames_);
+                should_release = receive_callback_(delivered_frames_, false);
         }
         catch (const std::exception &e)
         {
@@ -851,4 +925,13 @@ void RecvQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
     }
 
     clear_delivered_frames_locked();
+}
+
+void RecvQueueAsync::note_qs_event_locked(const QSEstimator::Events &events)
+{
+    qs_events_.skip += events.skip;
+    qs_events_.drop += events.drop;
+    qs_events_.late += events.late;
+    qs_events_.stale += events.stale;
+    qs_events_.overflow += events.overflow;
 }

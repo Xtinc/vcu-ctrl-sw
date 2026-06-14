@@ -8,10 +8,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 class RTDecoder;
 class DRMDisplay;
 class ReliableUDP;
+struct QueueFrame;
 
 struct AL_TBuffer;
 struct AL_TInfoDecode;
@@ -201,6 +203,9 @@ class DecMgr
     int64_t offset_ms() const;
 
   private:
+    bool handle_receive_frames(const std::vector<QueueFrame> &frames, bool allow_immediate);
+    bool handle_frame_mode(const std::vector<QueueFrame> &frames, bool allow_immediate);
+    bool handle_slice_mode(const QueueFrame &frame, bool allow_immediate);
     bool push_stream(const void *data, size_t size, StreamFlags flags = StreamFlags::Unknown);
     void on_decoded_frame(AL_TBuffer *frame, const AL_TInfoDecode &info);
     void return_frame(AL_TBuffer *frame);
@@ -219,6 +224,8 @@ class DecMgr
     std::shared_ptr<ReliableUDP> m_receiver;
     uint32_t m_display_width{0};
     uint32_t m_display_height{0};
+    bool m_immediate_mode{false};
+    bool m_sw_next_frame{false};
     std::atomic<bool> m_running{false};
 };
 

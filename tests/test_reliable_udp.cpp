@@ -130,8 +130,8 @@ static bool test_rtt_ignores_stale_pong()
     stale.t2_delta_ms = 0;
 
     asio::error_code ec;
-    sock.send_to(asio::buffer(&stale, sizeof(stale)), asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 15105),
-                 0, ec);
+    sock.send_to(asio::buffer(&stale, sizeof(stale)),
+                 asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 15105), 0, ec);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     const bool ok = added && !ec && !a->is_time_synced() && a->rtt_ms() == -1;
@@ -298,8 +298,8 @@ class SmallUnitDropProxy
   public:
     SmallUnitDropProxy(asio::io_context &ioc, uint16_t listen_port, uint16_t dst_port, uint8_t drop_idx)
         : socket_(ioc, asio::ip::udp::endpoint(asio::ip::udp::v4(), listen_port)),
-          dst_(asio::ip::make_address("127.0.0.1"), dst_port), buf_(new uint8_t[MAX_TRX_UDP_SIZE]),
-          drop_idx_(drop_idx), dropped_(0), forwarded_(0)
+          dst_(asio::ip::make_address("127.0.0.1"), dst_port), buf_(new uint8_t[MAX_TRX_UDP_SIZE]), drop_idx_(drop_idx),
+          dropped_(0), forwarded_(0)
     {
         do_receive();
     }
@@ -327,39 +327,38 @@ class SmallUnitDropProxy
   private:
     void do_receive()
     {
-        socket_.async_receive_from(asio::buffer(buf_, MAX_TRX_UDP_SIZE), sender_ep_,
-                                   [this](const asio::error_code &ec, size_t n) {
-                                       if (ec == asio::error::operation_aborted)
-                                       {
-                                           return;
-                                       }
+        socket_.async_receive_from(
+            asio::buffer(buf_, MAX_TRX_UDP_SIZE), sender_ep_, [this](const asio::error_code &ec, size_t n) {
+                if (ec == asio::error::operation_aborted)
+                {
+                    return;
+                }
 
-                                       if (!ec && n > 0)
-                                       {
-                                           bool drop = false;
-                                           if (n > TRX_HEADER_SIZE)
-                                           {
-                                               TRXUnit::Header head{};
-                                               std::memcpy(&head, buf_, TRX_HEADER_SIZE);
-                                               drop = TRXUnit::validate(&head) &&
-                                                      head.units_num ==
-                                                          MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY &&
-                                                      head.units_idx == drop_idx_;
-                                           }
+                if (!ec && n > 0)
+                {
+                    bool drop = false;
+                    if (n > TRX_HEADER_SIZE)
+                    {
+                        TRXUnit::Header head{};
+                        std::memcpy(&head, buf_, TRX_HEADER_SIZE);
+                        drop = TRXUnit::validate(&head) &&
+                               head.units_num == MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY &&
+                               head.units_idx == drop_idx_;
+                    }
 
-                                           if (drop)
-                                           {
-                                               dropped_.fetch_add(1, std::memory_order_relaxed);
-                                           }
-                                           else
-                                           {
-                                               forwarded_.fetch_add(1, std::memory_order_relaxed);
-                                               asio::error_code send_ec;
-                                               socket_.send_to(asio::buffer(buf_, n), dst_, 0, send_ec);
-                                           }
-                                       }
-                                       do_receive();
-                                   });
+                    if (drop)
+                    {
+                        dropped_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        forwarded_.fetch_add(1, std::memory_order_relaxed);
+                        asio::error_code send_ec;
+                        socket_.send_to(asio::buffer(buf_, n), dst_, 0, send_ec);
+                    }
+                }
+                do_receive();
+            });
     }
 
     asio::ip::udp::socket socket_;
@@ -458,7 +457,7 @@ static bool run_one_small_xor_case(uint8_t drop_idx, size_t payload_size, uint16
     size_t deliveries = 0;
     size_t errors = 0;
 
-    receiver->set_receive_callback([&](const std::vector<QueueFrame> &frames) {
+    receiver->set_receive_callback([&](const std::vector<QueueFrame> &frames, bool) {
         std::lock_guard<std::mutex> lk(recv_mtx);
         for (const auto &frame : frames)
         {
@@ -509,8 +508,8 @@ static bool run_one_small_xor_case(uint8_t drop_idx, size_t payload_size, uint16
     sender->stop();
     receiver->stop();
 
-    return sent && proxy.dropped() >= frame_count && proxy.forwarded() >= frame_count * 2 && deliveries == frame_count &&
-           errors == 0;
+    return sent && proxy.dropped() >= frame_count && proxy.forwarded() >= frame_count * 2 &&
+           deliveries == frame_count && errors == 0;
 }
 
 static int run_small_xor_tests()
@@ -522,12 +521,7 @@ static int run_small_xor_tests()
     };
 
     const TestCase cases[] = {
-        {0, 1},
-        {1, 2},
-        {2, 3},
-        {0, 97},
-        {1, 128},
-        {2, MAX_TRX_DATA_SIZE - 1},
+        {0, 1}, {1, 2}, {2, 3}, {0, 97}, {1, 128}, {2, MAX_TRX_DATA_SIZE - 1},
     };
 
     std::cout << "\nReliableUDP small XOR FEC tests\n";
@@ -639,7 +633,7 @@ static void run_fec_test(const TestConfig &cfg)
     // Pre-size the seen-bitmap generously (16-bit seq wraps at 65536)
     state.seq_seen.assign(65536, 0);
 
-    receiver->set_receive_callback([&state](const std::vector<QueueFrame> &frames) {
+    receiver->set_receive_callback([&state](const std::vector<QueueFrame> &frames, bool) {
         for (const auto &frame : frames)
         {
             state.on_receive(frame.data, frame.size);

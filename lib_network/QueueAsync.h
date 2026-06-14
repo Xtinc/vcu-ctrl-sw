@@ -12,7 +12,7 @@ struct QueueFrame
     size_t size = 0;
 };
 
-using RecvCallBack = std::function<bool(const std::vector<QueueFrame> &frames)>;
+using RecvCallBack = std::function<bool(const std::vector<QueueFrame> &frames, bool allow_immediate)>;
 using SendCallBack = std::function<void(const uint8_t *data, size_t size)>;
 using FillCallback = std::function<void(uint8_t *data, size_t size)>;
 
@@ -97,6 +97,31 @@ class ROEstimator
     uint32_t highest_seq;
 };
 
+class QSEstimator
+{
+  public:
+    using ClockTP = std::chrono::steady_clock::time_point;
+
+    struct Events
+    {
+        uint64_t skip = 0;
+        uint64_t drop = 0;
+        uint64_t late = 0;
+        uint64_t stale = 0;
+        uint64_t overflow = 0;
+    };
+
+    void reset();
+    bool note_delivery(ClockTP now, double expected_interval_ms, double residence_ms, const Events &events);
+
+    bool allow_immediate = false;
+
+  private:
+    bool has_last_delivery_ = false;
+    ClockTP last_delivery_time_{};
+    ClockTP stable_since_{};
+};
+
 class RecvQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
@@ -177,6 +202,7 @@ class RecvQueueAsync
     double compute_delivery_interval_locked() const;
     void deliver_one_locked(std::unique_lock<std::mutex> &lock);
     void skip_gap_locked(uint32_t next_available_seq);
+    void note_qs_event_locked(const QSEstimator::Events &events);
 
     MemPool<6, 16> frame_pool_;
     RecvCallBack receive_callback_;
@@ -197,6 +223,8 @@ class RecvQueueAsync
     RJEstimator arrival_est_;
     ROEstimator reorder_est_;
     BFController buffer_ctl_;
+    QSEstimator qs_est_;
+    QSEstimator::Events qs_events_;
     mutable Counters counters_;
 };
 

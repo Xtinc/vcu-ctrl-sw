@@ -374,15 +374,15 @@ static void stats_sampler(std::shared_ptr<ReliableUDP> receiver, RunState &state
         const auto now = Clock::now();
         const auto parsed = parse_queue_stats(receiver->queue_stats_text());
         csv << std::fixed << std::setprecision(3) << elapsed_ms(state.start_time, now) << ',' << std::setprecision(2)
-            << parsed.q_avg_fi_ms << ',' << parsed.q_fb_fi_ms << ',' << parsed.q_out_fi_ms << ','
-            << parsed.q_jitter_ms << ',' << parsed.q_jitter_frames << ',' << parsed.q_disorder_frames << ','
-            << parsed.q_max_disorder_depth << ',' << parsed.q_tail_jitter_ms << ',' << parsed.q_tail_jitter_frames
-            << ',' << parsed.q_buffered_frames << ',' << parsed.q_adaptive_depth << ',' << parsed.q_depth_raw << ','
-            << parsed.q_depth_error_frames << ',' << parsed.q_pressure_frames << ',' << parsed.q_pacing_factor << ','
-            << parsed.q_recv_delta << ',' << parsed.q_dlv_delta << ',' << parsed.q_skip_delta << ','
-            << parsed.q_drop_delta << ',' << parsed.q_dup_delta << ',' << parsed.q_late_delta << ','
-            << parsed.q_reorder_delta << ',' << parsed.q_stale_delta << ',' << parsed.q_ovf_delta << ','
-            << receiver->recv_rate() << ',' << receiver->lost_rate() << '\n';
+            << parsed.q_avg_fi_ms << ',' << parsed.q_fb_fi_ms << ',' << parsed.q_out_fi_ms << ',' << parsed.q_jitter_ms
+            << ',' << parsed.q_jitter_frames << ',' << parsed.q_disorder_frames << ',' << parsed.q_max_disorder_depth
+            << ',' << parsed.q_tail_jitter_ms << ',' << parsed.q_tail_jitter_frames << ',' << parsed.q_buffered_frames
+            << ',' << parsed.q_adaptive_depth << ',' << parsed.q_depth_raw << ',' << parsed.q_depth_error_frames << ','
+            << parsed.q_pressure_frames << ',' << parsed.q_pacing_factor << ',' << parsed.q_recv_delta << ','
+            << parsed.q_dlv_delta << ',' << parsed.q_skip_delta << ',' << parsed.q_drop_delta << ','
+            << parsed.q_dup_delta << ',' << parsed.q_late_delta << ',' << parsed.q_reorder_delta << ','
+            << parsed.q_stale_delta << ',' << parsed.q_ovf_delta << ',' << receiver->recv_rate() << ','
+            << receiver->lost_rate() << '\n';
     }
 }
 
@@ -488,7 +488,7 @@ static void run_test(const Config &cfg)
     write_stats_header(stats_csv);
 
     auto receiver = std::make_shared<ReliableUDP>(ioc, cfg.receiver_port);
-    receiver->set_receive_callback([&state](const std::vector<QueueFrame> &frames) {
+    receiver->set_receive_callback([&state](const std::vector<QueueFrame> &frames, bool) {
         handle_received_frames(state, frames);
         return true;
     });

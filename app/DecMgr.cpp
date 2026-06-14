@@ -81,61 +81,11 @@ bool DecMgr::start()
             throw std::runtime_error("DecMgr: create_decoder failed");
         }
 
+        m_immediate_mode = false;
+        m_sw_next_frame = false;
         m_receiver = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
-        m_receiver->set_receive_callback([this](const std::vector<QueueFrame> &frames) {
-            auto latest = std::prev(frames.cend());
-            if (latest->size < sizeof(SLICHead))
-            {
-                return true;
-            }
-
-            const auto *tail_head = reinterpret_cast<const SLICHead *>(latest->data);
-            const auto tail_flag = static_cast<StreamFlags>(tail_head->slice_tok);
-
-            if (tail_flag == StreamFlags::Unknown)
-            {
-                return true;
-            }
-
-            if (tail_flag == StreamFlags::EndOfSlice)
-            {
-                return false;
-            }
-
-            const uint32_t tgt_idx = tail_head->frame_idx;
-            const uint32_t tgt_num = tail_head->slice_num;
-
-            auto begin = latest;
-            size_t count = 1;
-            while (begin != frames.cbegin())
-            {
-                auto prev = std::prev(begin);
-                const auto *head = reinterpret_cast<const SLICHead *>(prev->data);
-                if (head->frame_idx != tgt_idx)
-                {
-                    break;
-                }
-                begin = prev;
-                ++count;
-            }
-
-            if (count != tgt_num)
-            {
-                VIDEO_ERROR_PRINT("DecMgr: incomplete frame %u, got %zu/%u slices", tgt_idx, count, tgt_num);
-                return true;
-            }
-
-            for (auto it = begin; it != frames.cend(); ++it)
-            {
-                const auto *head = reinterpret_cast<const SLICHead *>(it->data);
-                if (!push_stream(it->data + sizeof(SLICHead), it->size - sizeof(SLICHead),
-                                 static_cast<StreamFlags>(head->slice_tok)))
-                {
-                    break;
-                }
-            }
-
-            return true;
+        m_receiver->set_receive_callback([this](const std::vector<QueueFrame> &frames, bool allow_immediate) {
+            return handle_receive_frames(frames, allow_immediate);
         });
 
         m_receiver->start();
@@ -202,6 +152,108 @@ bool DecMgr::push_stream(const void *data, size_t size, StreamFlags flags)
         return false;
 
     return m_decoder && m_decoder->push_stream(data, size, sdk_flags);
+}
+
+bool DecMgr::handle_receive_frames(const std::vector<QueueFrame> &frames, bool allow_immediate)
+{
+    if (frames.empty())
+        return true;
+
+    if (m_immediate_mode)
+        return handle_slice_mode(frames.back(), allow_immediate);
+
+    return handle_frame_mode(frames, allow_immediate);
+}
+
+bool DecMgr::handle_slice_mode(const QueueFrame &frame, bool allow_immediate)
+{
+    if (frame.size < sizeof(SLICHead))
+        return true;
+
+    const auto *head = reinterpret_cast<const SLICHead *>(frame.data);
+    const auto flag = static_cast<StreamFlags>(head->slice_tok);
+
+    if (flag == StreamFlags::Unknown)
+        return true;
+
+    if (flag == StreamFlags::EndOfSlice || flag == StreamFlags::EndOfFrame)
+        push_stream(frame.data + sizeof(SLICHead), frame.size - sizeof(SLICHead), flag);
+
+    if (!allow_immediate)
+        m_sw_next_frame = true;
+
+    if (flag == StreamFlags::EndOfFrame && m_sw_next_frame)
+    {
+        m_immediate_mode = false;
+        m_sw_next_frame = false;
+        VIDEO_INFO_PRINT("DecMgr: slice delivery switched to frame-complete mode");
+    }
+
+    return true;
+}
+
+bool DecMgr::handle_frame_mode(const std::vector<QueueFrame> &frames, bool allow_immediate)
+{
+    auto latest = std::prev(frames.cend());
+    if (latest->size < sizeof(SLICHead))
+        return true;
+
+    const auto *tail_head = reinterpret_cast<const SLICHead *>(latest->data);
+    const auto tail_flag = static_cast<StreamFlags>(tail_head->slice_tok);
+
+    if (tail_flag == StreamFlags::Unknown)
+        return true;
+
+    if (tail_flag == StreamFlags::EndOfSlice)
+        return false;
+
+    if (tail_flag != StreamFlags::EndOfFrame)
+        return true;
+
+    const uint32_t tgt_idx = tail_head->frame_idx;
+    const uint32_t tgt_num = tail_head->slice_num;
+    if (tgt_num == 0)
+        return true;
+
+    auto begin = latest;
+    size_t count = 1;
+    while (begin != frames.cbegin())
+    {
+        auto prev = std::prev(begin);
+        const auto *head = reinterpret_cast<const SLICHead *>(prev->data);
+        if (head->frame_idx != tgt_idx)
+            break;
+
+        begin = prev;
+        ++count;
+    }
+
+    if (count != tgt_num)
+    {
+        VIDEO_ERROR_PRINT("DecMgr: incomplete frame %u, got %zu/%u slices", tgt_idx, count, tgt_num);
+        return true;
+    }
+
+    bool pushed_all = true;
+    for (auto it = begin; it != frames.cend(); ++it)
+    {
+        const auto *head = reinterpret_cast<const SLICHead *>(it->data);
+        if (!push_stream(it->data + sizeof(SLICHead), it->size - sizeof(SLICHead),
+                         static_cast<StreamFlags>(head->slice_tok)))
+        {
+            pushed_all = false;
+            break;
+        }
+    }
+
+    if (pushed_all && allow_immediate)
+    {
+        m_immediate_mode = true;
+        m_sw_next_frame = false;
+        VIDEO_INFO_PRINT("DecMgr: slice delivery switched to immediate mode");
+    }
+
+    return true;
 }
 
 bool DecMgr::do_rebuild()
