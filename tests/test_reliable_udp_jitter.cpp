@@ -119,6 +119,13 @@ static double queue_stat_tail_jitter_ms(const std::string &stats)
     return value.empty() ? 0.0 : std::stod(value.substr(0, end));
 }
 
+static double queue_stat_ms(const std::string &stats, const std::string &key)
+{
+    const auto value = queue_stat_value(stats, key);
+    const auto end = value.find("ms");
+    return value.empty() ? 0.0 : std::stod(value.substr(0, end));
+}
+
 static double queue_stat_tail_jitter_frames(const std::string &stats)
 {
     const auto value = queue_stat_value(stats, "q_tail_jitter=");
@@ -127,6 +134,12 @@ static double queue_stat_tail_jitter_frames(const std::string &stats)
         return 0.0;
     const auto end = value.find('f', slash + 1);
     return std::stod(value.substr(slash + 1, end == std::string::npos ? std::string::npos : end - slash - 1));
+}
+
+static double queue_stat_pacing_factor(const std::string &stats)
+{
+    const auto value = queue_stat_value(stats, "q_pace=");
+    return value.empty() ? 0.0 : std::stod(value);
 }
 
 static bool queue_adaptive_depth_is_valid(const std::string &stats)
@@ -930,6 +943,77 @@ static bool test_jitter_adaptive_estimation()
     return true;
 }
 
+/// A stale/slow sequence-delta sample must not pin pacing. The feed-forward
+/// interval should track actual queued-frame throughput, while depth feedback
+/// remains bounded by the configured pacing limits.
+static bool test_jitter_feedforward_tracks_throughput_with_bounded_feedback()
+{
+    constexpr uint32_t WARMUP = 50;
+    constexpr uint32_t BURST = 140;
+    constexpr uint32_t TOTAL = WARMUP + BURST;
+
+    std::vector<std::array<uint8_t, 4>> bufs(TOTAL);
+    for (uint32_t i = 0; i < TOTAL; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t delivered = 0;
+
+    RecvQueueAsync q;
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    }));
+
+    for (uint32_t i = 0; i < WARMUP; i++)
+    {
+        if (!enqueue_with_retry(q, bufs[i].data(), 4, i))
+        {
+            q.stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+
+    for (uint32_t i = WARMUP; i < TOTAL; i++)
+    {
+        if (!enqueue_with_retry(q, bufs[i].data(), 4, i, std::chrono::milliseconds(1000)))
+        {
+            q.stop();
+            return false;
+        }
+    }
+
+    const std::string pressure_stats = q.stats_text();
+    const double avg_interval_ms = queue_stat_ms(pressure_stats, "q_avg_fi=");
+    const double pacing_factor = queue_stat_pacing_factor(pressure_stats);
+    const auto buffered = queue_stat_current_depth(pressure_stats);
+    const auto adaptive = queue_stat_adaptive_depth(pressure_stats);
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(5), [&] { return delivered >= TOTAL; });
+    }
+
+    const std::string final_stats = q.stats_text();
+    q.stop();
+
+    if (buffered <= adaptive || avg_interval_ms >= 6.0 || pacing_factor < 0.59)
+    {
+        std::cout << "  [feedforward_feedback] bad pressure response: " << pressure_stats << '\n';
+        return false;
+    }
+    if (delivered < TOTAL || queue_stat_u64(final_stats, "q_late=") != 0 || queue_stat_u64(final_stats, "q_ovf=") != 0)
+    {
+        std::cout << "  [feedforward_feedback] bad final state: delivered=" << delivered << "/" << TOTAL
+                  << " stats=" << final_stats << '\n';
+        return false;
+    }
+    return true;
+}
+
 /// Fast/early compressed arrivals should not increase the one-sided tail jitter
 /// used for buffering depth.
 static bool test_jitter_one_sided_fast_arrivals()
@@ -1135,8 +1219,8 @@ static bool test_jitter_one_sided_tail_recovers()
     if (burst_tail_ms < 4.0 || recovered_tail_ms >= burst_tail_ms * 0.70 ||
         queue_stat_u64(recovered_stats, "q_late=") != 0 || queue_stat_u64(recovered_stats, "q_ovf=") != 0)
     {
-        std::cout << "  [one_sided_recover] bad recovery: burst=" << burst_stats
-                  << " recovered=" << recovered_stats << '\n';
+        std::cout << "  [one_sided_recover] bad recovery: burst=" << burst_stats << " recovered=" << recovered_stats
+                  << '\n';
         return false;
     }
     return true;
@@ -1662,6 +1746,7 @@ static int run_jitter_tests()
         {"permanent gap skipped, rest deliver ", test_jitter_permanent_gap},
         {"output timing uniform under jitter  ", test_jitter_timing_uniformity},
         {"timing estimators stable by phase   ", test_jitter_adaptive_estimation},
+        {"feed-forward + bounded feedback     ", test_jitter_feedforward_tracks_throughput_with_bounded_feedback},
         {"one-sided fast arrivals stay shallow", test_jitter_one_sided_fast_arrivals},
         {"one-sided slow tail raises depth    ", test_jitter_one_sided_slow_tail},
         {"one-sided tail recovers             ", test_jitter_one_sided_tail_recovers},

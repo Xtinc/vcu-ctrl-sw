@@ -14,7 +14,7 @@ STATS_PERIOD_MS=100
 DO_BUILD=1
 DO_CLEANUP=1
 DO_PLOT=1
-NORMAL_EDGE_SEC=5
+NORMAL_EDGE_SEC=10
 STAGE_FILE="${ROOT_DIR}/tests/reliable_udp_jitter_stages.txt"
 STAGE_NAMES=()
 STAGE_DURATIONS=()
@@ -35,6 +35,7 @@ Options:
   --dev <ifname>           interface to shape (default: lo)
   --out-dir <path>         output directory (default: reliable_udp_jitter_out/tc_<timestamp>)
   --duration <sec>         total seconds for jitter/reorder/harsh (default: 30)
+                             ignored for --preset staged, which derives duration from the stage file
   --rate-mbps <value>      ReliableUDP send rate (default: 5)
   --payload-bytes <n>      message size including test header (default: 1200)
   --stats-period-ms <n>    stats sampling period (default: 100)
@@ -44,10 +45,10 @@ Options:
   -h, --help               show this help
 
 Presets:
-  jitter   normal 5s -> delay 20ms 5ms 25% distribution normal -> normal 5s
-  reorder  normal 5s -> delay 20ms 5ms 25% distribution normal reorder 1% 25% -> normal 5s
-  harsh    normal 5s -> delay 40ms 10ms 25% distribution normal reorder 5% 25% loss 1% -> normal 5s
-  staged   normal 5s -> stages from --stage-file -> normal 5s
+  jitter   normal 10s -> delay 20ms 5ms 25% distribution normal -> normal 10s
+  reorder  normal 10s -> delay 20ms 5ms 25% distribution normal reorder 1% 25% -> normal 10s
+  harsh    normal 10s -> delay 40ms 10ms 25% distribution normal reorder 5% 25% loss 1% -> normal 10s
+  staged   normal 10s -> stages from --stage-file -> normal 10s
 
 Stage file example:
   20 jitter delay 20ms 5ms 25% distribution normal
@@ -271,20 +272,33 @@ clear_tc() {
     tc qdisc del dev "${DEV}" root >/dev/null 2>&1 || true
 }
 
+init_tc() {
+    clear_tc
+    tc qdisc replace dev "${DEV}" root netem delay 0ms 0ms
+}
+
 apply_stage_tc() {
     local netem="$1"
     if is_normal_netem "${netem}"; then
+        netem="delay 0ms 0ms"
+    fi
+
+    read -r -a NETEM_WORDS <<<"${netem}"
+    if ! tc qdisc change dev "${DEV}" root netem "${NETEM_WORDS[@]}"; then
+        tc qdisc replace dev "${DEV}" root netem "${NETEM_WORDS[@]}"
+    fi
+}
+
+reset_stage_tc() {
+    if [[ ${DO_CLEANUP} -eq 1 ]]; then
         clear_tc
         return
     fi
-    read -r -a NETEM_WORDS <<<"${netem}"
-    tc qdisc replace dev "${DEV}" root netem "${NETEM_WORDS[@]}"
+    apply_stage_tc "delay 0ms 0ms"
 }
 
 cleanup_tc() {
-    if [[ ${DO_CLEANUP} -eq 1 ]]; then
-        clear_tc
-    fi
+    reset_stage_tc
 }
 
 trap cleanup_tc EXIT INT TERM
@@ -305,7 +319,7 @@ echo "stage,start_s,end_s,netem_args" >"${OUT_DIR}/tc_stages.csv"
 
 echo "Starting ${PRESET} ReliableUDP jitter capture into ${OUT_DIR}"
 echo "Total duration: ${TEST_DURATION}s; normal guard: ${NORMAL_EDGE_SEC}s at start/end"
-clear_tc
+init_tc
 "${BUILD_DIR}/tests/test_reliable_udp_jitter_tc" \
     --duration "${TEST_DURATION}" \
     --rate-mbps "${RATE_MBPS}" \
@@ -341,7 +355,7 @@ for ((i = 0; i < ${#STAGE_NAMES[@]}; ++i)); do
     START_S=${END_S}
 done
 
-clear_tc
+apply_stage_tc "delay 0ms 0ms"
 wait "${TEST_PID}"
 
 if [[ ${DO_PLOT} -eq 1 ]]; then
@@ -354,7 +368,7 @@ fi
 
 echo
 echo "Done. Key outputs:"
-echo "  ${OUT_DIR}/network_vs_controller.png"
-echo "  ${OUT_DIR}/latency_ideal_vs_actual.png"
-echo "  ${OUT_DIR}/parameter_influence.png"
+echo "  ${OUT_DIR}/output_smoothness.png"
+echo "  ${OUT_DIR}/controller_terms.png"
+echo "  ${OUT_DIR}/network_effects.png"
 echo "  ${OUT_DIR}/controller_assessment.txt"

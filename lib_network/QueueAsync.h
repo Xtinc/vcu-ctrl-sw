@@ -73,6 +73,8 @@ class RJEstimator
     bool has_interval;
     uint32_t last_seq;
     ClockTP last_time;
+    size_t window_samples;
+    ClockTP window_start;
     Histogram<20> jitter_hist;
 };
 
@@ -99,28 +101,19 @@ class RecvQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
 
-    enum class WorkerState
-    {
-        Waiting,
-        Priming,
-        Pacing,
-        Delivering,
-        Gapping,
-    };
-
     struct Tunables
     {
         size_t min_depth = 1;
         size_t initial_depth = 8;
-        size_t max_depth = 128;
+        size_t max_depth = 256;
         size_t max_buffered_frames = 256;
         double stale_timeout_ms = 2000.0;
         double default_frame_interval_ms = 2.0;
         double depth_feedback_gain = 0.08;
-        double min_pacing_factor = 0.60;
-        double max_pacing_factor = 2.00;
+        double min_pacing_factor = 0.70;
+        double max_pacing_factor = 1.50;
         double depth_margin_frames = 0.5;
-        double jitter_weight = 2.0;
+        double jitter_weight = 1.5;
         uint32_t pressure_bonus_frames = 30;
     };
 
@@ -171,21 +164,17 @@ class RecvQueueAsync
 
   private:
     void worker_thread();
-    WorkerState worker_state_locked(ClockTP now) const;
     void handle_gap_locked(std::unique_lock<std::mutex> &lock, ClockTP now);
     void sanitize_tuning_locked();
     void reset_state_locked();
     void clear_buffered_frames_locked();
     void clear_delivered_frames_locked();
     void drain_locked(std::unique_lock<std::mutex> &lock);
-    void update_estimators_locked(uint32_t abs_seq, ClockTP arrival);
     void update_adaptive_depth_locked();
-    double frame_interval_ms_locked() const;
     void purge_stale_locked(ClockTP now);
     void drop_frame_locked(std::list<BufferedFrame>::iterator it);
-    double bootstrap_interval_locked() const;
+    double estimated_interval_ms_locked() const;
     double compute_delivery_interval_locked() const;
-    double compute_gap_wait_ms_locked() const;
     void deliver_one_locked(std::unique_lock<std::mutex> &lock);
     void skip_gap_locked(uint32_t next_available_seq);
 
@@ -202,7 +191,6 @@ class RecvQueueAsync
     bool primed_;
     uint32_t expected_seq_;
     ClockTP next_delivery_time_;
-    bool gap_active_;
     ClockTP gap_start_time_;
     Tunables tuning_;
 

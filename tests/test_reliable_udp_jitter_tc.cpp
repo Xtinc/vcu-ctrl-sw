@@ -25,10 +25,10 @@ namespace
 using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t TEST_MAGIC = 0x524a5443u; // RJTC
-constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v2";
+constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v4";
 constexpr const char *ARRIVAL_CSV_HEADER = "elapsed_ms,seq,interval_ms,latency_ms,size_bytes";
 constexpr const char *QUEUE_STATS_CSV_HEADER =
-    "elapsed_ms,q_avg_fi_ms,q_jitter_ms,q_jitter_frames,q_disorder_frames,q_max_disorder_depth,"
+    "elapsed_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,q_jitter_frames,q_disorder_frames,q_max_disorder_depth,"
     "q_tail_jitter_ms,q_tail_jitter_frames,"
     "q_buffered_frames,q_adaptive_depth,q_depth_raw,q_depth_error_frames,q_pressure_frames,q_pacing_factor,"
     "q_recv_delta,q_dlv_delta,"
@@ -60,6 +60,8 @@ struct Config
 struct ParsedQueueStats
 {
     double q_avg_fi_ms = 0.0;
+    double q_fb_fi_ms = 0.0;
+    double q_out_fi_ms = 0.0;
     double q_jitter_ms = 0.0;
     double q_jitter_frames = 0.0;
     double q_tail_jitter_ms = 0.0;
@@ -247,6 +249,8 @@ static ParsedQueueStats parse_queue_stats(const std::string &stats)
     ParsedQueueStats out;
 
     out.q_avg_fi_ms = parse_double_prefix(require_stat_value(stats, "q_avg_fi="));
+    out.q_fb_fi_ms = parse_double_prefix(require_stat_value(stats, "q_fb_fi="));
+    out.q_out_fi_ms = parse_double_prefix(require_stat_value(stats, "q_out_fi="));
 
     const std::string jitter = require_stat_value(stats, "q_jitter=");
     require_separator(jitter, '/', "q_jitter");
@@ -338,12 +342,12 @@ static void handle_received_frames(RunState &state, const std::vector<QueueFrame
         }
 
         const double interval = state.has_last_arrival ? elapsed_ms(state.last_arrival, now) : 0.0;
-        const double latency = (static_cast<double>(elapsed_us(state.start_time, now)) -
-                                static_cast<double>(hdr.send_elapsed_us)) /
-                               1000.0;
+        const double latency =
+            (static_cast<double>(elapsed_us(state.start_time, now)) - static_cast<double>(hdr.send_elapsed_us)) /
+            1000.0;
 
-        state.arrival_csv << std::fixed << std::setprecision(3) << elapsed_ms(state.start_time, now) << ','
-                          << hdr.seq << ',' << interval << ',' << latency << ',' << frame.size << '\n';
+        state.arrival_csv << std::fixed << std::setprecision(3) << elapsed_ms(state.start_time, now) << ',' << hdr.seq
+                          << ',' << interval << ',' << latency << ',' << frame.size << '\n';
 
         state.last_arrival = now;
         state.has_last_arrival = true;
@@ -370,10 +374,10 @@ static void stats_sampler(std::shared_ptr<ReliableUDP> receiver, RunState &state
         const auto now = Clock::now();
         const auto parsed = parse_queue_stats(receiver->queue_stats_text());
         csv << std::fixed << std::setprecision(3) << elapsed_ms(state.start_time, now) << ',' << std::setprecision(2)
-            << parsed.q_avg_fi_ms << ',' << parsed.q_jitter_ms << ',' << parsed.q_jitter_frames << ','
-            << parsed.q_disorder_frames << ',' << parsed.q_max_disorder_depth << ',' << parsed.q_tail_jitter_ms << ','
-            << parsed.q_tail_jitter_frames << ',' << parsed.q_buffered_frames << ','
-            << parsed.q_adaptive_depth << ',' << parsed.q_depth_raw << ','
+            << parsed.q_avg_fi_ms << ',' << parsed.q_fb_fi_ms << ',' << parsed.q_out_fi_ms << ','
+            << parsed.q_jitter_ms << ',' << parsed.q_jitter_frames << ',' << parsed.q_disorder_frames << ','
+            << parsed.q_max_disorder_depth << ',' << parsed.q_tail_jitter_ms << ',' << parsed.q_tail_jitter_frames
+            << ',' << parsed.q_buffered_frames << ',' << parsed.q_adaptive_depth << ',' << parsed.q_depth_raw << ','
             << parsed.q_depth_error_frames << ',' << parsed.q_pressure_frames << ',' << parsed.q_pacing_factor << ','
             << parsed.q_recv_delta << ',' << parsed.q_dlv_delta << ',' << parsed.q_skip_delta << ','
             << parsed.q_drop_delta << ',' << parsed.q_dup_delta << ',' << parsed.q_late_delta << ','
@@ -437,8 +441,7 @@ static void write_summary(const Config &cfg, const RunState &state, const std::s
     const auto received = state.received.load(std::memory_order_relaxed);
     const auto errors = state.integrity_errors.load(std::memory_order_relaxed);
     const auto duplicates = state.duplicates.load(std::memory_order_relaxed);
-    const double loss_pct =
-        sent > 0 ? 100.0 * (1.0 - static_cast<double>(received) / static_cast<double>(sent)) : 0.0;
+    const double loss_pct = sent > 0 ? 100.0 * (1.0 - static_cast<double>(received) / static_cast<double>(sent)) : 0.0;
 
     summary << std::fixed << std::setprecision(3);
     summary << "ReliableUDP TC jitter analysis\n";
@@ -458,7 +461,7 @@ static void write_summary(const Config &cfg, const RunState &state, const std::s
     summary << "duplicate_count=" << duplicates << '\n';
     summary << "observed_message_loss_pct=" << loss_pct << '\n';
     summary << "plot_command=python3 tests/plot_reliable_udp_jitter.py " << cfg.out_dir << '\n';
-    summary << "primary_figures=network_vs_controller.png,latency_ideal_vs_actual.png,parameter_influence.png\n";
+    summary << "primary_figures=output_smoothness.png,controller_terms.png,network_effects.png\n";
 }
 
 static void run_test(const Config &cfg)
@@ -567,6 +570,7 @@ static void run_test(const Config &cfg)
 
 int main(int argc, char *argv[])
 {
+    message_init();
     try
     {
         const Config cfg = parse_args(argc, argv);
