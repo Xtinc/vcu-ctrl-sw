@@ -105,7 +105,7 @@ EncMgr::~EncMgr()
     stop();
 }
 
-bool EncMgr::start()
+bool EncMgr::start(const std::string &udp_dest_addr, uint16_t udp_dest_port)
 {
     if (m_running.exchange(true))
     {
@@ -115,19 +115,29 @@ bool EncMgr::start()
     m_paused.store(false);
     m_streaming.store(false);
 
+    if (udp_dest_addr.empty() || udp_dest_port == 0)
+    {
+        VIDEO_ERROR_PRINT("EncMgr: invalid UDP destination %s:%u", udp_dest_addr.c_str(), udp_dest_port);
+        m_running.store(false);
+        return false;
+    }
+
+    std::shared_ptr<ReliableUDP> sender;
     try
     {
-        m_sender = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
-        m_sender->start();
+        sender = std::make_shared<ReliableUDP>(BG_SERVICE, m_cfg.udp_local_port);
+        sender->start();
 
-        if (!m_sender->add_destination(m_cfg.udp_dest_addr, m_cfg.udp_dest_port))
+        if (!sender->add_destination(udp_dest_addr, udp_dest_port))
         {
-            VIDEO_ERROR_PRINT("EncMgr: failed to set UDP destination %s:%u", m_cfg.udp_dest_addr.c_str(),
-                              m_cfg.udp_dest_port);
+            VIDEO_ERROR_PRINT("EncMgr: failed to set UDP destination %s:%u", udp_dest_addr.c_str(), udp_dest_port);
             throw std::runtime_error("EncMgr: add_destination failed");
         }
 
-        m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(m_cfg), make_enc_output_callback(m_sender));
+        m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(m_cfg), make_enc_output_callback(sender));
+        m_cfg.udp_dest_addr = udp_dest_addr;
+        m_cfg.udp_dest_port = udp_dest_port;
+        m_sender = std::move(sender);
         m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
         return true;
     }
@@ -137,12 +147,12 @@ bool EncMgr::start()
         m_running.store(false);
         m_streaming.store(false);
 
-        if (m_sender)
+        if (sender)
         {
-            m_sender->stop();
-            m_sender.reset();
+            sender->stop();
         }
 
+        m_sender.reset();
         m_encoder.reset();
         return false;
     }
@@ -354,6 +364,11 @@ void EncMgr::close_source()
 bool EncMgr::rebuild_encoder(int width, int height)
 {
     std::lock_guard<std::mutex> lock(m_enc_mutex);
+    return rebuild_encoder_locked(width, height);
+}
+
+bool EncMgr::rebuild_encoder_locked(int width, int height)
+{
     EncMgrConfig tmp = m_cfg;
     tmp.width = static_cast<uint16_t>(width);
     tmp.height = static_cast<uint16_t>(height);
@@ -372,13 +387,14 @@ bool EncMgr::rebuild_encoder(int width, int height)
 
 bool EncMgr::ensure_encoder_at(int width, int height)
 {
+    std::lock_guard<std::mutex> lock(m_enc_mutex);
     if (m_encoder->set_resolution(static_cast<uint32_t>(width), static_cast<uint32_t>(height)))
     {
         m_encoder->request_IDR();
         return true;
     }
     VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", width, height);
-    return rebuild_encoder(width, height);
+    return rebuild_encoder_locked(width, height);
 }
 
 bool EncMgr::query_source_resolution(int &width, int &height) const
@@ -459,7 +475,7 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
         return State::WaitingSource;
     }
 
-    m_encoder->request_IDR();
+    request_IDR();
     return State::Streaming;
 }
 

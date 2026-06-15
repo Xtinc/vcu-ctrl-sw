@@ -96,7 +96,7 @@ int main(int argc, char *argv[])
     {
         EncMgr mgr(mgr_cfg);
 
-        if (!mgr.start())
+        if (!mgr.start(mgr_cfg.udp_dest_addr, mgr_cfg.udp_dest_port))
         {
             VIDEO_ERROR_PRINT("EncMgr start failed");
             return EXIT_FAILURE;

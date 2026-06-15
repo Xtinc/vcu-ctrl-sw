@@ -134,16 +134,18 @@ class EncMgr
     EncMgr &operator=(EncMgr &&) = delete;
 
     /**
-     * @brief Start the encode pipeline (non-blocking).
-     * @return true on success, false if already running or encoder creation fails.
+     * @brief Start the encode pipeline with a specific UDP destination.
+     * @param udp_dest_addr Destination address for this run.
+     * @param udp_dest_port Destination UDP port for this run. Must be > 0.
+     * @return true on success, false if already running, invalid destination, or encoder creation fails.
      */
-    bool start();
+    bool start(const std::string &udp_dest_addr, uint16_t udp_dest_port);
 
     /**
      * @brief Stop the encode pipeline (blocking).
      *
      * Signals the loop thread, waits for it to exit (V4L2 dequeue timeout ≤ 1 s,
-     * encoder EOS flush ≤ 5 s), then destroys the encoder.
+     * encoder EOS flush ≤ 5 s), then destroys the encoder and UDP sender.
      * Safe to call from any thread or after a previous stop().
      */
     void stop();
@@ -221,6 +223,7 @@ class EncMgr
     bool open_source(int width, int height);
     void close_source();
     bool rebuild_encoder(int width, int height);
+    bool rebuild_encoder_locked(int width, int height);
     bool ensure_encoder_at(int width, int height);
     bool handle_source_change(int &width, int &height);
     bool query_source_resolution(int &width, int &height) const;
