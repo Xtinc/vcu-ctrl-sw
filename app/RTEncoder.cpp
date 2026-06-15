@@ -97,6 +97,23 @@ static uint32_t write_filler_data_section(DMAProxy &mem_ctl, AL_TBuffer *source,
     return section.uLength;
 }
 
+static bool set_pixmap_buffer_dimension(AL_TBuffer *pBuf, AL_TDimension dim, const char *context)
+{
+    if (!pBuf || dim.iWidth <= 0 || dim.iHeight <= 0)
+    {
+        VIDEO_ERROR_PRINT("%s: invalid source buffer or dimension %dx%d", context, dim.iWidth, dim.iHeight);
+        return false;
+    }
+
+    if (!AL_PixMapBuffer_SetDimension(pBuf, dim))
+    {
+        VIDEO_ERROR_PRINT("%s: failed to set source buffer dimension to %dx%d", context, dim.iWidth, dim.iHeight);
+        return false;
+    }
+
+    return true;
+}
+
 static void get_section_flag(const AL_TStreamMetaData *meta, int firstSection, bool &eof, bool &idr)
 {
     eof = false;
@@ -894,6 +911,13 @@ DMAFdArray RTEncoderV4L2::acquire_dma_buffers(unsigned int count)
         if (dim.iWidth <= 0 || dim.iHeight <= 0)
         {
             VIDEO_ERROR_PRINT("Invalid source resolution for DMA buffer description");
+            AL_Buffer_Unref(pBuf);
+            ok = false;
+            break;
+        }
+
+        if (!set_pixmap_buffer_dimension(pBuf, dim, "acquire_dma_buffers"))
+        {
             AL_Buffer_Unref(pBuf);
             ok = false;
             break;
