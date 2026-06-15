@@ -173,6 +173,19 @@ is_normal_netem() {
        "${spec}" == "clear" ]]
 }
 
+netem_has_option() {
+    local spec="$1"
+    local option="$2"
+    local words=()
+    read -r -a words <<<"${spec}"
+    for word in "${words[@]}"; do
+        if [[ "${word}" == "${option}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 add_stage() {
     local name="$1"
     local duration="$2"
@@ -284,8 +297,15 @@ apply_stage_tc() {
     fi
 
     read -r -a NETEM_WORDS <<<"${netem}"
-    if ! tc qdisc change dev "${DEV}" root netem "${NETEM_WORDS[@]}"; then
-        tc qdisc replace dev "${DEV}" root netem "${NETEM_WORDS[@]}"
+    tc qdisc replace dev "${DEV}" root netem "${NETEM_WORDS[@]}"
+
+    if ! netem_has_option "${netem}" "slot"; then
+        local qdisc
+        qdisc="$(tc qdisc show dev "${DEV}" 2>/dev/null || true)"
+        if [[ " ${qdisc} " == *" slot "* ]]; then
+            clear_tc
+            tc qdisc replace dev "${DEV}" root netem "${NETEM_WORDS[@]}"
+        fi
     fi
 }
 

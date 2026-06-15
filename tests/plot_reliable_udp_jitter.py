@@ -46,8 +46,11 @@ QUEUE_STATS_COLUMNS = {
     "q_avg_fi_ms",
     "q_fb_fi_ms",
     "q_out_fi_ms",
+    "q_jitter_ms",
+    "q_tail_jitter_ms",
     "q_buffered_frames",
     "q_adaptive_depth",
+    "q_depth_raw",
     "q_depth_error_frames",
     "q_skip_delta",
     "q_drop_delta",
@@ -161,11 +164,24 @@ def rolling_cv(values, window):
     return out
 
 
+def set_robust_upper_ylim(ax, values, p=0.99, margin=1.2):
+    ordered = sorted(v for v in values if v >= 0.0)
+    if not ordered:
+        return
+    upper = max(1.0, percentile(ordered, p) * margin)
+    if max(ordered) > upper:
+        ax.set_ylim(bottom=0.0, top=upper)
+    else:
+        ax.set_ylim(bottom=0.0)
+
+
 def parse_netem_args(args):
     def number(token):
         try:
             if token.endswith("ms"):
                 return float(token[:-2])
+            if token.endswith("us"):
+                return float(token[:-2]) / 1000.0
             if token.endswith("s"):
                 return float(token[:-1]) * 1000.0
             if token.endswith("%"):
@@ -174,18 +190,34 @@ def parse_netem_args(args):
         except (AttributeError, ValueError):
             return 0.0
 
-    spec = {"delay_ms": 0.0, "jitter_ms": 0.0, "reorder_pct": 0.0, "loss_pct": 0.0}
+    spec = {
+        "delay_ms": 0.0,
+        "jitter_ms": 0.0,
+        "slot_min_ms": 0.0,
+        "slot_max_ms": 0.0,
+        "theoretical_min_latency_ms": 0.0,
+        "theoretical_high_latency_ms": 0.0,
+        "reorder_pct": 0.0,
+        "loss_pct": 0.0,
+    }
     tokens = args.split()
     for idx, token in enumerate(tokens):
         if token == "delay" and idx + 1 < len(tokens):
             spec["delay_ms"] = number(tokens[idx + 1])
             if idx + 2 < len(tokens):
                 spec["jitter_ms"] = number(tokens[idx + 2])
+        elif token == "slot" and idx + 1 < len(tokens):
+            spec["slot_min_ms"] = number(tokens[idx + 1])
+            spec["slot_max_ms"] = spec["slot_min_ms"]
+            if idx + 2 < len(tokens) and tokens[idx + 2] not in ("packets", "bytes"):
+                spec["slot_max_ms"] = number(tokens[idx + 2])
         elif token == "reorder" and idx + 1 < len(tokens):
             spec["reorder_pct"] = number(tokens[idx + 1])
         elif token == "loss" and idx + 1 < len(tokens):
             spec["loss_pct"] = number(tokens[idx + 1])
-    spec["ideal_latency_ms"] = spec["delay_ms"] + 2.0 * spec["jitter_ms"]
+    spec["theoretical_min_latency_ms"] = max(0.0, spec["delay_ms"] - spec["jitter_ms"]) + spec["slot_min_ms"]
+    spec["theoretical_high_latency_ms"] = spec["delay_ms"] + 2.0 * spec["jitter_ms"] + spec["slot_max_ms"]
+    spec["ideal_latency_ms"] = spec["theoretical_high_latency_ms"]
     return spec
 
 
@@ -300,17 +332,19 @@ def write_assessment(out_dir, metrics):
         f.write("\n")
 
         if metrics["stage_effects"]:
-            f.write("5. Network parameter contribution\n")
+            f.write("5. Controller target drivers\n")
             f.write("- see network_effects.png\n")
             f.write(
-                "stage,start_s,end_s,delay_ms,jitter_ms,reorder_pct,loss_pct,ideal_latency_ms,"
-                "output_cv_mean,latency_p95_ms,reorder_events,bad_events\n"
+                "stage,start_s,end_s,target_p50_frames,target_p95_frames,raw_p50_frames,"
+                "reorder_p95_frames,jitter_driver_p95_frames,pressure_p95_frames,"
+                "latency_p50_ms,latency_p95_ms,reorder_events,bad_events\n"
             )
             for row in metrics["stage_effects"]:
                 f.write(
-                    "{stage},{start_s:.0f},{end_s:.0f},{delay_ms:.2f},{jitter_ms:.2f},"
-                    "{reorder_pct:.2f},{loss_pct:.2f},{ideal_latency_ms:.2f},"
-                    "{output_cv_mean:.4f},{latency_p95_ms:.2f},{reorder_events:.0f},{bad_events:.0f}\n".format(**row)
+                    "{stage},{start_s:.0f},{end_s:.0f},{target_p50_frames:.2f},{target_p95_frames:.2f},"
+                    "{raw_p50_frames:.2f},{reorder_p95_frames:.2f},{jitter_driver_p95_frames:.2f},"
+                    "{pressure_p95_frames:.2f},"
+                    "{latency_p50_ms:.2f},{latency_p95_ms:.2f},{reorder_events:.0f},{bad_events:.0f}\n".format(**row)
                 )
     print("wrote {}".format(path))
 
@@ -344,8 +378,13 @@ def main():
     q_avg_fi = [as_float(r, "q_avg_fi_ms") for r in queue_stats]
     q_fb_fi = [as_float(r, "q_fb_fi_ms") for r in queue_stats]
     q_out_fi = [as_float(r, "q_out_fi_ms") for r in queue_stats]
+    q_jitter = [as_float(r, "q_jitter_ms") for r in queue_stats]
+    q_tail_jitter = [as_float(r, "q_tail_jitter_ms") for r in queue_stats]
+    q_input_jitter_hi = [avg + jitter for avg, jitter in zip(q_avg_fi, q_jitter)]
+    q_input_tail_hi = [avg + tail for avg, tail in zip(q_avg_fi, q_tail_jitter)]
     q_buffered = [as_float(r, "q_buffered_frames") for r in queue_stats]
     q_target = [as_float(r, "q_adaptive_depth") for r in queue_stats]
+    q_depth_raw = [as_float(r, "q_depth_raw") for r in queue_stats]
     q_depth_error = [as_float(r, "q_depth_error_frames") for r in queue_stats]
     q_skip = [as_float(r, "q_skip_delta") for r in queue_stats]
     q_drop = [as_float(r, "q_drop_delta") for r in queue_stats]
@@ -354,6 +393,10 @@ def main():
     q_stale = [as_float(r, "q_stale_delta") for r in queue_stats]
     q_ovf = [as_float(r, "q_ovf_delta") for r in queue_stats]
     q_bad = [skip + late + ovf for skip, late, ovf in zip(q_skip, q_late, q_ovf)]
+    q_reorder_driver = [as_float(r, "q_disorder_frames") for r in queue_stats]
+    q_jitter_driver = [1.5 * as_float(r, "q_tail_jitter_frames") for r in queue_stats]
+    q_pressure_driver = [1.0 if as_float(r, "q_pressure_frames") > 0.0 else 0.0 for r in queue_stats]
+    q_margin_driver = [0.5 for _ in queue_stats]
 
     window = max(5, min(100, len(output_intervals) // 20 if len(output_intervals) >= 20 else 5))
     interval_mean = rolling_mean(output_intervals, window)
@@ -361,11 +404,38 @@ def main():
     interval_cv = rolling_cv(output_intervals, window)
     latency_mean = rolling_mean(latencies, window)
     latency_p95 = rolling_percentile(latencies, window, 0.95)
-    delay_t, delay_ms = stage_step_series(stages, "delay_ms")
-    jitter_t, jitter_ms = stage_step_series(stages, "jitter_ms")
     reorder_t, reorder_pct = stage_step_series(stages, "reorder_pct")
     loss_t, loss_pct = stage_step_series(stages, "loss_pct")
     ideal_t, ideal_latency = stage_step_series(stages, "ideal_latency_ms")
+    stage_effects = []
+    for stage in stages:
+        start_s = stage["start_s"]
+        end_s = stage["end_s"]
+        latency_values = sorted(v for t, v in zip(t_arr, latencies) if start_s <= t < end_s)
+        target_values = sorted(v for t, v in zip(t_stats, q_target) if start_s <= t < end_s)
+        raw_values = sorted(v for t, v in zip(t_stats, q_depth_raw) if start_s <= t < end_s)
+        reorder_driver_values = sorted(v for t, v in zip(t_stats, q_reorder_driver) if start_s <= t < end_s)
+        jitter_driver_values = sorted(v for t, v in zip(t_stats, q_jitter_driver) if start_s <= t < end_s)
+        pressure_driver_values = sorted(v for t, v in zip(t_stats, q_pressure_driver) if start_s <= t < end_s)
+        bad_events = sum(v for t, v in zip(t_stats, q_bad) if start_s <= t < end_s)
+        reorder_events = sum(v for t, v in zip(t_stats, q_reorder) if start_s <= t < end_s)
+        stage_effects.append(
+            {
+                "stage": stage["stage"],
+                "start_s": start_s,
+                "end_s": end_s,
+                "target_p50_frames": percentile(target_values, 0.50),
+                "target_p95_frames": percentile(target_values, 0.95),
+                "raw_p50_frames": percentile(raw_values, 0.50),
+                "reorder_p95_frames": percentile(reorder_driver_values, 0.95),
+                "jitter_driver_p95_frames": percentile(jitter_driver_values, 0.95),
+                "pressure_p95_frames": percentile(pressure_driver_values, 0.95),
+                "latency_p50_ms": percentile(latency_values, 0.50),
+                "latency_p95_ms": percentile(latency_values, 0.95),
+                "reorder_events": reorder_events,
+                "bad_events": bad_events,
+            }
+        )
 
     remove_old_outputs(out_dir)
 
@@ -375,13 +445,20 @@ def main():
     axes[0].plot(t_out, interval_p95, linewidth=1.2, label="rolling p95")
     axes[0].set_ylabel("ms")
     axes[0].set_title("User-Visible Output Interval Smoothness")
+    set_robust_upper_ylim(axes[0], output_intervals)
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="upper right")
 
     axes[1].plot(t_arr, latency_mean, linewidth=1.1, label="latency rolling mean")
     axes[1].plot(t_arr, latency_p95, linewidth=1.1, label="latency rolling p95")
     if ideal_t:
-        axes[1].plot(ideal_t, ideal_latency, linewidth=1.1, linestyle="--", label="ideal latency = delay + 2*jitter")
+        axes[1].plot(
+            ideal_t,
+            ideal_latency,
+            linewidth=1.1,
+            linestyle="--",
+            label="configured high latency envelope",
+        )
     axes[1].set_xlabel("time (s)")
     axes[1].set_ylabel("ms")
     axes[1].set_title("User-Visible Latency")
@@ -398,10 +475,13 @@ def main():
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="upper right")
 
-    axes[1].plot(t_stats, q_fb_fi, linewidth=1.0, label="feedback interval contribution")
-    axes[1].axhline(0.0, color="black", linewidth=1.0, alpha=0.35)
+    axes[1].plot(t_stats, q_avg_fi, linewidth=1.0, label="mean arrival interval")
+    axes[1].fill_between(t_stats, q_avg_fi, q_input_tail_hi, alpha=0.16, label="tail arrival interval envelope")
+    axes[1].plot(t_stats, q_input_jitter_hi, linewidth=0.9, label="mean + input jitter")
+    axes[1].plot(t_stats, q_input_tail_hi, linewidth=0.9, label="mean + tail jitter")
+    axes[1].plot(t_stats, q_out_fi, linewidth=0.9, alpha=0.75, label="final output interval")
     axes[1].set_ylabel("ms")
-    axes[1].set_title("Feedback Impact on Output Interval")
+    axes[1].set_title("Estimated Input Arrival Interval Envelope")
     axes[1].grid(True, alpha=0.25)
     axes[1].legend(loc="upper right")
 
@@ -419,34 +499,32 @@ def main():
     save_figure(fig, out_dir, "controller_terms.png")
 
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
-    if delay_t:
-        axes[0].plot(delay_t, delay_ms, linewidth=1.0, linestyle=":", label="configured delay")
-        axes[0].plot(jitter_t, jitter_ms, linewidth=1.0, linestyle=":", label="configured jitter")
-    if ideal_t:
-        axes[0].plot(ideal_t, ideal_latency, linewidth=1.1, linestyle="--", label="ideal latency = delay + 2*jitter")
-    axes[0].plot(t_arr, latency_mean, linewidth=1.0, label="actual latency rolling mean")
-    axes[0].plot(t_arr, latency_p95, linewidth=1.1, label="actual latency rolling p95")
-    axes[0].set_ylabel("ms")
-    axes[0].set_title("Latency Cost Under Network Parameters")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(loc="upper right")
-
-    axes[1].plot(t_stats, q_reorder, linewidth=1.0, label="observed reorder/disorder events")
-    axes[1].plot(t_stats, q_stale, linewidth=0.9, label="stale drops")
-    axes[1].plot(t_stats, q_drop, linewidth=0.9, label="drops")
+    axes[0].plot(t_stats, q_reorder, linewidth=1.0, label="observed reorder/disorder events")
+    axes[0].plot(t_stats, q_stale, linewidth=0.9, label="stale drops")
+    axes[0].plot(t_stats, q_drop, linewidth=0.9, label="drops")
     if reorder_t and max(reorder_pct + loss_pct) > 0.0:
-        ax_param = axes[1].twinx()
+        ax_param = axes[0].twinx()
         ax_param.plot(reorder_t, reorder_pct, linewidth=0.9, linestyle="--", color="tab:purple", label="configured reorder")
         ax_param.plot(loss_t, loss_pct, linewidth=0.9, linestyle="--", color="tab:brown", label="configured loss")
         ax_param.set_ylabel("%")
-        lines, labels = axes[1].get_legend_handles_labels()
+        lines, labels = axes[0].get_legend_handles_labels()
         param_lines, param_labels = ax_param.get_legend_handles_labels()
-        axes[1].legend(lines + param_lines, labels + param_labels, loc="upper right")
+        axes[0].legend(lines + param_lines, labels + param_labels, loc="upper right")
     else:
-        axes[1].legend(loc="upper right")
+        axes[0].legend(loc="upper right")
+    axes[0].set_ylabel("count / stats period")
+    axes[0].set_title("Observed Network Disorder")
+    axes[0].grid(True, alpha=0.25)
+
+    axes[1].plot(t_stats, q_reorder_driver, linewidth=1.0, label="reorder driver")
+    axes[1].plot(t_stats, q_jitter_driver, linewidth=1.0, label="tail jitter driver = 1.5 * tail jitter frames")
+    axes[1].plot(t_stats, q_pressure_driver, linewidth=0.9, label="pressure driver")
+    axes[1].plot(t_stats, q_margin_driver, linewidth=0.8, linestyle=":", label="margin")
+    axes[1].plot(t_stats, q_depth_raw, linewidth=1.0, linestyle="--", label="raw target sum")
+    axes[1].legend(loc="upper right")
     axes[1].set_xlabel("time (s)")
-    axes[1].set_ylabel("count / stats period")
-    axes[1].set_title("Observed Network Disorder")
+    axes[1].set_ylabel("frames")
+    axes[1].set_title("Controller Target Drivers")
     axes[1].grid(True, alpha=0.25)
     annotate_stages(axes, stages)
     save_figure(fig, out_dir, "network_effects.png")
@@ -469,31 +547,6 @@ def main():
     score -= min(15.0, max(0.0, interval_stats["p99"] - interval_stats["p50"]) * 0.5)
     score = clamp(score, 0.0, 100.0)
     summary = "stable output intervals" if visible_failures == 0 and cv_stats["p95"] < 0.5 else "output smoothness needs attention"
-    stage_effects = []
-    for stage in stages:
-        start_s = stage["start_s"]
-        end_s = stage["end_s"]
-        cv_values = [v for t, v in zip(t_out, interval_cv) if start_s <= t < end_s]
-        latency_values = sorted(v for t, v in zip(t_arr, latencies) if start_s <= t < end_s)
-        bad_events = sum(v for t, v in zip(t_stats, q_bad) if start_s <= t < end_s)
-        reorder_events = sum(v for t, v in zip(t_stats, q_reorder) if start_s <= t < end_s)
-        stage_effects.append(
-            {
-                "stage": stage["stage"],
-                "start_s": start_s,
-                "end_s": end_s,
-                "delay_ms": stage["delay_ms"],
-                "jitter_ms": stage["jitter_ms"],
-                "reorder_pct": stage["reorder_pct"],
-                "loss_pct": stage["loss_pct"],
-                "ideal_latency_ms": stage["ideal_latency_ms"],
-                "output_cv_mean": sum(cv_values) / float(len(cv_values)) if cv_values else 0.0,
-                "latency_p95_ms": percentile(latency_values, 0.95),
-                "reorder_events": reorder_events,
-                "bad_events": bad_events,
-            }
-        )
-
     write_assessment(
         out_dir,
         {
