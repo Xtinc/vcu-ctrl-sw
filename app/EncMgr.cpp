@@ -295,10 +295,10 @@ bool EncMgr::open_source(int width, int height)
 {
     constexpr size_t num_bufs = 4;
 
-    std::shared_ptr<V4L2Source> src;
+    std::unique_ptr<V4L2Source> src;
     try
     {
-        src = std::make_shared<V4L2Source>(m_cfg.v4l2_dev, m_cfg.v4l2_subdev, width, height, m_encoder->src_fourCC(),
+        src = std::make_unique<V4L2Source>(m_cfg.v4l2_dev, m_cfg.v4l2_subdev, width, height, m_encoder->src_fourCC(),
                                            num_bufs,
                                            /*multiple_planes=*/true, m_cfg.sync_dev);
     }
@@ -327,16 +327,13 @@ bool EncMgr::open_source(int width, int height)
         return false;
     }
 
+    V4L2Source *source_ptr = src.get();
     m_source = std::move(src);
 
-    std::weak_ptr<V4L2Source> weak_src = m_source;
-    m_encoder->set_release_callback([weak_src](AL_TBuffer const *buf) {
-        if (auto src = weak_src.lock())
+    m_encoder->set_release_callback([source_ptr](AL_TBuffer const *buf) {
+        if (!source_ptr->queue(buf))
         {
-            if (!src->queue(buf))
-            {
-                VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
-            }
+            VIDEO_ERROR_PRINT("EncMgr: requeue to V4L2 failed");
         }
     });
 

@@ -232,7 +232,7 @@ class EncMgr
     EncMgrConfig m_cfg;
 
     std::unique_ptr<RTEncoderV4L2> m_encoder;
-    std::shared_ptr<V4L2Source> m_source;
+    std::unique_ptr<V4L2Source> m_source;
     std::shared_ptr<ReliableUDP> m_sender;
 
     std::thread m_loop_thread;

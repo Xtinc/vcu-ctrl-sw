@@ -175,6 +175,7 @@ class V4L2Source
     static bool can_dequeue(State state);
 
     void enter_error_state();
+    void mark_error_state();
     bool qbuf_idx(unsigned int idx);
     void stop_requeue_worker();
     void requeue_worker_loop();

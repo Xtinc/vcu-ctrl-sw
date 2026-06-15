@@ -781,16 +781,21 @@ void V4L2Source::requeue_worker_loop()
 
         if (!qbuf_idx(idx))
         {
-            enter_error_state();
+            mark_error_state();
             break;
         }
     }
 }
 
-void V4L2Source::enter_error_state()
+void V4L2Source::mark_error_state()
 {
     m_state.store(State::ERROR);
     m_buffers_queued.store(false);
     m_requeue_cv.notify_all();
+}
+
+void V4L2Source::enter_error_state()
+{
+    mark_error_state();
     (void)stop();
 }
