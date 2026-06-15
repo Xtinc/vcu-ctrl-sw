@@ -361,7 +361,11 @@ bool EncMgr::rebuild_encoder_locked(int width, int height)
     EncMgrConfig tmp = m_cfg;
     tmp.width = static_cast<uint16_t>(width);
     tmp.height = static_cast<uint16_t>(height);
-    m_encoder.reset(); // release hardware resource before constructing new instance
+    if (m_encoder)
+    {
+        VIDEO_INFO_PRINT("EncMgr: replacing existing encoder before rebuild");
+        m_encoder.reset();
+    }
     try
     {
         m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(tmp), make_enc_output_callback(m_sender));
