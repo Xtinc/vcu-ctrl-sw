@@ -94,10 +94,6 @@ EncMgr::EncMgr(EncMgrConfig cfg) : m_cfg(std::move(cfg))
         throw std::invalid_argument("EncMgr: v4l2_dev must not be empty");
     if (m_cfg.v4l2_subdev.empty())
         throw std::invalid_argument("EncMgr: v4l2_subdev must not be empty (USB cameras not supported)");
-    if (m_cfg.udp_dest_addr.empty())
-        throw std::invalid_argument("EncMgr: udp_dest_addr must not be empty");
-    if (m_cfg.udp_dest_port == 0)
-        throw std::invalid_argument("EncMgr: udp_dest_port must be > 0");
 }
 
 EncMgr::~EncMgr()
@@ -135,8 +131,6 @@ bool EncMgr::start(const std::string &udp_dest_addr, uint16_t udp_dest_port)
         }
 
         m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(m_cfg), make_enc_output_callback(sender));
-        m_cfg.udp_dest_addr = udp_dest_addr;
-        m_cfg.udp_dest_port = udp_dest_port;
         m_sender = std::move(sender);
         m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
         return true;

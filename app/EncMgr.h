@@ -37,8 +37,6 @@ struct EncMgrConfig
     bool low_delay_mode = false;            ///< True = low-latency all-P GOP
     std::string enc_dev = "/dev/allegroIP"; ///< Encoder device node
     std::string dma_dev = "/dev/dmaproxy";  ///< DMAProxy device node
-    std::string udp_dest_addr;              ///< UDP destination address (required)
-    uint16_t udp_dest_port = 0;             ///< UDP destination port (required, must be > 0)
     uint16_t udp_local_port = 0;            ///< UDP local bind port (0 = OS-assigned)
 };
 
@@ -62,8 +60,8 @@ struct EncMgrConfig
  *     encoder fault            -> EncoderFault
  *     V4L2_EVENT_SOURCE_CHANGE -> SourceChanged
  *   SourceChanged:
- *     set_resolution() ok      -> Opening  (no delay)
- *     set_resolution() fail    -> rebuild_encoder() -> Opening  (no delay)
+ *     internal resolution update ok   -> Opening  (no delay)
+ *     internal resolution update fail -> rebuild_encoder() -> Opening  (no delay)
  *     rebuild_encoder() fail   -> Stopping
  *     pause()                  -> Paused (skip stale source-change handling)
  *     stop()                   -> Stopping
@@ -101,8 +99,7 @@ struct EncMgrConfig
  *     pipeline is running; they acquire m_enc_mutex, which also synchronises with
  *     the loop thread's final encoder reset.
  *
- * Encoded output is currently wired to a local placeholder callback. A future
- * network sender will be connected here once that class exists.
+ * Encoded output is sent through a per-start ReliableUDP sender.
  */
 class EncMgr
 {

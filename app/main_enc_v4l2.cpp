@@ -61,16 +61,17 @@ int main(int argc, char *argv[])
     mgr_cfg.height         = 2160;
     mgr_cfg.v4l2_dev       = argv[1];
     mgr_cfg.v4l2_subdev    = argv[2];
-    mgr_cfg.udp_dest_addr  = argv[3];
+    const std::string udp_dest_addr = argv[3];
+    unsigned short udp_dest_port = 0;
 
     try
     {
-        const int udp_dest_port = std::stoi(argv[4]);
-        if (udp_dest_port <= 0 || udp_dest_port > 65535)
+        const int parsed_dest_port = std::stoi(argv[4]);
+        if (parsed_dest_port <= 0 || parsed_dest_port > 65535)
         {
             throw std::out_of_range("udp_dest_port out of range");
         }
-        mgr_cfg.udp_dest_port = static_cast<unsigned short>(udp_dest_port);
+        udp_dest_port = static_cast<unsigned short>(parsed_dest_port);
 
         if (argc == 6)
         {
@@ -96,7 +97,7 @@ int main(int argc, char *argv[])
     {
         EncMgr mgr(mgr_cfg);
 
-        if (!mgr.start(mgr_cfg.udp_dest_addr, mgr_cfg.udp_dest_port))
+        if (!mgr.start(udp_dest_addr, udp_dest_port))
         {
             VIDEO_ERROR_PRINT("EncMgr start failed");
             return EXIT_FAILURE;
