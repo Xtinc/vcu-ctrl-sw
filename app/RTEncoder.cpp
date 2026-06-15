@@ -620,6 +620,8 @@ void RTEncoderBase::init_settings(AL_TEncSettings &settings) const
         ch.uSliceSize = 0;
         ch.bSubframeLatency = true;
         rc.eRCMode = AL_RC_LOW_LATENCY;
+        rc.uCPBSize = 1000;
+        rc.uInitialRemDelay = 1000;
     }
     else
     {
