@@ -80,8 +80,6 @@ const char *EncMgr::state_to_cstr(State s)
         return "EncoderFault";
     case State::WaitingSource:
         return "WaitingSource";
-    case State::Paused:
-        return "Paused";
     case State::Stopping:
         return "Stopping";
     }
@@ -108,7 +106,6 @@ bool EncMgr::start(const std::string &udp_dest_addr, uint16_t udp_dest_port)
         VIDEO_ERROR_PRINT("EncMgr::start() called while already running");
         return false;
     }
-    m_paused.store(false);
     m_streaming.store(false);
 
     if (udp_dest_addr.empty() || udp_dest_port == 0)
@@ -130,7 +127,6 @@ bool EncMgr::start(const std::string &udp_dest_addr, uint16_t udp_dest_port)
             throw std::runtime_error("EncMgr: add_destination failed");
         }
 
-        m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(m_cfg), make_enc_output_callback(sender));
         m_sender = std::move(sender);
         m_loop_thread = std::thread(&EncMgr::loop_thread_func, this);
         return true;
@@ -146,8 +142,11 @@ bool EncMgr::start(const std::string &udp_dest_addr, uint16_t udp_dest_port)
             sender->stop();
         }
 
+        if (m_sender)
+        {
+            m_sender->stop();
+        }
         m_sender.reset();
-        m_encoder.reset();
         return false;
     }
 }
@@ -168,31 +167,6 @@ void EncMgr::stop()
         m_sender->stop();
         m_sender.reset();
     }
-}
-
-bool EncMgr::pause()
-{
-    if (!m_running.load())
-        return false;
-
-    m_paused.store(true);
-    m_wait_cv.notify_all();
-    return true;
-}
-
-bool EncMgr::resume()
-{
-    if (!m_running.load())
-        return false;
-
-    m_paused.store(false);
-    m_wait_cv.notify_all();
-    return true;
-}
-
-bool EncMgr::is_paused() const
-{
-    return m_running.load() && m_paused.load();
 }
 
 bool EncMgr::set_bitrate(uint32_t target, uint32_t max)
@@ -299,6 +273,12 @@ bool EncMgr::open_source(int width, int height)
 {
     constexpr size_t num_bufs = 4;
 
+    if (!m_encoder)
+    {
+        VIDEO_ERROR_PRINT("EncMgr: cannot open source without encoder");
+        return false;
+    }
+
     std::unique_ptr<V4L2Source> src;
     try
     {
@@ -349,16 +329,31 @@ void EncMgr::close_source()
     if (!m_source)
         return;
 
-    m_encoder->set_release_callback(nullptr);
-
     m_source->stop();
     m_source.reset();
 }
 
-bool EncMgr::rebuild_encoder(int width, int height)
+void EncMgr::teardown_media_session()
 {
     std::lock_guard<std::mutex> lock(m_enc_mutex);
-    return rebuild_encoder_locked(width, height);
+
+    if (m_encoder)
+    {
+        VIDEO_INFO_PRINT("EncMgr: flushing encoder before media session teardown");
+        m_encoder->set_release_callback(nullptr);
+        if (!m_encoder->flush())
+        {
+            VIDEO_ERROR_PRINT("EncMgr: encoder flush timed out during media session teardown");
+        }
+    }
+
+    close_source();
+
+    if (m_encoder)
+    {
+        VIDEO_INFO_PRINT("EncMgr: destroying encoder media session");
+        m_encoder.reset();
+    }
 }
 
 bool EncMgr::rebuild_encoder_locked(int width, int height)
@@ -370,6 +365,8 @@ bool EncMgr::rebuild_encoder_locked(int width, int height)
     try
     {
         m_encoder = std::make_unique<RTEncoderV4L2>(to_encoder_config(tmp), make_enc_output_callback(m_sender));
+        m_cfg.width = tmp.width;
+        m_cfg.height = tmp.height;
         return true;
     }
     catch (const std::exception &e)
@@ -377,18 +374,6 @@ bool EncMgr::rebuild_encoder_locked(int width, int height)
         VIDEO_ERROR_PRINT("EncMgr: encoder rebuild failed: %s", e.what());
         return false;
     }
-}
-
-bool EncMgr::ensure_encoder_at(int width, int height)
-{
-    std::lock_guard<std::mutex> lock(m_enc_mutex);
-    if (m_encoder->set_resolution(static_cast<uint32_t>(width), static_cast<uint32_t>(height)))
-    {
-        m_encoder->request_IDR();
-        return true;
-    }
-    VIDEO_ERROR_PRINT("EncMgr: set_resolution(%dx%d) failed, rebuilding encoder", width, height);
-    return rebuild_encoder_locked(width, height);
 }
 
 bool EncMgr::query_source_resolution(int &width, int &height) const
@@ -409,38 +394,11 @@ bool EncMgr::query_source_resolution(int &width, int &height) const
     return false;
 }
 
-bool EncMgr::handle_source_change(int &width, int &height)
-{
-    auto new_w = width;
-    auto new_h = height;
-    if (!query_source_resolution(new_w, new_h))
-    {
-        VIDEO_ERROR_PRINT("EncMgr: query_source_resolution failed after source change");
-        return true; // non-fatal — next open_source will retry
-    }
-
-    if (new_w == width && new_h == height)
-        return true; // spurious event, no actual change
-
-    VIDEO_INFO_PRINT("EncMgr: resolution change %dx%d -> %dx%d", width, height, new_w, new_h);
-
-    if (!ensure_encoder_at(new_w, new_h))
-        return false;
-
-    width = new_w;
-    height = new_h;
-    return true;
-}
-
 EncMgr::State EncMgr::on_opening(int &width, int &height)
 {
     if (!m_running.load())
     {
         return State::Stopping;
-    }
-    if (m_paused.load())
-    {
-        return State::Paused;
     }
 
     auto detected_w = width;
@@ -454,18 +412,26 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
     if (detected_w != width || detected_h != height)
     {
         VIDEO_INFO_PRINT("EncMgr: resolution changed %dx%d -> %dx%d", width, height, detected_w, detected_h);
-        if (!ensure_encoder_at(detected_w, detected_h))
-        {
-            VIDEO_ERROR_PRINT("EncMgr: ensure_encoder_at(%dx%d) failed, stopping", detected_w, detected_h);
-            return State::Stopping;
-        }
         width = detected_w;
         height = detected_h;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_enc_mutex);
+        if (!m_encoder || m_cfg.width != static_cast<uint16_t>(width) || m_cfg.height != static_cast<uint16_t>(height))
+        {
+            VIDEO_INFO_PRINT("EncMgr: creating encoder media session at %dx%d", width, height);
+            if (!rebuild_encoder_locked(width, height))
+            {
+                return State::Stopping;
+            }
+        }
     }
 
     if (!open_source(width, height))
     {
         VIDEO_ERROR_PRINT("EncMgr: open_source failed, waiting for source");
+        teardown_media_session();
         return State::WaitingSource;
     }
 
@@ -476,9 +442,10 @@ EncMgr::State EncMgr::on_opening(int &width, int &height)
 EncMgr::State EncMgr::on_streaming()
 {
     bool source_changed = false;
+    bool source_error = false;
     m_streaming.store(true);
 
-    while (m_running.load() && !m_paused.load())
+    while (m_running.load())
     {
         const DQResult result = m_source->dqueue();
         switch (result.s)
@@ -497,21 +464,23 @@ EncMgr::State EncMgr::on_streaming()
             goto done;
         case DQStatus::Error:
             VIDEO_ERROR_PRINT("EncMgr: V4L2 device error");
+            source_error = true;
             goto done;
         }
     }
 done:
     m_streaming.store(false);
-    close_source();
 
     if (!m_running.load())
         return State::Stopping;
     if (!m_encoder->is_running())
         return State::EncoderFault;
-    if (m_paused.load())
-        return State::Paused;
     if (source_changed)
         return State::SourceChanged;
+    if (source_error)
+    {
+        teardown_media_session();
+    }
     return State::WaitingSource;
 }
 
@@ -519,11 +488,28 @@ EncMgr::State EncMgr::on_source_changed(int &width, int &height)
 {
     if (!m_running.load())
         return State::Stopping;
-    if (m_paused.load())
-        return State::Paused;
 
-    if (!handle_source_change(width, height))
-        return State::Stopping;
+    teardown_media_session();
+
+    auto new_w = width;
+    auto new_h = height;
+    if (!query_source_resolution(new_w, new_h))
+    {
+        VIDEO_ERROR_PRINT("EncMgr: query_source_resolution failed after source change, waiting for source");
+        return State::WaitingSource;
+    }
+
+    VIDEO_INFO_PRINT("EncMgr: media session restart %dx%d -> %dx%d", width, height, new_w, new_h);
+    width = new_w;
+    height = new_h;
+
+    {
+        std::lock_guard<std::mutex> lock(m_enc_mutex);
+        if (!rebuild_encoder_locked(width, height))
+        {
+            return State::Stopping;
+        }
+    }
 
     return State::Opening;
 }
@@ -534,12 +520,15 @@ EncMgr::State EncMgr::on_encoder_fault(int width, int height)
         return State::Stopping;
 
     VIDEO_ERROR_PRINT("EncMgr: encoder faulted, rebuilding at %dx%d", width, height);
-    if (!rebuild_encoder(width, height))
-        return State::Stopping;
+    teardown_media_session();
+
+    {
+        std::lock_guard<std::mutex> lock(m_enc_mutex);
+        if (!rebuild_encoder_locked(width, height))
+            return State::Stopping;
+    }
 
     VIDEO_INFO_PRINT("EncMgr: encoder rebuilt successfully");
-    if (m_paused.load())
-        return State::Paused;
     return State::Opening;
 }
 
@@ -547,20 +536,16 @@ EncMgr::State EncMgr::on_waiting_source()
 {
     if (!m_running.load())
         return State::Stopping;
-    if (m_paused.load())
-        return State::Paused;
 
     VIDEO_INFO_PRINT("EncMgr: waiting for source on %s", m_cfg.v4l2_subdev.c_str());
 
     std::unique_lock<std::mutex> lock(m_wait_mutex);
     m_wait_cv.wait_for(lock, std::chrono::milliseconds(m_cfg.source_check_interval_ms),
-                       [this] { return !m_running.load() || m_paused.load(); });
+                       [this] { return !m_running.load(); });
     lock.unlock();
 
     if (!m_running.load())
         return State::Stopping;
-    if (m_paused.load())
-        return State::Paused;
 
     int w = 0, h = 0;
     if (query_source_resolution(w, h))
@@ -570,23 +555,6 @@ EncMgr::State EncMgr::on_waiting_source()
     }
 
     return State::WaitingSource;
-}
-
-EncMgr::State EncMgr::on_paused()
-{
-    close_source();
-
-    VIDEO_INFO_PRINT("EncMgr: paused");
-
-    std::unique_lock<std::mutex> lock(m_wait_mutex);
-    m_wait_cv.wait(lock, [this] { return !m_running.load() || !m_paused.load(); });
-    lock.unlock();
-
-    if (!m_running.load())
-        return State::Stopping;
-
-    VIDEO_INFO_PRINT("EncMgr: resuming, returning to Opening");
-    return State::Opening;
 }
 
 void EncMgr::loop_thread_func()
@@ -617,9 +585,6 @@ void EncMgr::loop_thread_func()
         case State::WaitingSource:
             next = on_waiting_source();
             break;
-        case State::Paused:
-            next = on_paused();
-            break;
         case State::Stopping:
             next = State::Stopping;
             break;
@@ -635,14 +600,6 @@ void EncMgr::loop_thread_func()
 
     m_running.store(false);
 
-    if (m_encoder && !m_encoder->flush())
-    {
-        VIDEO_ERROR_PRINT("EncMgr: encoder flush timed out; output may be incomplete");
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(m_enc_mutex);
-        m_encoder.reset();
-    }
+    teardown_media_session();
     VIDEO_INFO_PRINT("EncMgr: loop thread exited");
 }

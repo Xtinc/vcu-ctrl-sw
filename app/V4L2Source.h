@@ -195,7 +195,6 @@ class V4L2Source
     std::thread m_requeue_thread;
 
     int m_consecutive_timeout_count;
-    std::atomic<bool> m_buffers_queued;
 
     std::vector<v4l2_buffer_info> m_buffers;
     std::unique_ptr<XilinxSyncIP> m_sync_ip;

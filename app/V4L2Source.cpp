@@ -182,7 +182,7 @@ V4L2Source::V4L2Source(const std::string &dev, const std::string &sub_dev, int r
                        TFourCC req_fourcc, size_t buf_cnt, bool multiple_planes, const std::string &sync_dev_path)
     : m_fd(-1), m_sub_fd(-1), m_buffer_cnt(buf_cnt),
       m_buf_type(multiple_planes ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE), m_plane_size(0),
-      m_state(State::INIT), m_consecutive_timeout_count(0), m_buffers_queued(false), m_sync_ip(nullptr)
+      m_state(State::INIT), m_consecutive_timeout_count(0), m_sync_ip(nullptr)
 {
     if (req_width <= 0 || req_height <= 0 || buf_cnt == 0)
     {
@@ -280,6 +280,12 @@ V4L2Source::V4L2Source(const std::string &dev, const std::string &sub_dev, int r
     }
     catch (...)
     {
+        if (m_sync_ip)
+        {
+            (void)m_sync_ip->stop();
+            m_sync_ip.reset();
+            (void)set_xilinx_low_latency_mode(m_fd, false);
+        }
         ::close(m_sub_fd);
         m_sub_fd = -1;
         ::close(m_fd);
@@ -387,7 +393,6 @@ bool V4L2Source::import_fds(DMAFdArray &&fds)
         }
     }
 
-    m_buffers_queued.store(true);
     m_state.store(State::IMPORTED);
     return true;
 }
@@ -459,6 +464,7 @@ bool V4L2Source::start()
     }
 
     stop_requeue_worker();
+    m_state.store(State::STREAMING);
     try
     {
         m_requeue_thread = std::thread(&V4L2Source::requeue_worker_loop, this);
@@ -468,9 +474,7 @@ bool V4L2Source::start()
         VIDEO_ERROR_PRINT("Failed to start requeue worker: %s", e.what());
         goto error_cleanup;
     }
-    
-    // Set STREAMING state only after all resources (including worker thread) are ready
-    m_state.store(State::STREAMING);
+
     m_consecutive_timeout_count = 0;
     return true;
 
@@ -483,6 +487,7 @@ error_cleanup:
 bool V4L2Source::stop()
 {
     const State state = m_state.load();
+    bool ok = true;
     if (!can_stop(state))
     {
         stop_requeue_worker();
@@ -505,8 +510,20 @@ bool V4L2Source::stop()
         {
             VIDEO_ERROR_PRINT("Failed to stop streaming: %s", std::strerror(errno));
             m_state.store(State::ERROR);
-            return false;
+            ok = false;
         }
+    }
+
+    if (m_sync_ip)
+    {
+        if (!m_sync_ip->stop())
+        {
+            VIDEO_ERROR_PRINT("Failed to stop Xilinx sync IP during V4L2 stop");
+            m_state.store(State::ERROR);
+            ok = false;
+        }
+        m_sync_ip.reset();
+        (void)set_xilinx_low_latency_mode(m_fd, false);
     }
 
     if (!release_v4l2_buffers(m_fd, m_buf_type))
@@ -515,7 +532,6 @@ bool V4L2Source::stop()
         return false;
     }
 
-    m_buffers_queued.store(false);
     m_buffers.clear();
 
     {
@@ -523,7 +539,7 @@ bool V4L2Source::stop()
         m_requeue_pending.clear();
     }
 
-    return true;
+    return ok;
 }
 
 bool V4L2Source::queue(AL_TBuffer const *buffer)
@@ -790,7 +806,6 @@ void V4L2Source::requeue_worker_loop()
 void V4L2Source::mark_error_state()
 {
     m_state.store(State::ERROR);
-    m_buffers_queued.store(false);
     m_requeue_cv.notify_all();
 }
 

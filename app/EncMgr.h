@@ -50,42 +50,31 @@ struct EncMgrConfig
  *     query_source ok          -> Streaming
  *     no source detected       -> WaitingSource
  *     open_source fail         -> WaitingSource (wait for user to fix)
- *     pause()                  -> Paused
  *     stop()                   -> Stopping
  *   Streaming:
  *     dqueue/submit loop active
  *     stop() / normal exit     -> Stopping
- *     pause()                  -> Paused (close V4L2Source, keep encoder alive)
  *     V4L2 device error        -> WaitingSource
  *     encoder fault            -> EncoderFault
  *     V4L2_EVENT_SOURCE_CHANGE -> SourceChanged
  *   SourceChanged:
- *     internal resolution update ok   -> Opening  (no delay)
- *     internal resolution update fail -> rebuild_encoder() -> Opening  (no delay)
- *     rebuild_encoder() fail   -> Stopping
- *     pause()                  -> Paused (skip stale source-change handling)
+ *     media session teardown ok -> Opening / WaitingSource
+ *     encoder rebuild fail      -> Stopping
  *     stop()                   -> Stopping
  *   EncoderFault:
- *     rebuild_encoder() ok     -> Opening  (no delay)
- *     rebuild_encoder() ok and pause requested -> Paused
- *     rebuild_encoder() fail   -> Stopping
+ *     encoder rebuild ok       -> Opening  (no delay)
+ *     encoder rebuild fail     -> Stopping
  *     stop()                   -> Stopping
  *   WaitingSource:
  *     Wait on condition variable with timeout, periodically check probe_subdev_format()
  *     source detected          -> Opening  (no delay)
- *     pause()                  -> Paused
- *     stop()                   -> Stopping
- *   Paused:
- *     Software pause state; V4L2Source is closed and source probing is suspended.
- *     Physical source loss/restore/change is ignored until resume().
- *     resume()                 -> Opening  (probe current source state)
  *     stop()                   -> Stopping
  *   Stopping:
- *     terminal state; flush encoder EOS, destroy encoder, exit loop thread
+ *     terminal state; teardown media session, exit loop thread
  *
- * The encoder is created once in start() and kept alive across state transitions;
- * only m_source is torn down and rebuilt each time. m_encoder is flushed (EOS) once
- * at final stop, not between sessions, so the encode session remains continuous.
+ * ReliableUDP is created once in start() and kept alive until stop(). The V4L2
+ * source, SyncIP, and encoder form a media session that is torn down and rebuilt
+ * across source/resolution changes.
  *
  * Requirements:
  *   - v4l2_subdev must be configured (HDMI/SDI/CSI capture cards with sub-device)
@@ -97,7 +86,7 @@ struct EncMgrConfig
  *   - stop() signals the thread and joins it (blocking until encoder EOS drains).
  *   - set_bitrate / set_framerate / request_IDR / fps are only accepted while the
  *     pipeline is running; they acquire m_enc_mutex, which also synchronises with
- *     the loop thread's final encoder reset.
+ *     media-session teardown/rebuild.
  *
  * Encoded output is sent through a per-start ReliableUDP sender.
  */
@@ -110,7 +99,6 @@ class EncMgr
         SourceChanged, ///< V4L2_EVENT_SOURCE_CHANGE received; resolve new resolution
         EncoderFault,  ///< Encoder stopped unexpectedly; rebuild before next open
         WaitingSource, ///< No source detected; wait on condition variable with periodic check
-        Paused,        ///< Software pause: source closed, encoder kept alive, no source probing
         Stopping,      ///< Terminal: exit loop thread
     };
 
@@ -134,7 +122,7 @@ class EncMgr
      * @brief Start the encode pipeline with a specific UDP destination.
      * @param udp_dest_addr Destination address for this run.
      * @param udp_dest_port Destination UDP port for this run. Must be > 0.
-     * @return true on success, false if already running, invalid destination, or encoder creation fails.
+     * @return true on success, false if already running, invalid destination, or sender/thread startup fails.
      */
     bool start(const std::string &udp_dest_addr, uint16_t udp_dest_port);
 
@@ -146,27 +134,6 @@ class EncMgr
      * Safe to call from any thread or after a previous stop().
      */
     void stop();
-
-    /**
-     * @brief Pause capture without stopping or flushing the encoder.
-     *
-     * Closes the V4L2 source and suspends source probing. The encoder and UDP sender
-     * stay alive. Safe to call repeatedly while running.
-     * @return true if the manager is running, false otherwise.
-     */
-    bool pause();
-
-    /**
-     * @brief Resume capture after pause.
-     *
-     * Wakes the loop thread and returns it to Opening, where the current source state
-     * is probed again. Safe to call repeatedly while running.
-     * @return true if the manager is running, false otherwise.
-     */
-    bool resume();
-
-    /** @brief Return whether software pause is currently requested. */
-    bool is_paused() const;
 
     /**
      * @brief Dynamically update the target (and optionally peak) bitrate.
@@ -214,15 +181,12 @@ class EncMgr
     State on_source_changed(int &width, int &height);
     State on_encoder_fault(int width, int height);
     State on_waiting_source();
-    State on_paused();
     static const char *state_to_cstr(State s);
 
     bool open_source(int width, int height);
     void close_source();
-    bool rebuild_encoder(int width, int height);
+    void teardown_media_session();
     bool rebuild_encoder_locked(int width, int height);
-    bool ensure_encoder_at(int width, int height);
-    bool handle_source_change(int &width, int &height);
     bool query_source_resolution(int &width, int &height) const;
     bool is_streaming() const;
 
@@ -237,7 +201,6 @@ class EncMgr
 
     std::thread m_loop_thread;
     std::atomic<bool> m_running{false};
-    std::atomic<bool> m_paused{false};
     std::atomic<bool> m_streaming{false};
     mutable std::mutex m_enc_mutex;
 

@@ -13,7 +13,8 @@ extern "C"
 static constexpr int HORIZONTAL_ALIGNMENT = 64;
 static constexpr int VERTICAL_ALIGNMENT = 32;
 
-XilinxSyncIP::XilinxSyncIP(const std::string &dev) noexcept : m_fd(-1), m_syncip{}, m_sync_chan{}, m_enc_sync_chan{}
+XilinxSyncIP::XilinxSyncIP(const std::string &dev) noexcept
+    : m_fd(-1), m_syncip{}, m_sync_chan{}, m_enc_sync_chan{}, m_initialized(false)
 {
     m_fd = ::open(dev.c_str(), O_RDWR);
     if (m_fd < 0)
@@ -24,9 +25,9 @@ XilinxSyncIP::XilinxSyncIP(const std::string &dev) noexcept : m_fd(-1), m_syncip
 
 XilinxSyncIP::~XilinxSyncIP() noexcept
 {
+    (void)stop();
     if (m_fd >= 0)
     {
-        xvfbsync_enc_sync_chan_depopulate(&m_enc_sync_chan);
         ::close(m_fd);
         m_fd = -1;
     }
@@ -52,14 +53,15 @@ bool XilinxSyncIP::init() noexcept
         return false;
     }
 
+    m_initialized = true;
     return true;
 }
 
 bool XilinxSyncIP::start() noexcept
 {
-    if (m_fd < 0)
+    if (m_fd < 0 || !m_initialized)
     {
-        VIDEO_ERROR_PRINT("Sync device not opened");
+        VIDEO_ERROR_PRINT("Sync device not initialized");
         return false;
     }
 
@@ -84,11 +86,28 @@ bool XilinxSyncIP::start() noexcept
     return true;
 }
 
+bool XilinxSyncIP::stop() noexcept
+{
+    if (!m_initialized)
+    {
+        return true;
+    }
+
+    if (xvfbsync_enc_sync_chan_depopulate(&m_enc_sync_chan) != 0)
+    {
+        VIDEO_ERROR_PRINT("Failed to depopulate sync channel");
+        return false;
+    }
+
+    m_initialized = false;
+    return true;
+}
+
 bool XilinxSyncIP::add_buffer(const DMAFd &buffer_desc) noexcept
 {
-    if (m_fd < 0)
+    if (m_fd < 0 || !m_initialized)
     {
-        VIDEO_ERROR_PRINT("Sync device not opened");
+        VIDEO_ERROR_PRINT("Sync device not initialized");
         return false;
     }
 

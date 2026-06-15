@@ -43,6 +43,12 @@ class XilinxSyncIP
     bool start() noexcept;
 
     /**
+     * @brief Stop and depopulate sync IP channels. Safe to call more than once.
+     * @return true on success, false on failure
+     */
+    bool stop() noexcept;
+
+    /**
      * @brief Add a DMA buffer to sync IP for tracking.
      * @param buffer_desc DMA buffer description
      * @return true on success, false on failure
@@ -54,6 +60,7 @@ class XilinxSyncIP
     SyncIp m_syncip;
     SyncChannel m_sync_chan;
     EncSyncChannel m_enc_sync_chan;
+    bool m_initialized;
 };
 
 #endif
