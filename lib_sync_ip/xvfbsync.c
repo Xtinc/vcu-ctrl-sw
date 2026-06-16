@@ -1084,9 +1084,8 @@ int xvfbsync_enc_sync_chan_depopulate(EncSyncChannel *enc_sync_chan)
         else
             return -1;
 
-        ret = xvfbsync_queue_pop(&enc_sync_chan->buffers);
-        if (ret)
-            return ret;
+        if (!xvfbsync_queue_pop(&enc_sync_chan->buffers))
+            return -1;
     }
 
     return ret;
