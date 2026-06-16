@@ -706,6 +706,15 @@ std::string RecvQueueAsync::stats_text() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    if (counters_.recv == 0)
+    {
+        counters_ = {};
+        return "q_avg_fi=0.00ms, q_fb_fi=0.00ms, q_out_fi=0.00ms, q_jitter=0.00ms/0.00f, "
+               "q_tail_jitter=0.00ms/0.00f, q_dis=0.00f/0, q_depth=0/0, q_depth_err=0.00, "
+               "q_depth_raw=0.00, q_pressure=0, q_pace=0.00, q_recv=0, q_dlv=0, q_skip=0, "
+               "q_drop=0, q_dup=0, q_late=0, q_reorder=0, q_stale=0, q_ovf=0";
+    }
+
     const double interval_ms = estimated_interval_ms_locked();
     const double jitter_frames = arrival_est_.jitter_avg / interval_ms;
     const double tail_jitter_frames = arrival_est_.jitter_tail / interval_ms;

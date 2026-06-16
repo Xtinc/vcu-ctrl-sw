@@ -293,8 +293,9 @@ void ReliableUDP::stop()
 double ReliableUDP::lost_rate()
 {
     auto curr_time = std::chrono::steady_clock::now();
-    auto recv_packets = recv_packets_.load(std::memory_order_relaxed);
-    auto lost_packets = lost_packets_.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(rate_mutex_);
+    auto recv_packets = recv_packets_.exchange(0, std::memory_order_relaxed);
+    auto lost_packets = lost_packets_.exchange(0, std::memory_order_relaxed);
 
     auto real_lost_rate = 0.0;
     if (recv_packets > 0)
@@ -310,8 +311,6 @@ double ReliableUDP::lost_rate()
                              lost_packets, recv_packets);
         }
 
-        recv_packets_.store(0, std::memory_order_relaxed);
-        lost_packets_.store(0, std::memory_order_relaxed);
         last_lost_rate_time_ = curr_time;
     }
 

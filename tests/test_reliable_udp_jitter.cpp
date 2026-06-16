@@ -387,7 +387,7 @@ static bool test_jitter_stats_counters_clear_after_read()
 
     const std::string second = q.stats_text();
     if (queue_stat_u64(second, "q_recv=") != 0 || queue_stat_u64(second, "q_dup=") != 0 ||
-        queue_stat_current_depth(second) != 1 || queue_stat_adaptive_depth(second) == 0)
+        queue_stat_current_depth(second) != 0 || queue_stat_adaptive_depth(second) != 0)
     {
         std::cout << "  [stats_delta] counters did not clear after stats_text(): " << second << '\n';
         ok = false;
@@ -395,6 +395,61 @@ static bool test_jitter_stats_counters_clear_after_read()
 
     q.stop();
     return ok;
+}
+
+static bool test_jitter_idle_stats_do_not_retain_previous_input()
+{
+    constexpr uint32_t N = 24;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; i++)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    uint32_t delivered = 0;
+
+    RecvQueueAsync q;
+    q.start(single_frame_callback([&](const uint8_t *, size_t) {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++delivered;
+        cv.notify_one();
+    }));
+
+    bool ok = true;
+    for (uint32_t i = 0; i < N; i++)
+    {
+        ok = ok && enqueue_with_retry(q, bufs[i].data(), bufs[i].size(), i);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(3), [&] { return delivered >= N; });
+    }
+
+    const std::string active = q.stats_text();
+    const std::string idle = q.stats_text();
+    q.stop();
+
+    if (!ok || delivered < N || queue_stat_u64(active, "q_recv=") == 0 || queue_stat_ms(active, "q_avg_fi=") <= 0.0)
+    {
+        std::cout << "  [idle_stats] active phase did not produce input stats: delivered=" << delivered
+                  << " stats=" << active << '\n';
+        return false;
+    }
+
+    if (queue_stat_u64(idle, "q_recv=") != 0 || queue_stat_u64(idle, "q_dlv=") != 0 ||
+        queue_stat_current_depth(idle) != 0 || queue_stat_adaptive_depth(idle) != 0 ||
+        queue_stat_ms(idle, "q_avg_fi=") != 0.0 || queue_stat_ms(idle, "q_out_fi=") != 0.0 ||
+        queue_stat_ms(idle, "q_jitter=") != 0.0 || queue_stat_tail_jitter_ms(idle) != 0.0 ||
+        queue_stat_disorder_depth(idle) != 0.0 || queue_stat_raw_depth(idle) != 0.0 ||
+        queue_stat_pacing_factor(idle) != 0.0)
+    {
+        std::cout << "  [idle_stats] idle stats retained previous input values: " << idle << '\n';
+        return false;
+    }
+
+    return true;
 }
 
 static bool test_jitter_inorder_prefill_not_reorder()
@@ -1801,6 +1856,7 @@ static int run_jitter_tests()
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
         {"callback retains until release      ", test_jitter_callback_retains_until_release},
         {"stats counters clear after read    ", test_jitter_stats_counters_clear_after_read},
+        {"idle stats clear input estimates   ", test_jitter_idle_stats_do_not_retain_previous_input},
         {"in-order prefill is not reorder     ", test_jitter_inorder_prefill_not_reorder},
         {"in-order backlog is not pressure    ", test_jitter_inorder_backlog_not_pressure},
         {"auto depth bounded after reorder    ", test_jitter_depth_recovers},
