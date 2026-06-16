@@ -523,7 +523,6 @@ bool V4L2Source::stop()
             ok = false;
         }
         m_sync_ip.reset();
-        (void)set_xilinx_low_latency_mode(m_fd, false);
     }
 
     if (!release_v4l2_buffers(m_fd, m_buf_type))

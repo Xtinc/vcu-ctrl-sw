@@ -1731,9 +1731,9 @@ static bool test_qs_estimator_stable_allows_immediate()
     QSEstimator::Events events;
 
     bool allowed = false;
-    for (int i = 0; i <= 61; ++i)
+    for (int i = 0; i <= 31; ++i)
     {
-        allowed = qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+        allowed = qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
     }
 
     return allowed && qs.allow_immediate;
@@ -1745,21 +1745,21 @@ static bool test_qs_estimator_continuity_break_revokes_immediate()
     const auto base = std::chrono::steady_clock::now();
     QSEstimator::Events events;
 
-    for (int i = 0; i <= 61; ++i)
-        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+    for (int i = 0; i <= 31; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
 
     QSEstimator::Events broken;
     broken.skip = 1;
-    if (qs.note_delivery(base + std::chrono::seconds(62), 1000.0, 100.0, broken))
+    if (qs.note_delivery(base + std::chrono::seconds(32), 1000.0, broken))
         return false;
 
-    for (int i = 63; i < 123; ++i)
+    for (int i = 33; i < 63; ++i)
     {
-        if (qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events))
+        if (qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events))
             return false;
     }
 
-    return qs.note_delivery(base + std::chrono::seconds(123), 1000.0, 100.0, events);
+    return qs.note_delivery(base + std::chrono::seconds(63), 1000.0, events);
 }
 
 static bool test_qs_estimator_delivery_jitter_revokes_immediate()
@@ -1768,23 +1768,23 @@ static bool test_qs_estimator_delivery_jitter_revokes_immediate()
     const auto base = std::chrono::steady_clock::now();
     QSEstimator::Events events;
 
-    for (int i = 0; i <= 61; ++i)
-        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+    for (int i = 0; i <= 31; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
 
-    return !qs.note_delivery(base + std::chrono::milliseconds(63500), 1000.0, 100.0, events) &&
+    return !qs.note_delivery(base + std::chrono::milliseconds(33500), 1000.0, events) &&
            !qs.allow_immediate;
 }
 
-static bool test_qs_estimator_residence_delay_revokes_immediate()
+static bool test_qs_estimator_two_frame_interval_allowed()
 {
     QSEstimator qs;
     const auto base = std::chrono::steady_clock::now();
     QSEstimator::Events events;
 
-    for (int i = 0; i <= 61; ++i)
-        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, 100.0, events);
+    for (int i = 0; i <= 31; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
 
-    return !qs.note_delivery(base + std::chrono::seconds(62), 1000.0, 1500.0, events) && !qs.allow_immediate;
+    return qs.note_delivery(base + std::chrono::seconds(33), 1000.0, events) && qs.allow_immediate;
 }
 
 static int run_jitter_tests()
@@ -1819,7 +1819,7 @@ static int run_jitter_tests()
         {"QS stable allows immediate          ", test_qs_estimator_stable_allows_immediate},
         {"QS continuity break revokes         ", test_qs_estimator_continuity_break_revokes_immediate},
         {"QS delivery jitter revokes          ", test_qs_estimator_delivery_jitter_revokes_immediate},
-        {"QS residence delay revokes          ", test_qs_estimator_residence_delay_revokes_immediate},
+        {"QS two-frame interval allowed       ", test_qs_estimator_two_frame_interval_allowed},
         {"send queue fill API                 ", test_send_queue_fill},
     };
 

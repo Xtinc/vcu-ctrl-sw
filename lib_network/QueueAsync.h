@@ -112,7 +112,7 @@ class QSEstimator
     };
 
     void reset();
-    bool note_delivery(ClockTP now, double expected_interval_ms, double residence_ms, const Events &events);
+    bool note_delivery(ClockTP now, double expected_interval_ms, const Events &events);
 
     bool allow_immediate = false;
 

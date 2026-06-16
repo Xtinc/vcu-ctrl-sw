@@ -21,9 +21,8 @@ constexpr double JITTER_TAIL_QUANTILE = 0.95;
 constexpr size_t FEEDFORWARD_INTERVAL_WINDOW_FRAMES = 16;
 
 constexpr double DEPTH_SETTLE_EPSILON_FRAMES = 0.25;
-constexpr double QS_STABLE_WINDOW_SECONDS = 60.0;
-constexpr double QS_MAX_DELIVERY_JITTER_FRAMES = 1.0;
-constexpr double QS_MAX_RESIDENCE_FRAMES = 1.0;
+constexpr double QS_STABLE_WINDOW_SECONDS = 30.0;
+constexpr double QS_MAX_DELIVERY_INTERVAL_FRAMES = 2.0;
 
 constexpr double ema_gain(double window_frames)
 {
@@ -377,10 +376,9 @@ void QSEstimator::reset()
     stable_since_ = ClockTP{};
 }
 
-bool QSEstimator::note_delivery(ClockTP now, double expected_interval_ms, double residence_ms, const Events &events)
+bool QSEstimator::note_delivery(ClockTP now, double expected_interval_ms, const Events &events)
 {
     expected_interval_ms = std::max(MIN_FRAME_INTERVAL_MS, expected_interval_ms);
-    residence_ms = std::max(0.0, residence_ms);
 
     if (events.skip > 0 || events.drop > 0 || events.late > 0 || events.stale > 0 || events.overflow > 0)
     {
@@ -388,13 +386,12 @@ bool QSEstimator::note_delivery(ClockTP now, double expected_interval_ms, double
         return allow_immediate;
     }
 
-    bool stable_sample = residence_ms / expected_interval_ms < QS_MAX_RESIDENCE_FRAMES;
+    bool stable_sample = true;
     if (has_last_delivery_)
     {
         const double actual_interval_ms = std::chrono::duration<double, std::milli>(now - last_delivery_time_).count();
         stable_sample = stable_sample && actual_interval_ms >= 0.0 && actual_interval_ms < 10000.0 &&
-                        std::abs(actual_interval_ms - expected_interval_ms) / expected_interval_ms <
-                            QS_MAX_DELIVERY_JITTER_FRAMES;
+                        actual_interval_ms <= QS_MAX_DELIVERY_INTERVAL_FRAMES * expected_interval_ms;
     }
 
     if (!stable_sample)
@@ -833,8 +830,7 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
 
     const ClockTP now = std::chrono::steady_clock::now();
     const double expected_interval_ms = estimated_interval_ms_locked();
-    const double residence_ms = std::chrono::duration<double, std::milli>(now - frame.arrival).count();
-    const bool allow_immediate = qs_est_.note_delivery(now, expected_interval_ms, residence_ms, qs_events_);
+    const bool allow_immediate = qs_est_.note_delivery(now, expected_interval_ms, qs_events_);
     qs_events_ = {};
 
     expected_seq_ = frame.seq + 1;
