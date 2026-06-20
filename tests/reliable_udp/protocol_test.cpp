@@ -1,8 +1,8 @@
 /**
- * @file test_reliable_udp.cpp
+ * @file protocol_test.cpp
  * @brief ReliableUDP protocol, RTT, and FEC integration tests.
  *
- * The jitter-buffer reorder/pacing tests live in test_reliable_udp_jitter.cpp.
+ * The jitter-buffer reorder/pacing tests live in queue_test.cpp.
  * This executable focuses on the full ReliableUDP stack: RTT probes, small
  * XOR-FEC recovery cases, and a lossy loopback integration run.
  *

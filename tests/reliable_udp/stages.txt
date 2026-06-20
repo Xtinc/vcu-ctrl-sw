@@ -1,5 +1,5 @@
 # Stage file for:
-#   tests/reliable_udp_jitter/run_reliable_udp_jitter_tc.sh --preset staged
+#   tests/reliable_udp/run_tc.sh --preset staged
 #
 # Format:
 #   <seconds> <name> <netem args | normal>

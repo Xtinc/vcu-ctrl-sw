@@ -38,16 +38,4 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(dumb_test PRIVATE liballegro_decode_static lib_network ${LIBDRM_LIBRARIES})
 endif()
 
-# --- ReliableUDP protocol + FEC integration tests ---
-# Covers RTT probes, deterministic XOR-FEC recovery cases, and random-sized
-# messages through a configurable lossy UDP proxy.
-#
-# Usage:
-#   ./test_reliable_udp [--min-bytes N] [--max-bytes N]
-#                       [--rate-mbps F] [--loss-min F] [--loss-max F]
-#                       [--duration N]
-add_executable(test_reliable_udp
-    test_reliable_udp.cpp)
-target_link_libraries(test_reliable_udp PRIVATE lib_network)
-
-add_subdirectory(reliable_udp_jitter)
+add_subdirectory(reliable_udp)

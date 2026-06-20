@@ -321,11 +321,24 @@ def write_assessment(out_dir, metrics):
             f.write("- sent: {}\n".format(accounting["sent"]))
             f.write("- received: {}\n".format(accounting["received"]))
             f.write("- send_fail: {}\n".format(accounting["send_fail"]))
-            f.write("- observed_message_loss_pct: {}\n\n".format(fmt(accounting["loss_pct"], 3)))
+            f.write("- observed_message_loss_pct: {}\n".format(fmt(accounting["loss_pct"], 3)))
+            f.write("- sender_payload_rate: {} Mbps\n\n".format(fmt(accounting["payload_rate_mbps"], 3)))
 
         f.write("1. User-visible output interval smoothness\n")
         for key in ("mean", "p50", "p90", "p95", "p99", "max"):
             f.write("- interval_{}: {} ms\n".format(key, fmt(metrics["interval"].get(key, 0.0))))
+        if metrics.get("sender_interval"):
+            sender = metrics["sender_interval"]
+            f.write("- sender_interval_mean: {} ms\n".format(fmt(sender["mean"])))
+            f.write("- sender_interval_p50: {} ms\n".format(fmt(sender["p50"])))
+            f.write("- sender_interval_p95: {} ms\n".format(fmt(sender["p95"])))
+            f.write("- sender_interval_p99: {} ms\n".format(fmt(sender["p99"])))
+            f.write("- sender_interval_max: {} ms\n".format(fmt(sender["max"])))
+            f.write(
+                "- receive_minus_send_mean: {} ms\n".format(
+                    fmt(metrics["interval"].get("mean", 0.0) - sender["mean"])
+                )
+            )
         f.write("- rolling_cv_mean: {}\n".format(fmt(metrics["cv"].get("mean", 0.0), 4)))
         f.write("- rolling_cv_p95: {}\n".format(fmt(metrics["cv"].get("p95", 0.0), 4)))
         f.write("- see output_smoothness.png\n\n")
@@ -379,6 +392,15 @@ def main():
 
     out_dir = args.out_dir
     sender_summary = read_summary(args.sender_summary)
+    sender_interval = None
+    if "send_interval_mean_ms" in sender_summary:
+        sender_interval = {
+            "mean": float(sender_summary.get("send_interval_mean_ms", "0")),
+            "p50": float(sender_summary.get("send_interval_p50_ms", "0")),
+            "p95": float(sender_summary.get("send_interval_p95_ms", "0")),
+            "p99": float(sender_summary.get("send_interval_p99_ms", "0")),
+            "max": float(sender_summary.get("send_interval_max_ms", "0")),
+        }
     arrival_path = os.path.join(out_dir, "arrival_intervals.csv")
     stats_path = os.path.join(out_dir, "queue_stats.csv")
     if not os.path.exists(arrival_path):
@@ -474,9 +496,13 @@ def main():
     axes[0].plot(t_out, output_intervals, linewidth=0.5, alpha=0.28, label="output interval samples")
     axes[0].plot(t_out, interval_mean, linewidth=1.2, label="rolling mean")
     axes[0].plot(t_out, interval_p95, linewidth=1.2, label="rolling p95")
+    if sender_interval:
+        axes[0].axhline(sender_interval["mean"], color="tab:green", linestyle="--", label="sender mean")
+        axes[0].axhline(sender_interval["p95"], color="tab:olive", linestyle=":", label="sender p95")
     axes[0].set_ylabel("ms")
     axes[0].set_title("User-Visible Output Interval Smoothness")
-    set_robust_upper_ylim(axes[0], output_intervals)
+    interval_scale = output_intervals + ([sender_interval["p95"]] if sender_interval else [])
+    set_robust_upper_ylim(axes[0], interval_scale)
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="upper right")
 
@@ -584,7 +610,13 @@ def main():
         send_fail = int(sender_summary.get("send_fail_count", "0"))
         received = len(arrivals)
         loss_pct = 100.0 * max(0, sent - received) / float(sent) if sent else 0.0
-        end_to_end = {"sent": sent, "received": received, "send_fail": send_fail, "loss_pct": loss_pct}
+        end_to_end = {
+            "sent": sent,
+            "received": received,
+            "send_fail": send_fail,
+            "loss_pct": loss_pct,
+            "payload_rate_mbps": float(sender_summary.get("payload_rate_mbps", "0")),
+        }
     write_assessment(
         out_dir,
         {
@@ -593,6 +625,7 @@ def main():
             "stats_count": len(queue_stats),
             "arrival_count": len(arrivals),
             "interval": interval_stats,
+            "sender_interval": sender_interval,
             "cv": cv_stats,
             "latency": latency_stats,
             "ideal_latency_max": max(ideal_latency) if ideal_latency else 0.0,

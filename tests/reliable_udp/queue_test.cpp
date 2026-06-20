@@ -1,5 +1,5 @@
 /**
- * @file reliable_udp_jitter/test_reliable_udp_jitter.cpp
+ * @file queue_test.cpp
  * @brief RecvQueueAsync reorder, jitter, pacing, and SendQueueAsync unit tests.
  *
  * Exit code: 0 = all tests passed, 1 = one or more failures.

@@ -15,7 +15,7 @@ DO_BUILD=1
 DO_CLEANUP=1
 DO_PLOT=1
 NORMAL_EDGE_SEC=10
-STAGE_FILE="${ROOT_DIR}/tests/reliable_udp_jitter/reliable_udp_jitter_stages.txt"
+STAGE_FILE="${ROOT_DIR}/tests/reliable_udp/stages.txt"
 STAGE_NAMES=()
 STAGE_DURATIONS=()
 STAGE_NETEMS=()
@@ -25,8 +25,7 @@ usage() {
     cat <<EOF
 Usage: $0 [options]
 
-Configure tc/netem on an interface, run test_reliable_udp_jitter_tc, then
-generate controller plots with plot_reliable_udp_jitter.py.
+Configure tc/netem on an interface, run test_udp_tc, then generate plots.
 
 Options:
   --preset <name>          jitter | reorder | harsh | staged (default: reorder)
@@ -326,7 +325,7 @@ trap cleanup_tc EXIT INT TERM
 cd "${ROOT_DIR}"
 
 if [[ ${DO_BUILD} -eq 1 ]]; then
-    cmake --build "${BUILD_DIR}" --target test_reliable_udp_jitter_tc
+    cmake --build "${BUILD_DIR}" --target test_udp_tc
 fi
 
 mkdir -p "${OUT_DIR}"
@@ -340,7 +339,7 @@ echo "stage,start_s,end_s,netem_args" >"${OUT_DIR}/tc_stages.csv"
 echo "Starting ${PRESET} ReliableUDP jitter capture into ${OUT_DIR}"
 echo "Total duration: ${TEST_DURATION}s; normal guard: ${NORMAL_EDGE_SEC}s at start/end"
 init_tc
-"${BUILD_DIR}/tests/reliable_udp_jitter/test_reliable_udp_jitter_tc" \
+"${BUILD_DIR}/tests/reliable_udp/test_udp_tc" \
     --duration "${TEST_DURATION}" \
     --rate-mbps "${RATE_MBPS}" \
     --payload-bytes "${PAYLOAD_BYTES}" \
@@ -379,7 +378,7 @@ apply_stage_tc "delay 0ms 0ms"
 wait "${TEST_PID}"
 
 if [[ ${DO_PLOT} -eq 1 ]]; then
-    python3 "${ROOT_DIR}/tests/reliable_udp_jitter/plot_reliable_udp_jitter.py" "${OUT_DIR}"
+    python3 "${ROOT_DIR}/tests/reliable_udp/plot.py" "${OUT_DIR}"
 fi
 
 if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then

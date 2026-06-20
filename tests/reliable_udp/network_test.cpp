@@ -11,10 +11,12 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #include <direct.h>
@@ -106,6 +108,17 @@ uint32_t adler32_compute(const uint8_t *data, size_t size)
         b = (b + a) % 65521u;
     }
     return (b << 16) | a;
+}
+
+double percentile(const std::vector<double> &sorted_values, double quantile)
+{
+    if (sorted_values.empty())
+        return 0.0;
+    const double position = quantile * static_cast<double>(sorted_values.size() - 1);
+    const size_t lower = static_cast<size_t>(position);
+    const size_t upper = std::min(lower + 1, sorted_values.size() - 1);
+    return sorted_values[lower] + (position - static_cast<double>(lower)) *
+                                      (sorted_values[upper] - sorted_values[lower]);
 }
 
 bool make_one_dir(const std::string &path)
@@ -291,6 +304,8 @@ void run_sender(const Config &cfg)
     const double bytes_per_sec = cfg.rate_mbps * 1e6 / 8.0;
     double budget = static_cast<double>(cfg.payload_bytes);
     auto budget_time = SteadyClock::now();
+    auto last_send_time = SteadyClock::time_point{};
+    std::vector<double> send_intervals_ms;
     uint32_t seq = 0;
     while (SteadyClock::now() < deadline)
     {
@@ -308,21 +323,45 @@ void run_sender(const Config &cfg)
         }
         const auto frame_seq = seq++;
         if (udp->send_fill(cfg.payload_bytes, [frame_seq](uint8_t *data, size_t size) { fill_frame(data, size, frame_seq); }))
+        {
+            const auto send_time = SteadyClock::now();
+            if (last_send_time != SteadyClock::time_point{})
+                send_intervals_ms.push_back(elapsed_ms(last_send_time, send_time));
+            last_send_time = send_time;
             ++state.sent;
+        }
         else
             ++state.send_fail;
     }
+    const double send_elapsed_sec = std::chrono::duration<double>(SteadyClock::now() - state.start).count();
     std::this_thread::sleep_for(std::chrono::seconds(1));
     const bool synced = udp->is_time_synced();
     const auto rtt = udp->rtt_ms();
     const auto offset = udp->offset_ms();
     udp->stop();
 
+    std::sort(send_intervals_ms.begin(), send_intervals_ms.end());
+    const double interval_sum = std::accumulate(send_intervals_ms.begin(), send_intervals_ms.end(), 0.0);
+    const double interval_mean = send_intervals_ms.empty() ? 0.0 : interval_sum / send_intervals_ms.size();
+    const double payload_rate_mbps = send_elapsed_sec > 0.0
+                                         ? static_cast<double>(state.sent.load() * cfg.payload_bytes) * 8.0 /
+                                               send_elapsed_sec / 1e6
+                                         : 0.0;
+
     std::ofstream summary(path_join(cfg.out_dir, "sender_summary.txt"));
     write_common_summary(summary, cfg);
-    summary << "clock_synced=" << (synced ? 1 : 0) << '\n' << "rtt_ms=" << rtt << '\n'
+    summary << std::fixed << std::setprecision(3)
+            << "clock_synced=" << (synced ? 1 : 0) << '\n' << "rtt_ms=" << rtt << '\n'
             << "offset_ms=" << offset << '\n' << "sent_count=" << state.sent.load() << '\n'
-            << "send_fail_count=" << state.send_fail.load() << '\n';
+            << "send_fail_count=" << state.send_fail.load() << '\n'
+            << "send_elapsed_sec=" << send_elapsed_sec << '\n'
+            << "payload_rate_mbps=" << payload_rate_mbps << '\n'
+            << "send_interval_count=" << send_intervals_ms.size() << '\n'
+            << "send_interval_mean_ms=" << interval_mean << '\n'
+            << "send_interval_p50_ms=" << percentile(send_intervals_ms, 0.50) << '\n'
+            << "send_interval_p95_ms=" << percentile(send_intervals_ms, 0.95) << '\n'
+            << "send_interval_p99_ms=" << percentile(send_intervals_ms, 0.99) << '\n'
+            << "send_interval_max_ms=" << (send_intervals_ms.empty() ? 0.0 : send_intervals_ms.back()) << '\n';
     std::cout << "Sender complete: sent=" << state.sent.load() << " failed=" << state.send_fail.load() << '\n';
 }
 
