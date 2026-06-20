@@ -50,7 +50,9 @@ timer or an additional thread. Gaps longer than five seconds start a new
 `segment_id`; `idle_gap_ms` records the observed gap so plots do not connect
 unrelated traffic segments. The active file rotates at 64 MiB into
 `queue_stats.csv.1` through `queue_stats.csv.3`, bounding retained queue
-statistics to approximately 256 MiB.
+statistics to approximately 256 MiB. The `part_id` column increases on every
+rotation; the first and last `elapsed_ms` values for each part identify its
+data range independently of the archive filename.
 
 Copy `sender_out/sender_summary.txt` to the analysis host, then run:
 

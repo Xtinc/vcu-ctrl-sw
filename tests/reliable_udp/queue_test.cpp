@@ -1898,15 +1898,31 @@ static bool test_queue_stats_csv_writer_rotation()
     }
 
     bool ok = true;
+    std::array<uint64_t, 3> part_ids{};
     for (size_t index = 0; index <= 2; ++index)
     {
         const auto candidate = index == 0 ? path : path + "." + std::to_string(index);
         std::ifstream input(candidate);
         std::string header;
         ok = ok && static_cast<bool>(std::getline(input, header));
-        ok = ok && header.find("elapsed_ms,segment_id,idle_gap_ms") == 0;
+        ok = ok && header.find("elapsed_ms,part_id,segment_id,idle_gap_ms") == 0;
+        std::string row;
+        if (std::getline(input, row))
+        {
+            const auto first_comma = row.find(',');
+            const auto second_comma = row.find(',', first_comma + 1);
+            ok = ok && first_comma != std::string::npos && second_comma != std::string::npos;
+            if (first_comma != std::string::npos && second_comma != std::string::npos)
+                part_ids[index] = static_cast<uint64_t>(std::stoull(row.substr(first_comma + 1,
+                                                                               second_comma - first_comma - 1)));
+        }
+        else
+        {
+            ok = false;
+        }
         std::remove(candidate.c_str());
     }
+    ok = ok && part_ids[2] < part_ids[1] && part_ids[1] < part_ids[0];
     std::ifstream excess(path + ".3");
     ok = ok && !excess.good();
     std::remove((path + ".3").c_str());

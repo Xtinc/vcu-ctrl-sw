@@ -24,7 +24,7 @@ class QueueStatsCsvWriter
   private:
     void write(Clock::time_point now, double idle_gap_ms, const QueueStatsSnapshot &stats);
     bool open();
-    void rotate();
+    bool rotate();
     void clear_files();
     void close();
     std::string archive_path(size_t index) const;
@@ -40,6 +40,7 @@ class QueueStatsCsvWriter
     bool has_last_frame_ = false;
     bool has_last_write_ = false;
     bool has_baseline_ = false;
+    uint64_t part_id_ = 0;
     uint64_t segment_id_ = 0;
     Clock::time_point start_time_{};
     Clock::time_point last_frame_time_{};

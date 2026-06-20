@@ -282,11 +282,16 @@ def process_queue(path, stages, stage_metrics):
     target_stats = SampleStats()
     events = {"skip": 0.0, "late": 0.0, "overflow": 0.0, "drop": 0.0, "stale": 0.0, "reorder": 0.0}
     gaps = []
+    parts = {}
     previous_segment = None
     row_count = 0
     for row in csv_rows(path, QUEUE_COLUMNS, include_rotated=True):
         row_count += 1
         timestamp = as_float(row, "elapsed_ms") / 1000.0
+        part_id = int(as_float(row, "part_id", 0.0))
+        part = parts.setdefault(part_id, {"part_id": part_id, "start_s": timestamp, "end_s": timestamp, "rows": 0})
+        part["end_s"] = timestamp
+        part["rows"] += 1
         segment = int(as_float(row, "segment_id", 1.0))
         if previous_segment is not None and segment != previous_segment:
             for key in keys:
@@ -319,7 +324,8 @@ def process_queue(path, stages, stage_metrics):
         plot["t"].append(timestamp)
         for key in keys:
             plot[key].append(values[key])
-    return {"count": row_count, "plot": plot, "gaps": gaps, "input": input_stats.summary(),
+    return {"count": row_count, "plot": plot, "gaps": gaps, "parts": [parts[key] for key in sorted(parts)],
+            "input": input_stats.summary(),
             "output": output_stats.summary(), "buffered": buffered_stats.summary(),
             "target": target_stats.summary(), "events": events}
 
@@ -487,6 +493,10 @@ def write_assessment(out_dir, arrivals, queue, sender, stages):
         stream.write("Overall\n- score: {} / 100 ({})\n".format(int(round(score)), label))
         stream.write("- percentile_note: computed from all samples\n")
         stream.write("- samples: stats={}, arrivals={}\n\n".format(queue["count"], arrivals["count"]))
+        stream.write("CSV parts\npart_id,start_s,end_s,rows\n")
+        for part in queue["parts"]:
+            stream.write("{part_id},{start_s:.3f},{end_s:.3f},{rows}\n".format(**part))
+        stream.write("\n")
         if sender:
             received = arrivals["count"]
             loss = 100.0 * max(0, sender["sent"] - received) / sender["sent"] if sender["sent"] else 0.0

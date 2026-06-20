@@ -1,6 +1,8 @@
 #include "QueueStatsCsvWriter.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <utility>
 
@@ -14,7 +16,7 @@ namespace
 constexpr auto RECORD_PERIOD = std::chrono::milliseconds(100);
 constexpr auto IDLE_GAP = std::chrono::seconds(5);
 constexpr const char *CSV_HEADER =
-    "elapsed_ms,segment_id,idle_gap_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,q_jitter_frames,"
+    "elapsed_ms,part_id,segment_id,idle_gap_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,q_jitter_frames,"
     "q_disorder_frames,q_max_disorder_depth,q_tail_jitter_ms,q_tail_jitter_frames,q_buffered_frames,"
     "q_adaptive_depth,q_depth_raw,q_depth_error_frames,q_pressure_frames,q_pacing_factor,q_recv_delta,"
     "q_dlv_delta,q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta";
@@ -46,6 +48,7 @@ void QueueStatsCsvWriter::start(Clock::time_point now)
     has_last_frame_ = false;
     has_last_write_ = false;
     has_baseline_ = false;
+    part_id_ = 0;
     segment_id_ = 0;
     start_time_ = now;
     baseline_ = QueueStatsSnapshot{};
@@ -113,7 +116,9 @@ void QueueStatsCsvWriter::write(Clock::time_point now, double idle_gap_ms, const
 
     if (file_.is_open() && max_file_bytes_ > 0 && bytes_written_ >= max_file_bytes_)
     {
-        rotate();
+        if (!rotate())
+            return;
+        ++part_id_;
         if (!open())
             return;
     }
@@ -125,13 +130,13 @@ void QueueStatsCsvWriter::write(Clock::time_point now, double idle_gap_ms, const
     const QueueStatsSnapshot previous = has_baseline_ ? baseline_ : QueueStatsSnapshot{};
     const double elapsed = std::chrono::duration<double, std::milli>(now - start_time_).count();
 
-    file_ << std::fixed << std::setprecision(3) << elapsed << ',' << segment_id_ << ',' << idle_gap_ms << ','
-          << std::setprecision(2) << stats.avg_frame_interval_ms << ',' << stats.feedback_interval_ms << ','
-          << stats.output_interval_ms << ',' << stats.jitter_ms << ',' << stats.jitter_frames << ','
-          << stats.disorder_frames << ',' << stats.max_disorder_depth << ',' << stats.tail_jitter_ms << ','
-          << stats.tail_jitter_frames << ',' << stats.buffered_frames << ',' << stats.adaptive_depth << ','
-          << stats.raw_depth_frames << ',' << stats.depth_error_frames << ',' << stats.pressure_frames << ','
-          << stats.pacing_factor << ',' << delta(stats.recv, previous.recv) << ','
+    file_ << std::fixed << std::setprecision(3) << elapsed << ',' << part_id_ << ',' << segment_id_ << ','
+          << idle_gap_ms << ',' << std::setprecision(2) << stats.avg_frame_interval_ms << ','
+          << stats.feedback_interval_ms << ',' << stats.output_interval_ms << ',' << stats.jitter_ms << ','
+          << stats.jitter_frames << ',' << stats.disorder_frames << ',' << stats.max_disorder_depth << ','
+          << stats.tail_jitter_ms << ',' << stats.tail_jitter_frames << ',' << stats.buffered_frames << ','
+          << stats.adaptive_depth << ',' << stats.raw_depth_frames << ',' << stats.depth_error_frames << ','
+          << stats.pressure_frames << ',' << stats.pacing_factor << ',' << delta(stats.recv, previous.recv) << ','
           << delta(stats.deliver, previous.deliver) << ',' << delta(stats.skip, previous.skip) << ','
           << delta(stats.drop, previous.drop) << ',' << delta(stats.duplicate, previous.duplicate) << ','
           << delta(stats.late, previous.late) << ',' << delta(stats.reorder, previous.reorder) << ','
@@ -181,26 +186,55 @@ void QueueStatsCsvWriter::clear_files()
         std::remove(archive_path(index).c_str());
 }
 
-void QueueStatsCsvWriter::rotate()
+bool QueueStatsCsvWriter::rotate()
 {
     close();
     if (archive_count_ == 0)
     {
-        std::remove(path_.c_str());
-        return;
+        if (std::remove(path_.c_str()) != 0 && errno != ENOENT)
+        {
+            file_failed_ = true;
+            VIDEO_ERROR_PRINT("Failed to remove %s during rotation: %s", path_.c_str(), std::strerror(errno));
+            return false;
+        }
+        return true;
     }
 
-    std::remove(archive_path(archive_count_).c_str());
+    const auto oldest = archive_path(archive_count_);
+    if (std::remove(oldest.c_str()) != 0 && errno != ENOENT)
+    {
+        file_failed_ = true;
+        VIDEO_ERROR_PRINT("Failed to remove %s during rotation: %s", oldest.c_str(), std::strerror(errno));
+        return false;
+    }
+
     for (size_t index = archive_count_; index > 1; --index)
-        std::rename(archive_path(index - 1).c_str(), archive_path(index).c_str());
-    std::rename(path_.c_str(), archive_path(1).c_str());
+    {
+        const auto source = archive_path(index - 1);
+        const auto destination = archive_path(index);
+        if (std::rename(source.c_str(), destination.c_str()) != 0 && errno != ENOENT)
+        {
+            file_failed_ = true;
+            VIDEO_ERROR_PRINT("Failed to rotate %s to %s: %s", source.c_str(), destination.c_str(),
+                              std::strerror(errno));
+            return false;
+        }
+    }
+
+    const auto first_archive = archive_path(1);
+    if (std::rename(path_.c_str(), first_archive.c_str()) != 0)
+    {
+        file_failed_ = true;
+        VIDEO_ERROR_PRINT("Failed to rotate %s to %s: %s", path_.c_str(), first_archive.c_str(), std::strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 void QueueStatsCsvWriter::close()
 {
     if (!file_.is_open())
         return;
-    file_.flush();
     file_.close();
 }
 
