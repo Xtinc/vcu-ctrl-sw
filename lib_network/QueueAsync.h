@@ -3,6 +3,7 @@
 
 #include "ClockWait.h"
 #include "MemPoolUDP.h"
+#include "QueueStats.h"
 #include <functional>
 #include <thread>
 
@@ -150,19 +151,6 @@ class RecvQueueAsync
         ClockTP arrival;
     };
 
-    struct Counters
-    {
-        uint64_t recv = 0;
-        uint64_t deliver = 0;
-        uint64_t skip = 0;
-        uint64_t drop = 0;
-        uint64_t duplicate = 0;
-        uint64_t late = 0;
-        uint64_t reorder = 0;
-        uint64_t stale = 0;
-        uint64_t overflow = 0;
-    };
-
     struct BFController
     {
         size_t adaptive_depth = 0;
@@ -185,7 +173,7 @@ class RecvQueueAsync
     void stop();
     void reset();
     bool enqueue(uint8_t *data, size_t size, uint32_t abs_seq);
-    std::string stats_text() const;
+    QueueStatsSnapshot stats_snapshot() const;
 
   private:
     void worker_thread();
@@ -203,6 +191,7 @@ class RecvQueueAsync
     void deliver_one_locked(std::unique_lock<std::mutex> &lock);
     void skip_gap_locked(uint32_t next_available_seq);
     void note_qs_event_locked(const QSEstimator::Events &events);
+    QueueStatsSnapshot stats_snapshot_locked() const;
 
     MemPool<6, 16> frame_pool_;
     RecvCallBack receive_callback_;
@@ -226,7 +215,7 @@ class RecvQueueAsync
     BFController buffer_ctl_;
     QSEstimator qs_est_;
     QSEstimator::Events qs_events_;
-    mutable Counters counters_;
+    QueueStatsSnapshot stats_;
 };
 
 void set_current_thread_scheduler_policy();

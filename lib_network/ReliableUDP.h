@@ -2,6 +2,7 @@
 #define RELIABLE_UDP_H
 
 #include "QueueAsync.h"
+#include "QueueStatsCsvWriter.h"
 #include "ReedSoloman.h"
 #include "asio.hpp"
 
@@ -244,10 +245,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     bool add_destination(const std::string &address, unsigned short port);
     bool send(const uint8_t *data, size_t size);
     bool send_fill(size_t size, FillCallback callback);
-    void set_receive_callback(RecvCallBack callback)
-    {
-        usr_queue_->start(callback);
-    }
+    void set_receive_callback(RecvCallBack callback);
     double send_rate();
     double recv_rate();
     double lost_rate();
@@ -255,7 +253,6 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
     bool is_time_synced() const;
-    std::string queue_stats_text() const;
 
   private:
     void start_receive();
@@ -328,6 +325,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
 
     asio::steady_timer probe_timer_;
     ClockSync clock_sync_;
+    QueueStatsCsvWriter stats_writer_;
 };
 
 #endif // RELIABLE_UDP_H

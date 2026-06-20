@@ -198,7 +198,6 @@ class DecMgr
     double fps() const;
     double recv_rate() const;
     double lost_rate() const;
-    std::string queue_stats_text() const;
     int64_t rtt_ms() const;
     int64_t offset_ms() const;
 

@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_set>
 #include <vector>
 
@@ -25,15 +26,8 @@ namespace
 using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t TEST_MAGIC = 0x524a5443u; // RJTC
-constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v4";
+constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v5";
 constexpr const char *ARRIVAL_CSV_HEADER = "elapsed_ms,seq,interval_ms,latency_ms,size_bytes";
-constexpr const char *QUEUE_STATS_CSV_HEADER =
-    "elapsed_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,q_jitter_frames,q_disorder_frames,q_max_disorder_depth,"
-    "q_tail_jitter_ms,q_tail_jitter_frames,"
-    "q_buffered_frames,q_adaptive_depth,q_depth_raw,q_depth_error_frames,q_pressure_frames,q_pacing_factor,"
-    "q_recv_delta,q_dlv_delta,"
-    "q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta,"
-    "recv_rate_bps,lost_rate";
 
 #pragma pack(push, 1)
 struct JitterMsgHdr
@@ -53,36 +47,7 @@ struct Config
     size_t payload_bytes = 1200;
     uint16_t sender_port = 15301;
     uint16_t receiver_port = 15302;
-    uint32_t stats_period_ms = 100;
     std::string out_dir = "reliable_udp_jitter_out";
-};
-
-struct ParsedQueueStats
-{
-    double q_avg_fi_ms = 0.0;
-    double q_fb_fi_ms = 0.0;
-    double q_out_fi_ms = 0.0;
-    double q_jitter_ms = 0.0;
-    double q_jitter_frames = 0.0;
-    double q_tail_jitter_ms = 0.0;
-    double q_tail_jitter_frames = 0.0;
-    double q_disorder_frames = 0.0;
-    uint64_t q_max_disorder_depth = 0;
-    uint64_t q_buffered_frames = 0;
-    uint64_t q_adaptive_depth = 0;
-    double q_depth_raw = 0.0;
-    double q_depth_error_frames = 0.0;
-    uint64_t q_pressure_frames = 0;
-    double q_pacing_factor = 0.0;
-    uint64_t q_recv_delta = 0;
-    uint64_t q_dlv_delta = 0;
-    uint64_t q_skip_delta = 0;
-    uint64_t q_drop_delta = 0;
-    uint64_t q_dup_delta = 0;
-    uint64_t q_late_delta = 0;
-    uint64_t q_reorder_delta = 0;
-    uint64_t q_stale_delta = 0;
-    uint64_t q_ovf_delta = 0;
 };
 
 struct RunState
@@ -113,7 +78,6 @@ static void usage(const char *prog)
               << "  --payload-bytes <n>    ReliableUDP message size including test header (default: 1200)\n"
               << "  --sender-port <n>      local sender port (default: 15301)\n"
               << "  --receiver-port <n>    local receiver port (default: 15302)\n"
-              << "  --stats-period-ms <n>  RecvQueue stats sampling period (default: 100)\n"
               << "  --out-dir <path>       output directory (default: reliable_udp_jitter_out)\n";
 }
 
@@ -196,101 +160,14 @@ static std::string join_path(const std::string &dir, const std::string &name)
     return dir + "/" + name;
 }
 
-static std::string trim_copy(std::string value)
+static std::string absolute_path(const std::string &path)
 {
-    const auto first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos)
-        return std::string{};
-    const auto last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
-
-static std::string stat_value(const std::string &stats, const std::string &key)
-{
-    const auto pos = stats.find(key);
-    if (pos == std::string::npos)
-        return std::string{};
-
-    const auto begin = pos + key.size();
-    const auto end = stats.find(',', begin);
-    return trim_copy(stats.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
-}
-
-static std::string require_stat_value(const std::string &stats, const std::string &key)
-{
-    const auto value = stat_value(stats, key);
-    if (value.empty())
-        throw std::runtime_error("queue_stats_text() missing field " + key + " in: " + stats);
-    return value;
-}
-
-static void require_separator(const std::string &value, char separator, const std::string &field)
-{
-    if (value.find(separator) == std::string::npos)
-        throw std::runtime_error("queue_stats_text() field " + field + " has unexpected value: " + value);
-}
-
-static double parse_double_prefix(const std::string &value)
-{
-    if (value.empty())
-        return 0.0;
-    return std::strtod(value.c_str(), nullptr);
-}
-
-static uint64_t parse_u64_prefix(const std::string &value)
-{
-    if (value.empty())
-        return 0;
-    return static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
-}
-
-static ParsedQueueStats parse_queue_stats(const std::string &stats)
-{
-    ParsedQueueStats out;
-
-    out.q_avg_fi_ms = parse_double_prefix(require_stat_value(stats, "q_avg_fi="));
-    out.q_fb_fi_ms = parse_double_prefix(require_stat_value(stats, "q_fb_fi="));
-    out.q_out_fi_ms = parse_double_prefix(require_stat_value(stats, "q_out_fi="));
-
-    const std::string jitter = require_stat_value(stats, "q_jitter=");
-    require_separator(jitter, '/', "q_jitter");
-    const auto jitter_slash = jitter.find('/');
-    out.q_jitter_ms = parse_double_prefix(jitter);
-    out.q_jitter_frames = parse_double_prefix(jitter.substr(jitter_slash + 1));
-
-    const std::string tail_jitter = require_stat_value(stats, "q_tail_jitter=");
-    require_separator(tail_jitter, '/', "q_tail_jitter");
-    const auto tail_jitter_slash = tail_jitter.find('/');
-    out.q_tail_jitter_ms = parse_double_prefix(tail_jitter);
-    out.q_tail_jitter_frames = parse_double_prefix(tail_jitter.substr(tail_jitter_slash + 1));
-
-    const std::string disorder = require_stat_value(stats, "q_dis=");
-    require_separator(disorder, '/', "q_dis");
-    const auto disorder_slash = disorder.find('/');
-    out.q_disorder_frames = parse_double_prefix(disorder);
-    out.q_max_disorder_depth = parse_u64_prefix(disorder.substr(disorder_slash + 1));
-
-    const std::string depth = require_stat_value(stats, "q_depth=");
-    require_separator(depth, '/', "q_depth");
-    const auto first_slash = depth.find('/');
-    out.q_buffered_frames = parse_u64_prefix(depth);
-    out.q_adaptive_depth = parse_u64_prefix(depth.substr(first_slash + 1));
-
-    out.q_depth_raw = parse_double_prefix(require_stat_value(stats, "q_depth_raw="));
-    out.q_depth_error_frames = parse_double_prefix(require_stat_value(stats, "q_depth_err="));
-    out.q_pressure_frames = parse_u64_prefix(require_stat_value(stats, "q_pressure="));
-    out.q_pacing_factor = parse_double_prefix(require_stat_value(stats, "q_pace="));
-    out.q_recv_delta = parse_u64_prefix(require_stat_value(stats, "q_recv="));
-    out.q_dlv_delta = parse_u64_prefix(require_stat_value(stats, "q_dlv="));
-    out.q_skip_delta = parse_u64_prefix(require_stat_value(stats, "q_skip="));
-    out.q_drop_delta = parse_u64_prefix(require_stat_value(stats, "q_drop="));
-    out.q_dup_delta = parse_u64_prefix(require_stat_value(stats, "q_dup="));
-    out.q_late_delta = parse_u64_prefix(require_stat_value(stats, "q_late="));
-    out.q_reorder_delta = parse_u64_prefix(require_stat_value(stats, "q_reorder="));
-    out.q_stale_delta = parse_u64_prefix(require_stat_value(stats, "q_stale="));
-    out.q_ovf_delta = parse_u64_prefix(require_stat_value(stats, "q_ovf="));
-
-    return out;
+    if (!path.empty() && path[0] == '/')
+        return path;
+    char cwd[4096]{};
+    if (!::getcwd(cwd, sizeof(cwd)))
+        throw std::runtime_error("cannot determine current directory");
+    return join_path(cwd, path);
 }
 
 static void fill_test_frame(uint8_t *data, size_t size, uint32_t seq, uint64_t send_us)
@@ -355,37 +232,6 @@ static void handle_received_frames(RunState &state, const std::vector<QueueFrame
     }
 }
 
-static void write_stats_header(std::ofstream &csv)
-{
-    csv << QUEUE_STATS_CSV_HEADER << '\n';
-}
-
-static void stats_sampler(std::shared_ptr<ReliableUDP> receiver, RunState &state, const Config &cfg,
-                          std::atomic<bool> &stop_requested, std::ofstream &csv)
-{
-    const auto period = std::chrono::milliseconds(cfg.stats_period_ms);
-    auto next_sample = Clock::now() + period;
-
-    while (!stop_requested.load(std::memory_order_acquire))
-    {
-        std::this_thread::sleep_until(next_sample);
-        next_sample += period;
-
-        const auto now = Clock::now();
-        const auto parsed = parse_queue_stats(receiver->queue_stats_text());
-        csv << std::fixed << std::setprecision(3) << elapsed_ms(state.start_time, now) << ',' << std::setprecision(2)
-            << parsed.q_avg_fi_ms << ',' << parsed.q_fb_fi_ms << ',' << parsed.q_out_fi_ms << ',' << parsed.q_jitter_ms
-            << ',' << parsed.q_jitter_frames << ',' << parsed.q_disorder_frames << ',' << parsed.q_max_disorder_depth
-            << ',' << parsed.q_tail_jitter_ms << ',' << parsed.q_tail_jitter_frames << ',' << parsed.q_buffered_frames
-            << ',' << parsed.q_adaptive_depth << ',' << parsed.q_depth_raw << ',' << parsed.q_depth_error_frames << ','
-            << parsed.q_pressure_frames << ',' << parsed.q_pacing_factor << ',' << parsed.q_recv_delta << ','
-            << parsed.q_dlv_delta << ',' << parsed.q_skip_delta << ',' << parsed.q_drop_delta << ','
-            << parsed.q_dup_delta << ',' << parsed.q_late_delta << ',' << parsed.q_reorder_delta << ','
-            << parsed.q_stale_delta << ',' << parsed.q_ovf_delta << ',' << receiver->recv_rate() << ','
-            << receiver->lost_rate() << '\n';
-    }
-}
-
 static Config parse_args(int argc, char *argv[])
 {
     Config cfg;
@@ -413,8 +259,6 @@ static Config parse_args(int argc, char *argv[])
             cfg.sender_port = static_cast<uint16_t>(std::stoul(value));
         else if (arg == "--receiver-port")
             cfg.receiver_port = static_cast<uint16_t>(std::stoul(value));
-        else if (arg == "--stats-period-ms")
-            cfg.stats_period_ms = static_cast<uint32_t>(std::stoul(value));
         else if (arg == "--out-dir")
             cfg.out_dir = value;
         else
@@ -423,7 +267,6 @@ static Config parse_args(int argc, char *argv[])
 
     cfg.payload_bytes = std::max(cfg.payload_bytes, sizeof(JitterMsgHdr));
     cfg.payload_bytes = std::min(cfg.payload_bytes, MAX_TRX_UDP_SIZE);
-    cfg.stats_period_ms = std::max<uint32_t>(cfg.stats_period_ms, 10);
     cfg.rate_mbps = std::max(0.0, cfg.rate_mbps);
 
     return cfg;
@@ -452,7 +295,7 @@ static void write_summary(const Config &cfg, const RunState &state, const std::s
     summary << "payload_bytes=" << cfg.payload_bytes << '\n';
     summary << "sender_port=" << cfg.sender_port << '\n';
     summary << "receiver_port=" << cfg.receiver_port << '\n';
-    summary << "stats_period_ms=" << cfg.stats_period_ms << '\n';
+    summary << "stats_period_ms=100 (receiver-triggered, approximate)\n";
     summary << "out_dir=" << cfg.out_dir << '\n';
     summary << "sent_count=" << sent << '\n';
     summary << "send_fail_count=" << send_fail << '\n';
@@ -469,9 +312,12 @@ static void run_test(const Config &cfg)
     if (!make_dirs(cfg.out_dir))
         throw std::runtime_error("failed to create output directory: " + cfg.out_dir);
 
-    const std::string arrival_path = join_path(cfg.out_dir, "arrival_intervals.csv");
-    const std::string stats_path = join_path(cfg.out_dir, "queue_stats.csv");
-    const std::string summary_path = join_path(cfg.out_dir, "summary.txt");
+    const std::string output_dir = absolute_path(cfg.out_dir);
+    if (::chdir(output_dir.c_str()) != 0)
+        throw std::runtime_error("failed to enter output directory: " + output_dir);
+
+    const std::string arrival_path = "arrival_intervals.csv";
+    const std::string summary_path = "summary.txt";
 
     auto &ioc = BG_SERVICE;
     const auto start = Clock::now();
@@ -481,11 +327,6 @@ static void run_test(const Config &cfg)
     if (!state.arrival_csv)
         throw std::runtime_error("failed to open " + arrival_path);
     state.arrival_csv << ARRIVAL_CSV_HEADER << '\n';
-
-    std::ofstream stats_csv(stats_path.c_str(), std::ios::out | std::ios::trunc);
-    if (!stats_csv)
-        throw std::runtime_error("failed to open " + stats_path);
-    write_stats_header(stats_csv);
 
     auto receiver = std::make_shared<ReliableUDP>(ioc, cfg.receiver_port);
     receiver->set_receive_callback([&state](const std::vector<QueueFrame> &frames, bool) {
@@ -498,10 +339,6 @@ static void run_test(const Config &cfg)
     sender->start();
     if (!sender->add_destination("127.0.0.1", cfg.receiver_port))
         throw std::runtime_error("sender add_destination failed");
-
-    std::atomic<bool> stop_stats{false};
-    std::thread stats_thread(stats_sampler, receiver, std::ref(state), std::cref(cfg), std::ref(stop_stats),
-                             std::ref(stats_csv));
 
     const auto deadline = start + std::chrono::seconds(cfg.duration_sec);
     const double bytes_per_sec = cfg.rate_mbps > 0.0 ? cfg.rate_mbps * 1e6 / 8.0 : 0.0;
@@ -543,10 +380,6 @@ static void run_test(const Config &cfg)
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(3));
-    stop_stats.store(true, std::memory_order_release);
-    if (stats_thread.joinable())
-        stats_thread.join();
-
     sender->stop();
     receiver->stop();
 
@@ -554,8 +387,6 @@ static void run_test(const Config &cfg)
         std::lock_guard<std::mutex> lock(state.arrival_mutex);
         state.arrival_csv.flush();
     }
-    stats_csv.flush();
-
     const double elapsed_seconds = std::chrono::duration<double>(Clock::now() - start).count();
     write_summary(cfg, state, summary_path, elapsed_seconds);
 

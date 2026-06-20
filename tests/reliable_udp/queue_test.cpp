@@ -6,6 +6,7 @@
  */
 
 #include "lib_network/QueueAsync.h"
+#include "lib_network/QueueStatsCsvWriter.h"
 
 #include <algorithm>
 #include <array>
@@ -13,8 +14,10 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -56,96 +59,9 @@ template <typename Callback> static RecvCallBack single_frame_callback(Callback 
     };
 }
 
-static std::string queue_stat_value(const std::string &stats, const std::string &key)
+static bool queue_adaptive_depth_is_valid(const QueueStatsSnapshot &stats)
 {
-    const auto pos = stats.find(key);
-    if (pos == std::string::npos)
-        return std::string{};
-
-    const auto begin = pos + key.size();
-    const auto end = stats.find(',', begin);
-    return stats.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-}
-
-static uint64_t queue_stat_u64(const std::string &stats, const std::string &key)
-{
-    const auto value = queue_stat_value(stats, key);
-    return value.empty() ? 0 : static_cast<uint64_t>(std::stoull(value));
-}
-
-static double queue_stat_disorder_depth(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_dis=");
-    const auto end = value.find('f');
-    return value.empty() ? 0.0 : std::stod(value.substr(0, end));
-}
-
-static uint64_t queue_stat_max_disorder_depth(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_dis=");
-    const auto slash = value.find('/');
-    return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(slash + 1)));
-}
-
-static uint64_t queue_stat_current_depth(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_depth=");
-    const auto slash = value.find('/');
-    return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(0, slash)));
-}
-
-static uint64_t queue_stat_adaptive_depth(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_depth=");
-    const auto slash = value.rfind('/');
-    return slash == std::string::npos ? 0 : static_cast<uint64_t>(std::stoull(value.substr(slash + 1)));
-}
-
-static double queue_stat_raw_depth(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_depth_raw=");
-    return value.empty() ? 0.0 : std::stod(value);
-}
-
-static uint64_t queue_stat_pressure_frames(const std::string &stats)
-{
-    return queue_stat_u64(stats, "q_pressure=");
-}
-
-static double queue_stat_tail_jitter_ms(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_tail_jitter=");
-    const auto end = value.find("ms");
-    return value.empty() ? 0.0 : std::stod(value.substr(0, end));
-}
-
-static double queue_stat_ms(const std::string &stats, const std::string &key)
-{
-    const auto value = queue_stat_value(stats, key);
-    const auto end = value.find("ms");
-    return value.empty() ? 0.0 : std::stod(value.substr(0, end));
-}
-
-static double queue_stat_tail_jitter_frames(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_tail_jitter=");
-    const auto slash = value.find('/');
-    if (slash == std::string::npos)
-        return 0.0;
-    const auto end = value.find('f', slash + 1);
-    return std::stod(value.substr(slash + 1, end == std::string::npos ? std::string::npos : end - slash - 1));
-}
-
-static double queue_stat_pacing_factor(const std::string &stats)
-{
-    const auto value = queue_stat_value(stats, "q_pace=");
-    return value.empty() ? 0.0 : std::stod(value);
-}
-
-static bool queue_adaptive_depth_is_valid(const std::string &stats)
-{
-    const auto depth = queue_stat_adaptive_depth(stats);
-    return depth >= 1 && depth <= 512 && queue_stat_raw_depth(stats) >= 0.0;
+    return stats.adaptive_depth >= 1 && stats.adaptive_depth <= 512 && stats.raw_depth_frames >= 0.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +280,7 @@ static bool test_jitter_callback_retains_until_release()
     return true;
 }
 
-static bool test_jitter_stats_counters_clear_after_read()
+static bool test_jitter_stats_snapshot_is_stable()
 {
     std::array<uint8_t, 4> buf{};
     uint32_t value = 1;
@@ -377,19 +293,18 @@ static bool test_jitter_stats_counters_clear_after_read()
     ok = ok && q.enqueue(buf.data(), buf.size(), 0);
     q.enqueue(buf.data(), buf.size(), 0);
 
-    const std::string first = q.stats_text();
-    if (queue_stat_u64(first, "q_recv=") != 2 || queue_stat_u64(first, "q_dup=") != 1 ||
-        queue_stat_current_depth(first) != 1 || queue_stat_adaptive_depth(first) == 0)
+    const auto snapshot1 = q.stats_snapshot();
+    const auto snapshot2 = q.stats_snapshot();
+    if (snapshot1.recv != 2 || snapshot1.duplicate != 1 || snapshot2.recv != snapshot1.recv ||
+        snapshot2.duplicate != snapshot1.duplicate)
     {
-        std::cout << "  [stats_delta] unexpected first stats: " << first << '\n';
+        std::cout << "  [stats_delta] cumulative snapshot changed while reading\n";
         ok = false;
     }
 
-    const std::string second = q.stats_text();
-    if (queue_stat_u64(second, "q_recv=") != 0 || queue_stat_u64(second, "q_dup=") != 0 ||
-        queue_stat_current_depth(second) != 0 || queue_stat_adaptive_depth(second) != 0)
+    if (snapshot1.buffered_frames != 1 || snapshot1.adaptive_depth == 0)
     {
-        std::cout << "  [stats_delta] counters did not clear after stats_text(): " << second << '\n';
+        std::cout << "  [stats_snapshot] unexpected queue depth\n";
         ok = false;
     }
 
@@ -397,7 +312,7 @@ static bool test_jitter_stats_counters_clear_after_read()
     return ok;
 }
 
-static bool test_jitter_idle_stats_do_not_retain_previous_input()
+static bool test_jitter_idle_snapshot_is_stable()
 {
     constexpr uint32_t N = 24;
     std::vector<std::array<uint8_t, 4>> bufs(N);
@@ -427,25 +342,20 @@ static bool test_jitter_idle_stats_do_not_retain_previous_input()
         cv.wait_for(lk, std::chrono::seconds(3), [&] { return delivered >= N; });
     }
 
-    const std::string active = q.stats_text();
-    const std::string idle = q.stats_text();
+    const auto active = q.stats_snapshot();
+    const auto idle = q.stats_snapshot();
     q.stop();
 
-    if (!ok || delivered < N || queue_stat_u64(active, "q_recv=") == 0 || queue_stat_ms(active, "q_avg_fi=") <= 0.0)
+    if (!ok || delivered < N || active.recv == 0 || active.avg_frame_interval_ms <= 0.0)
     {
-        std::cout << "  [idle_stats] active phase did not produce input stats: delivered=" << delivered
-                  << " stats=" << active << '\n';
+        std::cout << "  [idle_stats] active phase did not produce input stats: delivered=" << delivered << '\n';
         return false;
     }
 
-    if (queue_stat_u64(idle, "q_recv=") != 0 || queue_stat_u64(idle, "q_dlv=") != 0 ||
-        queue_stat_current_depth(idle) != 0 || queue_stat_adaptive_depth(idle) != 0 ||
-        queue_stat_ms(idle, "q_avg_fi=") != 0.0 || queue_stat_ms(idle, "q_out_fi=") != 0.0 ||
-        queue_stat_ms(idle, "q_jitter=") != 0.0 || queue_stat_tail_jitter_ms(idle) != 0.0 ||
-        queue_stat_disorder_depth(idle) != 0.0 || queue_stat_raw_depth(idle) != 0.0 ||
-        queue_stat_pacing_factor(idle) != 0.0)
+    if (idle.recv != active.recv || idle.deliver != active.deliver || idle.avg_frame_interval_ms <= 0.0 ||
+        idle.adaptive_depth == 0)
     {
-        std::cout << "  [idle_stats] idle stats retained previous input values: " << idle << '\n';
+        std::cout << "  [idle_stats] repeated snapshot changed cumulative state\n";
         return false;
     }
 
@@ -471,13 +381,12 @@ static bool test_jitter_inorder_prefill_not_reorder()
         }
     }
 
-    const std::string stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     q.stop();
 
-    if (queue_stat_u64(stats, "q_reorder=") != 0 || queue_stat_max_disorder_depth(stats) != 0 ||
-        queue_stat_disorder_depth(stats) != 0.0)
+    if (stats.reorder != 0 || stats.max_disorder_depth != 0 || stats.disorder_frames != 0.0)
     {
-        std::cout << "  [inorder_prefill] in-order prefill counted as reorder: " << stats << '\n';
+        std::cout << "  [inorder_prefill] in-order prefill counted as reorder\n";
         return false;
     }
     return true;
@@ -507,16 +416,16 @@ static bool test_jitter_inorder_backlog_not_pressure()
         }
     }
 
-    const std::string stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     release_callback.store(true);
     q.stop();
 
     if (!ok)
         return false;
 
-    if (queue_stat_pressure_frames(stats) != 0)
+    if (stats.pressure_frames != 0)
     {
-        std::cout << "  [inorder_backlog] in-order backlog triggered pressure: " << stats << '\n';
+        std::cout << "  [inorder_backlog] in-order backlog triggered pressure\n";
         return false;
     }
 
@@ -589,10 +498,10 @@ static bool test_jitter_depth_recovers()
         std::cout << "  [depth_recovers] expected " << N << " frames, got " << delivered << '\n';
         return false;
     }
-    const std::string stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     if (!queue_adaptive_depth_is_valid(stats))
     {
-        std::cout << "  [depth_recovers] invalid automatic target depth: " << stats << '\n';
+        std::cout << "  [depth_recovers] invalid automatic target depth\n";
         return false;
     }
     return true;
@@ -743,10 +652,10 @@ static bool test_jitter_adapt_up_down()
         std::cout << "  [adapt_up_down] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    const std::string stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     if (!queue_adaptive_depth_is_valid(stats))
     {
-        std::cout << "  [adapt_up_down] invalid automatic target depth: " << stats << '\n';
+        std::cout << "  [adapt_up_down] invalid automatic target depth\n";
         return false;
     }
     return true;
@@ -854,12 +763,12 @@ static bool test_jitter_gap_filled_before_deadline()
         std::unique_lock<std::mutex> lk(mtx);
         cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() >= N; });
     }
-    const auto stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     q.stop();
 
-    if (received.size() != N || queue_stat_u64(stats, "q_skip=") != 0)
+    if (received.size() != N || stats.skip != 0)
     {
-        std::cout << "  [gap_before_deadline] bad result: received=" << received.size() << " stats=" << stats << '\n';
+        std::cout << "  [gap_before_deadline] bad result: received=" << received.size() << '\n';
         return false;
     }
     for (uint32_t i = 0; i < N; ++i)
@@ -928,15 +837,13 @@ static bool test_jitter_stale_prefix_preserves_fresh_tail()
         std::unique_lock<std::mutex> lk(mtx);
         cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() >= 2; });
     }
-    const auto stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     q.stop();
 
-    if (received.size() != 2 || received[0] != 0 || received[1] != 16 ||
-        queue_stat_u64(stats, "q_stale=") != 15 || queue_stat_u64(stats, "q_drop=") != 15 ||
-        queue_stat_u64(stats, "q_skip=") != 15)
+    if (received.size() != 2 || received[0] != 0 || received[1] != 16 || stats.stale != 15 || stats.drop != 15 ||
+        stats.skip != 15)
     {
-        std::cout << "  [stale_prefix] unexpected output/counters: received=" << received.size()
-                  << " stats=" << stats << '\n';
+        std::cout << "  [stale_prefix] unexpected output/counters: received=" << received.size() << '\n';
         return false;
     }
     return true;
@@ -1115,10 +1022,10 @@ static bool test_jitter_adaptive_estimation()
         return false;
     }
 
-    const std::string stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     if (!queue_adaptive_depth_is_valid(stats))
     {
-        std::cout << "  [adaptive_estimation] invalid automatic target depth: " << stats << '\n';
+        std::cout << "  [adaptive_estimation] invalid automatic target depth\n";
         return false;
     }
 
@@ -1168,29 +1075,28 @@ static bool test_jitter_feedforward_tracks_throughput_with_bounded_feedback()
         }
     }
 
-    const std::string pressure_stats = q.stats_text();
-    const double avg_interval_ms = queue_stat_ms(pressure_stats, "q_avg_fi=");
-    const double pacing_factor = queue_stat_pacing_factor(pressure_stats);
-    const auto buffered = queue_stat_current_depth(pressure_stats);
-    const auto adaptive = queue_stat_adaptive_depth(pressure_stats);
+    const auto pressure_stats = q.stats_snapshot();
+    const double avg_interval_ms = pressure_stats.avg_frame_interval_ms;
+    const double pacing_factor = pressure_stats.pacing_factor;
+    const auto buffered = pressure_stats.buffered_frames;
+    const auto adaptive = pressure_stats.adaptive_depth;
 
     {
         std::unique_lock<std::mutex> lk(mtx);
         cv.wait_for(lk, std::chrono::seconds(5), [&] { return delivered >= TOTAL; });
     }
 
-    const std::string final_stats = q.stats_text();
+    const auto final_stats = q.stats_snapshot();
     q.stop();
 
     if (buffered <= adaptive || avg_interval_ms >= 6.0 || pacing_factor < 0.59)
     {
-        std::cout << "  [feedforward_feedback] bad pressure response: " << pressure_stats << '\n';
+        std::cout << "  [feedforward_feedback] bad pressure response\n";
         return false;
     }
-    if (delivered < TOTAL || queue_stat_u64(final_stats, "q_late=") != 0 || queue_stat_u64(final_stats, "q_ovf=") != 0)
+    if (delivered < TOTAL || final_stats.late != 0 || final_stats.overflow != 0)
     {
-        std::cout << "  [feedforward_feedback] bad final state: delivered=" << delivered << "/" << TOTAL
-                  << " stats=" << final_stats << '\n';
+        std::cout << "  [feedforward_feedback] bad final state: delivered=" << delivered << "/" << TOTAL << '\n';
         return false;
     }
     return true;
@@ -1244,7 +1150,7 @@ static bool test_jitter_one_sided_fast_arrivals()
         cv.wait_for(lk, std::chrono::seconds(5), [&] { return delivered >= TOTAL; });
     }
 
-    const std::string stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     q.stop();
 
     if (delivered < TOTAL)
@@ -1252,9 +1158,9 @@ static bool test_jitter_one_sided_fast_arrivals()
         std::cout << "  [one_sided_fast] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (queue_stat_tail_jitter_frames(stats) > 0.75 || queue_stat_adaptive_depth(stats) > 6)
+    if (stats.tail_jitter_frames > 0.75 || stats.adaptive_depth > 6)
     {
-        std::cout << "  [one_sided_fast] compressed arrivals raised tail jitter/depth: " << stats << '\n';
+        std::cout << "  [one_sided_fast] compressed arrivals raised tail jitter/depth\n";
         return false;
     }
     return true;
@@ -1309,7 +1215,7 @@ static bool test_jitter_one_sided_slow_tail()
         cv.wait_for(lk, std::chrono::seconds(8), [&] { return delivered >= TOTAL; });
     }
 
-    const std::string stats = q.stats_text();
+    const auto stats = q.stats_snapshot();
     q.stop();
 
     if (delivered < TOTAL)
@@ -1317,9 +1223,9 @@ static bool test_jitter_one_sided_slow_tail()
         std::cout << "  [one_sided_slow] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (queue_stat_tail_jitter_ms(stats) < 4.0 || queue_stat_raw_depth(stats) <= 4.0)
+    if (stats.tail_jitter_ms < 4.0 || stats.raw_depth_frames <= 4.0)
     {
-        std::cout << "  [one_sided_slow] slow tail did not raise jitter/depth: " << stats << '\n';
+        std::cout << "  [one_sided_slow] slow tail did not raise jitter/depth\n";
         return false;
     }
     return true;
@@ -1371,8 +1277,8 @@ static bool test_jitter_one_sided_tail_recovers()
         std::this_thread::sleep_for(d);
     }
 
-    const std::string burst_stats = q.stats_text();
-    const double burst_tail_ms = queue_stat_tail_jitter_ms(burst_stats);
+    const auto burst_stats = q.stats_snapshot();
+    const double burst_tail_ms = burst_stats.tail_jitter_ms;
 
     for (; seq < TOTAL; seq++)
     {
@@ -1389,20 +1295,20 @@ static bool test_jitter_one_sided_tail_recovers()
         cv.wait_for(lk, std::chrono::seconds(10), [&] { return delivered >= TOTAL; });
     }
 
-    const std::string recovered_stats = q.stats_text();
+    const auto recovered_stats = q.stats_snapshot();
     q.stop();
 
-    const double recovered_tail_ms = queue_stat_tail_jitter_ms(recovered_stats);
+    const double recovered_tail_ms = recovered_stats.tail_jitter_ms;
     if (delivered < TOTAL)
     {
         std::cout << "  [one_sided_recover] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (burst_tail_ms < 4.0 || recovered_tail_ms >= burst_tail_ms * 0.70 ||
-        queue_stat_u64(recovered_stats, "q_late=") != 0 || queue_stat_u64(recovered_stats, "q_ovf=") != 0)
+    if (burst_tail_ms < 4.0 || recovered_tail_ms >= burst_tail_ms * 0.70 || recovered_stats.late != 0 ||
+        recovered_stats.overflow != 0)
     {
-        std::cout << "  [one_sided_recover] bad recovery: burst=" << burst_stats << " recovered=" << recovered_stats
-                  << '\n';
+        std::cout << "  [one_sided_recover] bad recovery: burst=" << burst_tail_ms
+                  << "ms recovered=" << recovered_tail_ms << "ms\n";
         return false;
     }
     return true;
@@ -1969,6 +1875,44 @@ static bool test_qs_estimator_two_frame_interval_allowed()
     return qs.note_delivery(base + std::chrono::seconds(33), 1000.0, events) && qs.allow_immediate;
 }
 
+static bool test_queue_stats_csv_writer_rotation()
+{
+    const std::string path = "queue_stats_writer_rotation_test.csv";
+    for (size_t index = 0; index <= 3; ++index)
+    {
+        const auto candidate = index == 0 ? path : path + "." + std::to_string(index);
+        std::remove(candidate.c_str());
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    QueueStatsSnapshot snapshot;
+    {
+        QueueStatsCsvWriter writer(path, 700, 2);
+        writer.start(start);
+        for (uint64_t index = 0; index < 30; ++index)
+        {
+            snapshot.recv = index + 1;
+            writer.on_frame(start + std::chrono::milliseconds(101 * index), snapshot);
+        }
+        writer.stop(start + std::chrono::milliseconds(3000), snapshot);
+    }
+
+    bool ok = true;
+    for (size_t index = 0; index <= 2; ++index)
+    {
+        const auto candidate = index == 0 ? path : path + "." + std::to_string(index);
+        std::ifstream input(candidate);
+        std::string header;
+        ok = ok && static_cast<bool>(std::getline(input, header));
+        ok = ok && header.find("elapsed_ms,segment_id,idle_gap_ms") == 0;
+        std::remove(candidate.c_str());
+    }
+    std::ifstream excess(path + ".3");
+    ok = ok && !excess.good();
+    std::remove((path + ".3").c_str());
+    return ok;
+}
+
 static int run_jitter_tests()
 {
     struct Test
@@ -1982,8 +1926,8 @@ static int run_jitter_tests()
         {"reorder: all frames received        ", test_jitter_reorder_complete},
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
         {"callback retains until release      ", test_jitter_callback_retains_until_release},
-        {"stats counters clear after read    ", test_jitter_stats_counters_clear_after_read},
-        {"idle stats clear input estimates   ", test_jitter_idle_stats_do_not_retain_previous_input},
+        {"stats snapshot is stable           ", test_jitter_stats_snapshot_is_stable},
+        {"idle snapshot is stable            ", test_jitter_idle_snapshot_is_stable},
         {"in-order prefill is not reorder     ", test_jitter_inorder_prefill_not_reorder},
         {"in-order backlog is not pressure    ", test_jitter_inorder_backlog_not_pressure},
         {"auto depth bounded after reorder    ", test_jitter_depth_recovers},
@@ -2005,6 +1949,7 @@ static int run_jitter_tests()
         {"QS continuity break revokes         ", test_qs_estimator_continuity_break_revokes_immediate},
         {"QS delivery jitter revokes          ", test_qs_estimator_delivery_jitter_revokes_immediate},
         {"QS two-frame interval allowed       ", test_qs_estimator_two_frame_interval_allowed},
+        {"queue stats CSV rotation            ", test_queue_stats_csv_writer_rotation},
         {"send queue fill API                 ", test_send_queue_fill},
     };
 

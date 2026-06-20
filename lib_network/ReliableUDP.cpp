@@ -224,6 +224,12 @@ void ReliableUDP::start()
     start_receive();
 }
 
+void ReliableUDP::set_receive_callback(RecvCallBack callback)
+{
+    stats_writer_.start(std::chrono::steady_clock::now());
+    usr_queue_->start(std::move(callback));
+}
+
 bool ReliableUDP::add_destination(const std::string &address, unsigned short port)
 {
     if (!running_)
@@ -288,6 +294,7 @@ void ReliableUDP::stop()
     probe_timer_.cancel();
     send_queue_->stop();
     usr_queue_->stop();
+    stats_writer_.stop(std::chrono::steady_clock::now(), usr_queue_->stats_snapshot());
 }
 
 double ReliableUDP::lost_rate()
@@ -330,11 +337,6 @@ int64_t ReliableUDP::offset_ms() const
 bool ReliableUDP::is_time_synced() const
 {
     return clock_sync_.is_time_synced();
-}
-
-std::string ReliableUDP::queue_stats_text() const
-{
-    return usr_queue_->stats_text();
 }
 
 double ReliableUDP::send_rate()
@@ -1010,6 +1012,7 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
         {
             VIDEO_ERROR_PRINT("Failed to enqueue received message");
         }
+        stats_writer_.on_frame(std::chrono::steady_clock::now(), usr_queue_->stats_snapshot());
         recv_pool_.deallocate(complete_message);
         receive_frames_.erase(it);
     }

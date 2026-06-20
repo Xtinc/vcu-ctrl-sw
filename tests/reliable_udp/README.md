@@ -44,6 +44,14 @@ destination so the built-in RTT/clock-offset probes work in both directions.
 One-way latency is approximate; samples collected before clock synchronization
 are marked invalid and excluded by the analyzer.
 
+Receiver-side `ReliableUDP` writes `queue_stats.csv` in the process working
+directory. A row is emitted on the receive path roughly every 100 ms without a
+timer or an additional thread. Gaps longer than five seconds start a new
+`segment_id`; `idle_gap_ms` records the observed gap so plots do not connect
+unrelated traffic segments. The active file rotates at 64 MiB into
+`queue_stats.csv.1` through `queue_stats.csv.3`, bounding retained queue
+statistics to approximately 256 MiB.
+
 Copy `sender_out/sender_summary.txt` to the analysis host, then run:
 
 ```sh

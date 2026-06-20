@@ -313,18 +313,6 @@ double DecMgr::lost_rate() const
     return receiver->lost_rate();
 }
 
-std::string DecMgr::queue_stats_text() const
-{
-    if (!m_running.load(std::memory_order_acquire))
-        return std::string{};
-
-    auto receiver = m_receiver;
-    if (!receiver)
-        return std::string{};
-
-    return receiver->queue_stats_text();
-}
-
 int64_t DecMgr::rtt_ms() const
 {
     if (!m_running.load(std::memory_order_acquire))

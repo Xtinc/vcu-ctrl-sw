@@ -26,6 +26,7 @@
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 extern "C"
@@ -43,10 +44,6 @@ constexpr size_t SEND_INTERVAL_RESERVOIR_SIZE = 65536;
 constexpr size_t RECENT_SEQUENCE_WINDOW_SIZE = 4096;
 constexpr const char *ARRIVAL_HEADER =
     "elapsed_ms,seq,interval_ms,latency_ms,qs_immediate";
-constexpr const char *STATS_HEADER =
-    "elapsed_ms,q_avg_fi_ms,q_out_fi_ms,q_tail_jitter_frames,q_disorder_frames,q_buffered_frames,"
-    "q_adaptive_depth,q_depth_raw,q_pressure_frames,q_skip_delta,q_drop_delta,q_late_delta,"
-    "q_reorder_delta,q_stale_delta,q_ovf_delta";
 
 struct NetworkHeader
 {
@@ -67,7 +64,6 @@ struct Config
     uint16_t local_port = 15301;
     uint16_t peer_port = 15302;
     uint32_t duration_sec = 30;
-    uint32_t stats_period_ms = 100;
     size_t payload_bytes = 1200;
     double rate_mbps = 5.0;
 };
@@ -257,42 +253,31 @@ std::string path_join(const std::string &dir, const std::string &name)
     return dir.empty() || dir.back() == '/' || dir.back() == '\\' ? dir + name : dir + "/" + name;
 }
 
-std::string stat_value(const std::string &stats, const std::string &key)
+std::string absolute_path(const std::string &path)
 {
-    const auto pos = stats.find(key);
-    if (pos == std::string::npos)
-        return "0";
-    const auto begin = pos + key.size();
-    const auto end = stats.find(',', begin);
-    return stats.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+#if defined(_WIN32)
+    if (path.size() > 1 && path[1] == ':')
+        return path;
+    char cwd[_MAX_PATH]{};
+    if (!_getcwd(cwd, sizeof(cwd)))
+        throw std::runtime_error("cannot determine current directory");
+#else
+    if (!path.empty() && path[0] == '/')
+        return path;
+    char cwd[4096]{};
+    if (!::getcwd(cwd, sizeof(cwd)))
+        throw std::runtime_error("cannot determine current directory");
+#endif
+    return path_join(cwd, path);
 }
 
-double part(const std::string &value, size_t index = 0)
+bool change_directory(const std::string &path)
 {
-    size_t begin = 0;
-    for (size_t i = 0; i < index; ++i)
-    {
-        begin = value.find('/', begin);
-        if (begin == std::string::npos)
-            return 0.0;
-        ++begin;
-    }
-    return std::strtod(value.c_str() + begin, nullptr);
-}
-
-void write_stats_row(std::ofstream &csv, ReliableUDP &udp, double elapsed)
-{
-    const auto stats = udp.queue_stats_text();
-    const auto tail = stat_value(stats, "q_tail_jitter=");
-    const auto disorder = stat_value(stats, "q_dis=");
-    const auto depth = stat_value(stats, "q_depth=");
-    csv << std::fixed << std::setprecision(3) << elapsed << ','
-        << part(stat_value(stats, "q_avg_fi=")) << ',' << part(stat_value(stats, "q_out_fi=")) << ','
-        << part(tail, 1) << ',' << part(disorder) << ',' << part(depth) << ',' << part(depth, 1) << ','
-        << part(stat_value(stats, "q_depth_raw=")) << ',' << part(stat_value(stats, "q_pressure=")) << ','
-        << part(stat_value(stats, "q_skip=")) << ',' << part(stat_value(stats, "q_drop=")) << ','
-        << part(stat_value(stats, "q_late=")) << ',' << part(stat_value(stats, "q_reorder=")) << ','
-        << part(stat_value(stats, "q_stale=")) << ',' << part(stat_value(stats, "q_ovf=")) << '\n';
+#if defined(_WIN32)
+    return _chdir(path.c_str()) == 0;
+#else
+    return ::chdir(path.c_str()) == 0;
+#endif
 }
 
 void fill_frame(uint8_t *data, size_t size, uint32_t seq)
@@ -318,8 +303,7 @@ Config parse_args(int argc, char **argv)
         {
             std::cout << "Usage: " << argv[0]
                       << " --role sender|receiver --peer-address <ip> [--local-port n] [--peer-port n]"
-                         " [--duration n] [--rate-mbps f] [--payload-bytes n] [--stats-period-ms n]"
-                         " [--out-dir path]\n";
+                         " [--duration n] [--rate-mbps f] [--payload-bytes n] [--out-dir path]\n";
             std::exit(0);
         }
         if (i + 1 >= argc)
@@ -332,7 +316,6 @@ Config parse_args(int argc, char **argv)
         else if (arg == "--duration") cfg.duration_sec = static_cast<uint32_t>(std::stoul(value));
         else if (arg == "--rate-mbps") cfg.rate_mbps = std::stod(value);
         else if (arg == "--payload-bytes") cfg.payload_bytes = static_cast<size_t>(std::stoul(value));
-        else if (arg == "--stats-period-ms") cfg.stats_period_ms = static_cast<uint32_t>(std::stoul(value));
         else if (arg == "--out-dir") cfg.out_dir = value;
         else throw std::runtime_error("unknown option: " + arg);
     }
@@ -342,7 +325,6 @@ Config parse_args(int argc, char **argv)
         throw std::runtime_error("--peer-address is required");
     cfg.payload_bytes = std::max(cfg.payload_bytes, sizeof(NetworkHeader));
     cfg.payload_bytes = std::min(cfg.payload_bytes, MAX_TRX_UDP_SIZE);
-    cfg.stats_period_ms = std::max<uint32_t>(cfg.stats_period_ms, 10);
     cfg.duration_sec = std::max<uint32_t>(cfg.duration_sec, 1);
     cfg.rate_mbps = std::max(0.0, cfg.rate_mbps);
     return cfg;
@@ -438,9 +420,10 @@ void run_receiver(const Config &cfg)
 {
     if (!make_dirs(cfg.out_dir))
         throw std::runtime_error("cannot create output directory " + cfg.out_dir);
-    ReceiverState state(SteadyClock::now(), path_join(cfg.out_dir, "arrival_intervals.csv"));
-    std::ofstream stats(path_join(cfg.out_dir, "queue_stats.csv"));
-    stats << STATS_HEADER << '\n';
+    const auto output_dir = absolute_path(cfg.out_dir);
+    if (!change_directory(output_dir))
+        throw std::runtime_error("cannot enter output directory " + output_dir);
+    ReceiverState state(SteadyClock::now(), "arrival_intervals.csv");
 
     std::shared_ptr<ReliableUDP> udp;
     udp = std::make_shared<ReliableUDP>(BG_SERVICE, cfg.local_port);
@@ -489,8 +472,6 @@ void run_receiver(const Config &cfg)
     std::cout << "Receiver capture keeps full per-frame CSV data; allow about 450 MB for a 24-hour run.\n";
     const auto first_deadline = SteadyClock::now() + std::chrono::seconds(60);
     SteadyClock::time_point capture_deadline{};
-    auto next_stats = SteadyClock::now();
-    const auto stats_period = std::chrono::milliseconds(cfg.stats_period_ms);
     while (true)
     {
         const auto now = SteadyClock::now();
@@ -501,12 +482,7 @@ void run_receiver(const Config &cfg)
         if (capture_deadline != SteadyClock::time_point{} && now >= capture_deadline)
             break;
 
-        if (now >= next_stats)
-        {
-            write_stats_row(stats, *udp, elapsed_ms(state.start, now));
-            state.flush_if_due(now);
-            next_stats = now + stats_period;
-        }
+        state.flush_if_due(now);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     const bool synced = udp->is_time_synced();
@@ -514,9 +490,8 @@ void run_receiver(const Config &cfg)
     const auto offset = udp->offset_ms();
     udp->stop();
     state.arrivals.flush();
-    stats.flush();
 
-    std::ofstream summary(path_join(cfg.out_dir, "receiver_summary.txt"));
+    std::ofstream summary("receiver_summary.txt");
     write_common_summary(summary, cfg);
     summary << "clock_synced=" << (synced ? 1 : 0) << '\n' << "rtt_ms=" << rtt << '\n'
             << "offset_ms=" << offset << '\n' << "received_count=" << state.received << '\n'

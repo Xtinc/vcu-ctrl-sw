@@ -2,8 +2,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <iomanip>
-#include <sstream>
 
 extern "C"
 {
@@ -532,7 +530,7 @@ void RecvQueueAsync::reset_state_locked()
     buffer_ctl_.reset(tuning_.initial_depth);
     qs_est_.reset();
     qs_events_ = {};
-    counters_ = Counters{};
+    stats_ = QueueStatsSnapshot{};
 }
 
 void RecvQueueAsync::clear_buffered_frames_locked()
@@ -658,12 +656,12 @@ void RecvQueueAsync::purge_stale_locked(ClockTP now)
         ++stale_count;
     }
 
-    counters_.drop += stale_count;
-    counters_.stale += stale_count;
+    stats_.drop += stale_count;
+    stats_.stale += stale_count;
 
     const uint32_t resume_seq = buffered_frames_.empty() ? last_stale_seq + 1 : buffered_frames_.front().seq;
     const uint64_t skipped = resume_seq > expected_seq_ ? static_cast<uint64_t>(resume_seq - expected_seq_) : 0;
-    counters_.skip += skipped;
+    stats_.skip += skipped;
 
     QSEstimator::Events events;
     events.drop = stale_count;
@@ -694,11 +692,11 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     if (!running_)
         return false;
 
-    ++counters_.recv;
+    ++stats_.recv;
 
     if (primed_ && abs_seq < expected_seq_)
     {
-        ++counters_.late;
+        ++stats_.late;
         QSEstimator::Events events;
         events.late = 1;
         note_qs_event_locked(events);
@@ -712,7 +710,7 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         ++it;
     if (it != buffered_frames_.end() && it->seq == abs_seq)
     {
-        ++counters_.duplicate;
+        ++stats_.duplicate;
         return false;
     }
 
@@ -725,7 +723,7 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     const uint32_t prev_reorder_cnt = reorder_est_.reorder_cnt;
     arrival_est_.note(abs_seq, arrival, tuning_.max_depth);
     reorder_est_.note(abs_seq, tuning_.max_depth);
-    counters_.reorder += reorder_est_.reorder_cnt - prev_reorder_cnt;
+    stats_.reorder += reorder_est_.reorder_cnt - prev_reorder_cnt;
     update_adaptive_depth_locked();
 
     while (buffered_frames_.size() > tuning_.max_depth)
@@ -733,8 +731,8 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         VIDEO_DEBUG_PRINT("[JitterBuf] buffered frames overflow: size=%zu max=%zu", buffered_frames_.size(),
                           tuning_.max_depth);
         auto tail = std::prev(buffered_frames_.end());
-        ++counters_.drop;
-        ++counters_.overflow;
+        ++stats_.drop;
+        ++stats_.overflow;
         QSEstimator::Events events;
         events.drop = 1;
         events.overflow = 1;
@@ -748,42 +746,36 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     return true;
 }
 
-std::string RecvQueueAsync::stats_text() const
+QueueStatsSnapshot RecvQueueAsync::stats_snapshot_locked() const
+{
+    const double interval_ms = estimated_interval_ms_locked();
+    const double effective_disorder_frames = std::max(reorder_est_.depth_frames, reorder_est_.guard_depth_frames);
+    const double output_interval_ms = compute_delivery_interval_locked();
+
+    QueueStatsSnapshot out = stats_;
+    out.avg_frame_interval_ms = interval_ms;
+    out.feedback_interval_ms = output_interval_ms - interval_ms;
+    out.output_interval_ms = output_interval_ms;
+    out.jitter_ms = arrival_est_.jitter_avg;
+    out.jitter_frames = arrival_est_.jitter_avg / interval_ms;
+    out.tail_jitter_ms = arrival_est_.jitter_tail;
+    out.tail_jitter_frames = arrival_est_.jitter_tail / interval_ms;
+    out.disorder_frames = effective_disorder_frames;
+    out.max_disorder_depth = reorder_est_.max_disorder_depth;
+    out.buffered_frames = buffered_frames_.size();
+    out.adaptive_depth = buffer_ctl_.adaptive_depth;
+    out.raw_depth_frames = buffer_ctl_.raw_depth_frames;
+    out.depth_error_frames =
+        static_cast<double>(buffered_frames_.size()) - static_cast<double>(buffer_ctl_.adaptive_depth);
+    out.pressure_frames = buffer_ctl_.pressure_frames_remaining;
+    out.pacing_factor = output_interval_ms / interval_ms;
+    return out;
+}
+
+QueueStatsSnapshot RecvQueueAsync::stats_snapshot() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-
-    if (counters_.recv == 0)
-    {
-        counters_ = {};
-        return "q_avg_fi=0.00ms, q_fb_fi=0.00ms, q_out_fi=0.00ms, q_jitter=0.00ms/0.00f, "
-               "q_tail_jitter=0.00ms/0.00f, q_dis=0.00f/0, q_depth=0/0, q_depth_err=0.00, "
-               "q_depth_raw=0.00, q_pressure=0, q_pace=0.00, q_recv=0, q_dlv=0, q_skip=0, "
-               "q_drop=0, q_dup=0, q_late=0, q_reorder=0, q_stale=0, q_ovf=0";
-    }
-
-    const double interval_ms = estimated_interval_ms_locked();
-    const double jitter_frames = arrival_est_.jitter_avg / interval_ms;
-    const double tail_jitter_frames = arrival_est_.jitter_tail / interval_ms;
-    const double effective_disorder_frames = std::max(reorder_est_.depth_frames, reorder_est_.guard_depth_frames);
-    const double depth_error_frames =
-        static_cast<double>(buffered_frames_.size()) - static_cast<double>(buffer_ctl_.adaptive_depth);
-    const double output_interval_ms = compute_delivery_interval_locked();
-    const double pacing_factor = output_interval_ms / interval_ms;
-    const double feedback_interval_ms = output_interval_ms - interval_ms;
-
-    std::ostringstream os;
-    os << std::fixed << std::setprecision(2) << "q_avg_fi=" << interval_ms << "ms, q_fb_fi=" << feedback_interval_ms
-       << "ms, q_out_fi=" << output_interval_ms << "ms, q_jitter=" << arrival_est_.jitter_avg << "ms/" << jitter_frames
-       << "f, q_tail_jitter=" << arrival_est_.jitter_tail << "ms/" << tail_jitter_frames
-       << "f, q_dis=" << effective_disorder_frames << "f/" << reorder_est_.max_disorder_depth
-       << ", q_depth=" << buffered_frames_.size() << '/' << buffer_ctl_.adaptive_depth
-       << ", q_depth_err=" << depth_error_frames << ", q_depth_raw=" << buffer_ctl_.raw_depth_frames
-       << ", q_pressure=" << buffer_ctl_.pressure_frames_remaining << ", q_pace=" << pacing_factor
-       << ", q_recv=" << counters_.recv << ", q_dlv=" << counters_.deliver << ", q_skip=" << counters_.skip
-       << ", q_drop=" << counters_.drop << ", q_dup=" << counters_.duplicate << ", q_late=" << counters_.late
-       << ", q_reorder=" << counters_.reorder << ", q_stale=" << counters_.stale << ", q_ovf=" << counters_.overflow;
-    counters_ = {};
-    return os.str();
+    return stats_snapshot_locked();
 }
 
 void RecvQueueAsync::handle_gap_locked(std::unique_lock<std::mutex> &lock, ClockTP now)
@@ -862,7 +854,7 @@ void RecvQueueAsync::worker_thread()
 
         if (buffered_frames_.front().seq < expected_seq_)
         {
-            ++counters_.drop;
+            ++stats_.drop;
             QSEstimator::Events events;
             events.drop = 1;
             note_qs_event_locked(events);
@@ -898,7 +890,7 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
     next_delivery_time_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                     std::chrono::duration<double, std::milli>(compute_delivery_interval_locked()));
 
-    ++counters_.deliver;
+    ++stats_.deliver;
     delivered_frames_.push_back({frame.data, frame.size});
 
     bool should_release = true;
@@ -934,7 +926,7 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
         expected_seq_, next_available_seq, missing, buffered_frames_.size(), interval_ms, arrival_est_.jitter_avg,
         reorder_est_.depth_frames);
 
-    counters_.skip += missing;
+    stats_.skip += missing;
     QSEstimator::Events events;
     events.skip = missing;
     note_qs_event_locked(events);

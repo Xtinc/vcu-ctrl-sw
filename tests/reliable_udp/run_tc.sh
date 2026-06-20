@@ -10,7 +10,6 @@ OUT_DIR="${ROOT_DIR}/reliable_udp_jitter_out/tc_$(date +%Y%m%d_%H%M%S)"
 DURATION=30
 RATE_MBPS=5
 PAYLOAD_BYTES=1200
-STATS_PERIOD_MS=100
 DO_BUILD=1
 DO_CLEANUP=1
 DO_PLOT=1
@@ -37,7 +36,6 @@ Options:
                              ignored for --preset staged, which derives duration from the stage file
   --rate-mbps <value>      ReliableUDP send rate (default: 5)
   --payload-bytes <n>      message size including test header (default: 1200)
-  --stats-period-ms <n>    stats sampling period (default: 100)
   --build | --no-build     build test target before run (default: --build)
   --plot | --no-plot       run Python plotter after capture (default: --plot)
   --cleanup | --no-cleanup remove tc qdisc on exit (default: --cleanup)
@@ -86,10 +84,6 @@ while [[ $# -gt 0 ]]; do
         ;;
     --payload-bytes)
         PAYLOAD_BYTES="$2"
-        shift 2
-        ;;
-    --stats-period-ms)
-        STATS_PERIOD_MS="$2"
         shift 2
         ;;
     --build)
@@ -343,7 +337,6 @@ init_tc
     --duration "${TEST_DURATION}" \
     --rate-mbps "${RATE_MBPS}" \
     --payload-bytes "${PAYLOAD_BYTES}" \
-    --stats-period-ms "${STATS_PERIOD_MS}" \
     --out-dir "${OUT_DIR}" &
 TEST_PID=$!
 

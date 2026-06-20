@@ -28,7 +28,7 @@ OBSOLETE_OUTPUTS = {
     "queue_counters.png", "network_vs_controller.png", "latency_ideal_vs_actual.png",
     "parameter_influence.png",
 }
-ARRIVAL_COLUMNS = {"elapsed_ms", "seq", "interval_ms", "latency_ms", "qs_immediate"}
+ARRIVAL_COLUMNS = {"elapsed_ms", "seq", "interval_ms", "latency_ms"}
 QUEUE_COLUMNS = {
     "elapsed_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_frames",
     "q_buffered_frames", "q_adaptive_depth", "q_depth_raw", "q_pressure_frames",
@@ -85,15 +85,25 @@ class SampleStats:
         }
 
 
-def csv_rows(path, required):
-    with open(path, newline="") as stream:
-        reader = csv.DictReader(stream)
-        fields = set(reader.fieldnames or ())
-        missing = sorted(required - fields)
-        if missing:
-            raise SystemExit("{} is missing required columns: {}".format(path, ", ".join(missing)))
-        for row in reader:
-            yield row
+def csv_rows(path, required, include_rotated=False):
+    paths = [path]
+    if include_rotated:
+        archives = []
+        index = 1
+        while os.path.exists("{}.{}".format(path, index)):
+            archives.append("{}.{}".format(path, index))
+            index += 1
+        paths = list(reversed(archives)) + paths
+
+    for current_path in paths:
+        with open(current_path, newline="") as stream:
+            reader = csv.DictReader(stream)
+            fields = set(reader.fieldnames or ())
+            missing = sorted(required - fields)
+            if missing:
+                raise SystemExit("{} is missing required columns: {}".format(current_path, ", ".join(missing)))
+            for row in reader:
+                yield row
 
 
 def read_summary(path):
@@ -271,10 +281,19 @@ def process_queue(path, stages, stage_metrics):
     buffered_stats = SampleStats()
     target_stats = SampleStats()
     events = {"skip": 0.0, "late": 0.0, "overflow": 0.0, "drop": 0.0, "stale": 0.0, "reorder": 0.0}
+    gaps = []
+    previous_segment = None
     row_count = 0
-    for row in csv_rows(path, QUEUE_COLUMNS):
+    for row in csv_rows(path, QUEUE_COLUMNS, include_rotated=True):
         row_count += 1
         timestamp = as_float(row, "elapsed_ms") / 1000.0
+        segment = int(as_float(row, "segment_id", 1.0))
+        if previous_segment is not None and segment != previous_segment:
+            for key in keys:
+                plot[key].append(float("nan"))
+            plot["t"].append(timestamp)
+            gaps.append({"time": timestamp, "idle_ms": as_float(row, "idle_gap_ms"), "segment": segment})
+        previous_segment = segment
         values = {key: as_float(row, key) for key in keys}
         if values["q_avg_fi_ms"] > 0.0:
             input_stats.add(values["q_avg_fi_ms"])
@@ -300,7 +319,7 @@ def process_queue(path, stages, stage_metrics):
         plot["t"].append(timestamp)
         for key in keys:
             plot[key].append(values[key])
-    return {"count": row_count, "plot": plot, "input": input_stats.summary(),
+    return {"count": row_count, "plot": plot, "gaps": gaps, "input": input_stats.summary(),
             "output": output_stats.summary(), "buffered": buffered_stats.summary(),
             "target": target_stats.summary(), "events": events}
 

@@ -192,19 +192,18 @@ int main(int argc, char *argv[])
             const double dec_fps = dec_mgr.fps();
             const double recv_bps = dec_mgr.recv_rate();
             const double lost = dec_mgr.lost_rate();
-            const std::string queue_stats = dec_mgr.queue_stats_text();
             const int64_t rtt = dec_mgr.rtt_ms();
             const int64_t offset = dec_mgr.offset_ms();
             if (rtt >= 0)
             {
-                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, lost=%.2f%%, rtt=%" PRId64
-                                 "ms, offset=%" PRId64 "ms, %s",
-                                 dec_fps, recv_bps, lost * 100.0, rtt, offset, queue_stats.c_str());
+                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, lost=%.2f%%, rtt=%" PRId64 "ms, offset=%" PRId64
+                                 "ms",
+                                 dec_fps, recv_bps, lost * 100.0, rtt, offset);
             }
             else
             {
-                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, lost=%.2f%%, rtt=N/A, %s", dec_fps, recv_bps,
-                                 lost * 100.0, queue_stats.c_str());
+                VIDEO_INFO_PRINT("Dec stats: fps=%.2f, recv_bps=%.0f, lost=%.2f%%, rtt=N/A", dec_fps, recv_bps,
+                                 lost * 100.0);
             }
             continue;
         }
