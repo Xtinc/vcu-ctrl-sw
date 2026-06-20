@@ -7,11 +7,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -37,14 +39,14 @@ using SteadyClock = std::chrono::steady_clock;
 using SystemClock = std::chrono::system_clock;
 
 constexpr uint32_t TEST_MAGIC = 0x524a4e54u; // RJNT
+constexpr size_t SEND_INTERVAL_RESERVOIR_SIZE = 65536;
+constexpr size_t RECENT_SEQUENCE_WINDOW_SIZE = 4096;
 constexpr const char *ARRIVAL_HEADER =
-    "elapsed_ms,seq,interval_ms,latency_ms,size_bytes,clock_synced,rtt_ms,offset_ms";
+    "elapsed_ms,seq,interval_ms,latency_ms,qs_immediate";
 constexpr const char *STATS_HEADER =
-    "elapsed_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,q_jitter_frames,q_disorder_frames,"
-    "q_max_disorder_depth,q_tail_jitter_ms,q_tail_jitter_frames,q_buffered_frames,q_adaptive_depth,"
-    "q_depth_raw,q_depth_error_frames,q_pressure_frames,q_pacing_factor,q_recv_delta,q_dlv_delta,"
-    "q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta,"
-    "recv_rate_bps,lost_rate";
+    "elapsed_ms,q_avg_fi_ms,q_out_fi_ms,q_tail_jitter_frames,q_disorder_frames,q_buffered_frames,"
+    "q_adaptive_depth,q_depth_raw,q_pressure_frames,q_skip_delta,q_drop_delta,q_late_delta,"
+    "q_reorder_delta,q_stale_delta,q_ovf_delta";
 
 struct NetworkHeader
 {
@@ -70,20 +72,94 @@ struct Config
     double rate_mbps = 5.0;
 };
 
-struct State
+struct IntervalStats
 {
-    explicit State(SteadyClock::time_point start) : start(start) {}
+    IntervalStats() : rng(0x524a4e54u)
+    {
+        sample.reserve(SEND_INTERVAL_RESERVOIR_SIZE);
+    }
+
+    void add(double value)
+    {
+        ++count;
+        sum += value;
+        maximum = std::max(maximum, value);
+        if (sample.size() < SEND_INTERVAL_RESERVOIR_SIZE)
+        {
+            sample.push_back(value);
+            return;
+        }
+        std::uniform_int_distribution<uint64_t> pick(0, count - 1);
+        const auto index = pick(rng);
+        if (index < sample.size())
+            sample[static_cast<size_t>(index)] = value;
+    }
+
+    std::vector<double> sorted_sample() const
+    {
+        auto sorted = sample;
+        std::sort(sorted.begin(), sorted.end());
+        return sorted;
+    }
+
+    uint64_t count = 0;
+    double sum = 0.0;
+    double maximum = 0.0;
+    std::vector<double> sample;
+    std::mt19937_64 rng;
+};
+
+struct SenderState
+{
+    explicit SenderState(SteadyClock::time_point start) : start(start) {}
     SteadyClock::time_point start;
+    uint64_t sent = 0;
+    uint64_t send_fail = 0;
+    IntervalStats intervals;
+};
+
+struct ReceiverState
+{
+    explicit ReceiverState(SteadyClock::time_point start, const std::string &arrival_path)
+        : start(start), next_flush(start + std::chrono::seconds(1)), arrivals(arrival_path)
+    {
+        arrivals << ARRIVAL_HEADER << '\n';
+    }
+
+    bool remember_sequence(uint32_t seq)
+    {
+        if (!recent_sequences.insert(seq).second)
+            return false;
+        sequence_order.push_back(seq);
+        if (sequence_order.size() > RECENT_SEQUENCE_WINDOW_SIZE)
+        {
+            recent_sequences.erase(sequence_order.front());
+            sequence_order.pop_front();
+        }
+        return true;
+    }
+
+    void flush_if_due(SteadyClock::time_point now)
+    {
+        if (now >= next_flush)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            arrivals.flush();
+            next_flush = now + std::chrono::seconds(1);
+        }
+    }
+
+    SteadyClock::time_point start;
+    SteadyClock::time_point next_flush;
     SteadyClock::time_point last_arrival{};
     bool has_last_arrival = false;
     std::atomic<bool> first_frame{false};
-    std::atomic<uint64_t> sent{0};
-    std::atomic<uint64_t> send_fail{0};
-    std::atomic<uint64_t> received{0};
-    std::atomic<uint64_t> integrity_errors{0};
-    std::atomic<uint64_t> duplicates{0};
+    uint64_t received = 0;
+    uint64_t integrity_errors = 0;
+    uint64_t duplicates = 0;
     std::mutex mutex;
-    std::set<uint32_t> seen;
+    std::set<uint32_t> recent_sequences;
+    std::deque<uint32_t> sequence_order;
     std::ofstream arrivals;
 };
 
@@ -207,22 +283,16 @@ double part(const std::string &value, size_t index = 0)
 void write_stats_row(std::ofstream &csv, ReliableUDP &udp, double elapsed)
 {
     const auto stats = udp.queue_stats_text();
-    const auto jitter = stat_value(stats, "q_jitter=");
     const auto tail = stat_value(stats, "q_tail_jitter=");
     const auto disorder = stat_value(stats, "q_dis=");
     const auto depth = stat_value(stats, "q_depth=");
     csv << std::fixed << std::setprecision(3) << elapsed << ','
-        << part(stat_value(stats, "q_avg_fi=")) << ',' << part(stat_value(stats, "q_fb_fi=")) << ','
-        << part(stat_value(stats, "q_out_fi=")) << ',' << part(jitter) << ',' << part(jitter, 1) << ','
-        << part(disorder) << ',' << part(disorder, 1) << ',' << part(tail) << ',' << part(tail, 1) << ','
-        << part(depth) << ',' << part(depth, 1) << ',' << part(stat_value(stats, "q_depth_raw=")) << ','
-        << part(stat_value(stats, "q_depth_err=")) << ',' << part(stat_value(stats, "q_pressure=")) << ','
-        << part(stat_value(stats, "q_pace=")) << ',' << part(stat_value(stats, "q_recv=")) << ','
-        << part(stat_value(stats, "q_dlv=")) << ',' << part(stat_value(stats, "q_skip=")) << ','
-        << part(stat_value(stats, "q_drop=")) << ',' << part(stat_value(stats, "q_dup=")) << ','
+        << part(stat_value(stats, "q_avg_fi=")) << ',' << part(stat_value(stats, "q_out_fi=")) << ','
+        << part(tail, 1) << ',' << part(disorder) << ',' << part(depth) << ',' << part(depth, 1) << ','
+        << part(stat_value(stats, "q_depth_raw=")) << ',' << part(stat_value(stats, "q_pressure=")) << ','
+        << part(stat_value(stats, "q_skip=")) << ',' << part(stat_value(stats, "q_drop=")) << ','
         << part(stat_value(stats, "q_late=")) << ',' << part(stat_value(stats, "q_reorder=")) << ','
-        << part(stat_value(stats, "q_stale=")) << ',' << part(stat_value(stats, "q_ovf=")) << ','
-        << udp.recv_rate() << ',' << udp.lost_rate() << '\n';
+        << part(stat_value(stats, "q_stale=")) << ',' << part(stat_value(stats, "q_ovf=")) << '\n';
 }
 
 void fill_frame(uint8_t *data, size_t size, uint32_t seq)
@@ -299,13 +369,12 @@ void run_sender(const Config &cfg)
     while (!udp->is_time_synced() && SteadyClock::now() < sync_deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-    State state(SteadyClock::now());
+    SenderState state(SteadyClock::now());
     const auto deadline = state.start + std::chrono::seconds(cfg.duration_sec);
     const double bytes_per_sec = cfg.rate_mbps * 1e6 / 8.0;
     double budget = static_cast<double>(cfg.payload_bytes);
     auto budget_time = SteadyClock::now();
     auto last_send_time = SteadyClock::time_point{};
-    std::vector<double> send_intervals_ms;
     uint32_t seq = 0;
     while (SteadyClock::now() < deadline)
     {
@@ -326,7 +395,7 @@ void run_sender(const Config &cfg)
         {
             const auto send_time = SteadyClock::now();
             if (last_send_time != SteadyClock::time_point{})
-                send_intervals_ms.push_back(elapsed_ms(last_send_time, send_time));
+                state.intervals.add(elapsed_ms(last_send_time, send_time));
             last_send_time = send_time;
             ++state.sent;
         }
@@ -340,11 +409,10 @@ void run_sender(const Config &cfg)
     const auto offset = udp->offset_ms();
     udp->stop();
 
-    std::sort(send_intervals_ms.begin(), send_intervals_ms.end());
-    const double interval_sum = std::accumulate(send_intervals_ms.begin(), send_intervals_ms.end(), 0.0);
-    const double interval_mean = send_intervals_ms.empty() ? 0.0 : interval_sum / send_intervals_ms.size();
+    const auto sorted_intervals = state.intervals.sorted_sample();
+    const double interval_mean = state.intervals.count == 0 ? 0.0 : state.intervals.sum / state.intervals.count;
     const double payload_rate_mbps = send_elapsed_sec > 0.0
-                                         ? static_cast<double>(state.sent.load() * cfg.payload_bytes) * 8.0 /
+                                         ? static_cast<double>(state.sent * cfg.payload_bytes) * 8.0 /
                                                send_elapsed_sec / 1e6
                                          : 0.0;
 
@@ -352,32 +420,31 @@ void run_sender(const Config &cfg)
     write_common_summary(summary, cfg);
     summary << std::fixed << std::setprecision(3)
             << "clock_synced=" << (synced ? 1 : 0) << '\n' << "rtt_ms=" << rtt << '\n'
-            << "offset_ms=" << offset << '\n' << "sent_count=" << state.sent.load() << '\n'
-            << "send_fail_count=" << state.send_fail.load() << '\n'
+            << "offset_ms=" << offset << '\n' << "sent_count=" << state.sent << '\n'
+            << "send_fail_count=" << state.send_fail << '\n'
             << "send_elapsed_sec=" << send_elapsed_sec << '\n'
             << "payload_rate_mbps=" << payload_rate_mbps << '\n'
-            << "send_interval_count=" << send_intervals_ms.size() << '\n'
+            << "send_interval_count=" << state.intervals.count << '\n'
+            << "send_interval_sample_count=" << sorted_intervals.size() << '\n'
             << "send_interval_mean_ms=" << interval_mean << '\n'
-            << "send_interval_p50_ms=" << percentile(send_intervals_ms, 0.50) << '\n'
-            << "send_interval_p95_ms=" << percentile(send_intervals_ms, 0.95) << '\n'
-            << "send_interval_p99_ms=" << percentile(send_intervals_ms, 0.99) << '\n'
-            << "send_interval_max_ms=" << (send_intervals_ms.empty() ? 0.0 : send_intervals_ms.back()) << '\n';
-    std::cout << "Sender complete: sent=" << state.sent.load() << " failed=" << state.send_fail.load() << '\n';
+            << "send_interval_p50_ms=" << percentile(sorted_intervals, 0.50) << '\n'
+            << "send_interval_p95_ms=" << percentile(sorted_intervals, 0.95) << '\n'
+            << "send_interval_p99_ms=" << percentile(sorted_intervals, 0.99) << '\n'
+            << "send_interval_max_ms=" << state.intervals.maximum << '\n';
+    std::cout << "Sender complete: sent=" << state.sent << " failed=" << state.send_fail << '\n';
 }
 
 void run_receiver(const Config &cfg)
 {
     if (!make_dirs(cfg.out_dir))
         throw std::runtime_error("cannot create output directory " + cfg.out_dir);
-    State state(SteadyClock::now());
-    state.arrivals.open(path_join(cfg.out_dir, "arrival_intervals.csv"));
-    state.arrivals << ARRIVAL_HEADER << '\n';
+    ReceiverState state(SteadyClock::now(), path_join(cfg.out_dir, "arrival_intervals.csv"));
     std::ofstream stats(path_join(cfg.out_dir, "queue_stats.csv"));
     stats << STATS_HEADER << '\n';
 
     std::shared_ptr<ReliableUDP> udp;
     udp = std::make_shared<ReliableUDP>(BG_SERVICE, cfg.local_port);
-    udp->set_receive_callback([&state, &udp](const std::vector<QueueFrame> &frames, bool) {
+    udp->set_receive_callback([&state, &udp](const std::vector<QueueFrame> &frames, bool allow_immediate) {
         std::lock_guard<std::mutex> lock(state.mutex);
         for (const auto &frame : frames)
         {
@@ -395,7 +462,7 @@ void run_receiver(const Config &cfg)
                 ++state.integrity_errors;
                 continue;
             }
-            if (!state.seen.insert(header.seq).second)
+            if (!state.remember_sequence(header.seq))
             {
                 ++state.duplicates;
                 continue;
@@ -406,8 +473,8 @@ void run_receiver(const Config &cfg)
                                              static_cast<double>(header.send_wall_us) +
                                              static_cast<double>(udp->offset_ms()) * 1000.0) / 1000.0 : -1.0;
             state.arrivals << std::fixed << std::setprecision(3) << elapsed_ms(state.start, steady_now) << ','
-                           << header.seq << ',' << interval << ',' << latency << ',' << frame.size << ','
-                           << (synced ? 1 : 0) << ',' << udp->rtt_ms() << ',' << udp->offset_ms() << '\n';
+                           << header.seq << ',' << interval << ',' << latency << ',' << (allow_immediate ? 1 : 0)
+                           << '\n';
             state.last_arrival = steady_now;
             state.has_last_arrival = true;
             state.first_frame = true;
@@ -419,28 +486,26 @@ void run_receiver(const Config &cfg)
     if (!udp->add_destination(cfg.peer_address, cfg.peer_port))
         throw std::runtime_error("add_destination failed");
 
+    std::cout << "Receiver capture keeps full per-frame CSV data; allow about 450 MB for a 24-hour run.\n";
     const auto first_deadline = SteadyClock::now() + std::chrono::seconds(60);
+    SteadyClock::time_point capture_deadline{};
     auto next_stats = SteadyClock::now();
-    while (!state.first_frame && SteadyClock::now() < first_deadline)
-    {
-        if (SteadyClock::now() >= next_stats)
-        {
-            write_stats_row(stats, *udp, elapsed_ms(state.start, SteadyClock::now()));
-            next_stats += std::chrono::milliseconds(cfg.stats_period_ms);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    if (!state.first_frame)
-        throw std::runtime_error("timed out waiting for the first valid frame");
-
-    const auto deadline = SteadyClock::now() + std::chrono::seconds(cfg.duration_sec + 3);
-    while (SteadyClock::now() < deadline)
+    const auto stats_period = std::chrono::milliseconds(cfg.stats_period_ms);
+    while (true)
     {
         const auto now = SteadyClock::now();
+        if (!state.first_frame && now >= first_deadline)
+            throw std::runtime_error("timed out waiting for the first valid frame");
+        if (state.first_frame && capture_deadline == SteadyClock::time_point{})
+            capture_deadline = now + std::chrono::seconds(cfg.duration_sec + 3);
+        if (capture_deadline != SteadyClock::time_point{} && now >= capture_deadline)
+            break;
+
         if (now >= next_stats)
         {
             write_stats_row(stats, *udp, elapsed_ms(state.start, now));
-            next_stats += std::chrono::milliseconds(cfg.stats_period_ms);
+            state.flush_if_due(now);
+            next_stats = now + stats_period;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -454,11 +519,11 @@ void run_receiver(const Config &cfg)
     std::ofstream summary(path_join(cfg.out_dir, "receiver_summary.txt"));
     write_common_summary(summary, cfg);
     summary << "clock_synced=" << (synced ? 1 : 0) << '\n' << "rtt_ms=" << rtt << '\n'
-            << "offset_ms=" << offset << '\n' << "received_count=" << state.received.load() << '\n'
-            << "integrity_errors=" << state.integrity_errors.load() << '\n'
-            << "duplicate_count=" << state.duplicates.load() << '\n';
-    std::cout << "Receiver complete: received=" << state.received.load()
-              << " errors=" << state.integrity_errors.load() << '\n';
+            << "offset_ms=" << offset << '\n' << "received_count=" << state.received << '\n'
+            << "integrity_errors=" << state.integrity_errors << '\n'
+            << "duplicate_count=" << state.duplicates << '\n';
+    std::cout << "Receiver complete: received=" << state.received
+              << " errors=" << state.integrity_errors << '\n';
 }
 } // namespace
 
