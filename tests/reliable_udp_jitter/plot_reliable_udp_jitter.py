@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import csv
 import math
 import os
-import sys
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
@@ -370,14 +370,15 @@ def write_assessment(out_dir, metrics):
 
 
 def main():
-    if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] != "--sender-summary"):
-        raise SystemExit(
-            "usage: python3 tests/reliable_udp_jitter/plot_reliable_udp_jitter.py "
-            "<receiver-out-dir> [--sender-summary <path>]"
-        )
+    parser = argparse.ArgumentParser(
+        description="Generate ReliableUDP jitter/controller plots from a capture directory."
+    )
+    parser.add_argument("out_dir", help="directory containing arrival_intervals.csv and queue_stats.csv")
+    parser.add_argument("--sender-summary", help="optional sender_summary.txt for end-to-end loss accounting")
+    args = parser.parse_args()
 
-    out_dir = sys.argv[1]
-    sender_summary = read_summary(sys.argv[3] if len(sys.argv) == 4 else "")
+    out_dir = args.out_dir
+    sender_summary = read_summary(args.sender_summary)
     arrival_path = os.path.join(out_dir, "arrival_intervals.csv")
     stats_path = os.path.join(out_dir, "queue_stats.csv")
     if not os.path.exists(arrival_path):
