@@ -1,5 +1,5 @@
-#ifndef QUEUE_STATS_CSV_WRITER_H
-#define QUEUE_STATS_CSV_WRITER_H
+#ifndef CSV_WRITER_H
+#define CSV_WRITER_H
 
 #include "QueueStats.h"
 #include <chrono>
@@ -8,14 +8,14 @@
 #include <mutex>
 #include <string>
 
-class QueueStatsCsvWriter
+class NetCSVWriter
 {
   public:
     using Clock = std::chrono::steady_clock;
 
-    explicit QueueStatsCsvWriter(std::string path = "queue_stats.csv", size_t max_file_bytes = 64u * 1024u * 1024u,
-                                 size_t archive_count = 3);
-    ~QueueStatsCsvWriter();
+    explicit NetCSVWriter(std::string path = "queue_stats.csv", size_t max_file_bytes = 64u * 1024u * 1024u,
+                          size_t archive_count = 3);
+    ~NetCSVWriter();
 
     void start(Clock::time_point now);
     void on_frame(Clock::time_point now, const QueueStatsSnapshot &stats);
@@ -48,4 +48,4 @@ class QueueStatsCsvWriter
     QueueStatsSnapshot baseline_;
 };
 
-#endif // QUEUE_STATS_CSV_WRITER_H
+#endif // CSV_WRITER_H

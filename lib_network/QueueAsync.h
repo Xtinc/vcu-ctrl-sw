@@ -89,7 +89,7 @@ class ROEstimator
     void reset();
     void note(uint32_t abs_seq, size_t max_seq_delta);
 
-    uint32_t reorder_cnt;
+    uint64_t reorder_cnt;
     uint32_t max_disorder_depth;
     double depth_frames;
     double guard_depth_frames;
@@ -104,17 +104,8 @@ class QSEstimator
   public:
     using ClockTP = std::chrono::steady_clock::time_point;
 
-    struct Events
-    {
-        uint64_t skip = 0;
-        uint64_t drop = 0;
-        uint64_t late = 0;
-        uint64_t stale = 0;
-        uint64_t overflow = 0;
-    };
-
     void reset();
-    bool note_delivery(ClockTP now, double expected_interval_ms, const Events &events);
+    bool note_delivery(ClockTP now, double expected_interval_ms, bool continuity_broken);
 
     bool allow_immediate = false;
 
@@ -191,7 +182,6 @@ class RecvQueueAsync
     double compute_delivery_interval_locked() const;
     void deliver_one_locked(std::unique_lock<std::mutex> &lock);
     void skip_gap_locked(uint32_t next_available_seq);
-    void note_qs_event_locked(const QSEstimator::Events &events);
     QueueStatsSnapshot stats_snapshot_locked() const;
 
     MemPool<6, 16> frame_pool_;
@@ -215,8 +205,15 @@ class RecvQueueAsync
     ROEstimator reorder_est_;
     BFController buffer_ctl_;
     QSEstimator qs_est_;
-    QSEstimator::Events qs_events_;
-    QueueStatsSnapshot stats_;
+    bool qs_continuity_broken_ = false;
+    uint64_t recv_count_ = 0;
+    uint64_t deliver_count_ = 0;
+    uint64_t skip_count_ = 0;
+    uint64_t drop_count_ = 0;
+    uint64_t duplicate_count_ = 0;
+    uint64_t late_count_ = 0;
+    uint64_t stale_count_ = 0;
+    uint64_t overflow_count_ = 0;
 };
 
 void set_current_thread_scheduler_policy();

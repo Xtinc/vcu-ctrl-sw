@@ -1,4 +1,4 @@
-#include "QueueStatsCsvWriter.h"
+#include "CSVWriter.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -16,10 +16,9 @@ namespace
 constexpr auto RECORD_PERIOD = std::chrono::milliseconds(100);
 constexpr auto IDLE_GAP = std::chrono::seconds(5);
 constexpr const char *CSV_HEADER =
-    "elapsed_ms,part_id,segment_id,idle_gap_ms,q_short_fi_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,"
-    "q_jitter_frames,"
-    "q_disorder_frames,q_max_disorder_depth,q_tail_jitter_ms,q_tail_jitter_frames,q_buffered_frames,"
-    "q_adaptive_depth,q_depth_raw,q_depth_error_frames,q_pressure_frames,q_pacing_factor,q_recv_delta,"
+    "elapsed_ms,part_id,segment_id,idle_gap_ms,q_short_fi_ms,q_avg_fi_ms,q_out_fi_ms,q_jitter_ms,"
+    "q_disorder_frames,q_max_disorder_depth,q_tail_jitter_ms,q_buffered_frames,q_adaptive_depth,q_depth_raw,"
+    "q_pressure_frames,q_recv_delta,"
     "q_dlv_delta,q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta";
 
 uint64_t delta(uint64_t current, uint64_t previous)
@@ -28,18 +27,18 @@ uint64_t delta(uint64_t current, uint64_t previous)
 }
 } // namespace
 
-QueueStatsCsvWriter::QueueStatsCsvWriter(std::string path, size_t max_file_bytes, size_t archive_count)
+NetCSVWriter::NetCSVWriter(std::string path, size_t max_file_bytes, size_t archive_count)
     : path_(std::move(path)), max_file_bytes_(max_file_bytes), archive_count_(archive_count)
 {
 }
 
-QueueStatsCsvWriter::~QueueStatsCsvWriter()
+NetCSVWriter::~NetCSVWriter()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     close();
 }
 
-void QueueStatsCsvWriter::start(Clock::time_point now)
+void NetCSVWriter::start(Clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     close();
@@ -56,7 +55,7 @@ void QueueStatsCsvWriter::start(Clock::time_point now)
     clear_files();
 }
 
-void QueueStatsCsvWriter::on_frame(Clock::time_point now, const QueueStatsSnapshot &stats)
+void NetCSVWriter::on_frame(Clock::time_point now, const QueueStatsSnapshot &stats)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!enabled_)
@@ -88,7 +87,7 @@ void QueueStatsCsvWriter::on_frame(Clock::time_point now, const QueueStatsSnapsh
     write(now, idle_gap_ms, stats);
 }
 
-void QueueStatsCsvWriter::stop(Clock::time_point now, const QueueStatsSnapshot &stats)
+void NetCSVWriter::stop(Clock::time_point now, const QueueStatsSnapshot &stats)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!enabled_)
@@ -110,7 +109,7 @@ void QueueStatsCsvWriter::stop(Clock::time_point now, const QueueStatsSnapshot &
     enabled_ = false;
 }
 
-void QueueStatsCsvWriter::write(Clock::time_point now, double idle_gap_ms, const QueueStatsSnapshot &stats)
+void NetCSVWriter::write(Clock::time_point now, double idle_gap_ms, const QueueStatsSnapshot &stats)
 {
     if (file_failed_)
         return;
@@ -133,12 +132,10 @@ void QueueStatsCsvWriter::write(Clock::time_point now, double idle_gap_ms, const
 
     file_ << std::fixed << std::setprecision(3) << elapsed << ',' << part_id_ << ',' << segment_id_ << ','
           << idle_gap_ms << ',' << std::setprecision(2) << stats.short_frame_interval_ms << ','
-          << stats.avg_frame_interval_ms << ','
-          << stats.feedback_interval_ms << ',' << stats.output_interval_ms << ',' << stats.jitter_ms << ','
-          << stats.jitter_frames << ',' << stats.disorder_frames << ',' << stats.max_disorder_depth << ','
-          << stats.tail_jitter_ms << ',' << stats.tail_jitter_frames << ',' << stats.buffered_frames << ','
-          << stats.adaptive_depth << ',' << stats.raw_depth_frames << ',' << stats.depth_error_frames << ','
-          << stats.pressure_frames << ',' << stats.pacing_factor << ',' << delta(stats.recv, previous.recv) << ','
+          << stats.avg_frame_interval_ms << ',' << stats.output_interval_ms << ',' << stats.jitter_ms << ','
+          << stats.disorder_frames << ',' << stats.max_disorder_depth << ',' << stats.tail_jitter_ms << ','
+          << stats.buffered_frames << ',' << stats.adaptive_depth << ',' << stats.raw_depth_frames << ','
+          << stats.pressure_frames << ',' << delta(stats.recv, previous.recv) << ','
           << delta(stats.deliver, previous.deliver) << ',' << delta(stats.skip, previous.skip) << ','
           << delta(stats.drop, previous.drop) << ',' << delta(stats.duplicate, previous.duplicate) << ','
           << delta(stats.late, previous.late) << ',' << delta(stats.reorder, previous.reorder) << ','
@@ -159,7 +156,7 @@ void QueueStatsCsvWriter::write(Clock::time_point now, double idle_gap_ms, const
     has_last_write_ = true;
 }
 
-bool QueueStatsCsvWriter::open()
+bool NetCSVWriter::open()
 {
     file_.open(path_, std::ios::out | std::ios::trunc);
     if (!file_)
@@ -180,7 +177,7 @@ bool QueueStatsCsvWriter::open()
     return true;
 }
 
-void QueueStatsCsvWriter::clear_files()
+void NetCSVWriter::clear_files()
 {
     close();
     std::remove(path_.c_str());
@@ -188,7 +185,7 @@ void QueueStatsCsvWriter::clear_files()
         std::remove(archive_path(index).c_str());
 }
 
-bool QueueStatsCsvWriter::rotate()
+bool NetCSVWriter::rotate()
 {
     close();
     if (archive_count_ == 0)
@@ -233,14 +230,14 @@ bool QueueStatsCsvWriter::rotate()
     return true;
 }
 
-void QueueStatsCsvWriter::close()
+void NetCSVWriter::close()
 {
     if (!file_.is_open())
         return;
     file_.close();
 }
 
-std::string QueueStatsCsvWriter::archive_path(size_t index) const
+std::string NetCSVWriter::archive_path(size_t index) const
 {
     return path_ + "." + std::to_string(index);
 }

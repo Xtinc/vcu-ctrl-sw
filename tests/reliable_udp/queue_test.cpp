@@ -6,7 +6,7 @@
  */
 
 #include "lib_network/QueueAsync.h"
-#include "lib_network/QueueStatsCsvWriter.h"
+#include "lib_network/CSVWriter.h"
 
 #include <algorithm>
 #include <array>
@@ -1077,7 +1077,8 @@ static bool test_jitter_feedforward_tracks_throughput_with_bounded_feedback()
 
     const auto pressure_stats = q.stats_snapshot();
     const double avg_interval_ms = pressure_stats.avg_frame_interval_ms;
-    const double pacing_factor = pressure_stats.pacing_factor;
+    const double pacing_factor =
+        avg_interval_ms > 0.0 ? pressure_stats.output_interval_ms / avg_interval_ms : 0.0;
     const auto buffered = pressure_stats.buffered_frames;
     const auto adaptive = pressure_stats.adaptive_depth;
 
@@ -1158,7 +1159,9 @@ static bool test_jitter_one_sided_fast_arrivals()
         std::cout << "  [one_sided_fast] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (stats.tail_jitter_frames > 0.75 || stats.adaptive_depth > 6)
+    const double tail_jitter_frames =
+        stats.avg_frame_interval_ms > 0.0 ? stats.tail_jitter_ms / stats.avg_frame_interval_ms : 0.0;
+    if (tail_jitter_frames > 0.75 || stats.adaptive_depth > 6)
     {
         std::cout << "  [one_sided_fast] compressed arrivals raised tail jitter/depth\n";
         return false;
@@ -1816,12 +1819,10 @@ static bool test_qs_estimator_stable_allows_immediate()
 {
     QSEstimator qs;
     const auto base = std::chrono::steady_clock::now();
-    QSEstimator::Events events;
-
     bool allowed = false;
     for (int i = 0; i <= 31; ++i)
     {
-        allowed = qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
+        allowed = qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false);
     }
 
     return allowed && qs.allow_immediate;
@@ -1831,35 +1832,29 @@ static bool test_qs_estimator_continuity_break_revokes_immediate()
 {
     QSEstimator qs;
     const auto base = std::chrono::steady_clock::now();
-    QSEstimator::Events events;
-
     for (int i = 0; i <= 31; ++i)
-        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false);
 
-    QSEstimator::Events broken;
-    broken.skip = 1;
-    if (qs.note_delivery(base + std::chrono::seconds(32), 1000.0, broken))
+    if (qs.note_delivery(base + std::chrono::seconds(32), 1000.0, true))
         return false;
 
     for (int i = 33; i < 63; ++i)
     {
-        if (qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events))
+        if (qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false))
             return false;
     }
 
-    return qs.note_delivery(base + std::chrono::seconds(63), 1000.0, events);
+    return qs.note_delivery(base + std::chrono::seconds(63), 1000.0, false);
 }
 
 static bool test_qs_estimator_delivery_jitter_revokes_immediate()
 {
     QSEstimator qs;
     const auto base = std::chrono::steady_clock::now();
-    QSEstimator::Events events;
-
     for (int i = 0; i <= 31; ++i)
-        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false);
 
-    return !qs.note_delivery(base + std::chrono::milliseconds(33500), 1000.0, events) &&
+    return !qs.note_delivery(base + std::chrono::milliseconds(33500), 1000.0, false) &&
            !qs.allow_immediate;
 }
 
@@ -1867,12 +1862,10 @@ static bool test_qs_estimator_two_frame_interval_allowed()
 {
     QSEstimator qs;
     const auto base = std::chrono::steady_clock::now();
-    QSEstimator::Events events;
-
     for (int i = 0; i <= 31; ++i)
-        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, events);
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false);
 
-    return qs.note_delivery(base + std::chrono::seconds(33), 1000.0, events) && qs.allow_immediate;
+    return qs.note_delivery(base + std::chrono::seconds(33), 1000.0, false) && qs.allow_immediate;
 }
 
 static bool test_queue_stats_csv_writer_rotation()
@@ -1887,7 +1880,7 @@ static bool test_queue_stats_csv_writer_rotation()
     const auto start = std::chrono::steady_clock::now();
     QueueStatsSnapshot snapshot;
     {
-        QueueStatsCsvWriter writer(path, 700, 2);
+        NetCSVWriter writer(path, 700, 2);
         writer.start(start);
         for (uint64_t index = 0; index < 30; ++index)
         {
@@ -1906,6 +1899,11 @@ static bool test_queue_stats_csv_writer_rotation()
         std::string header;
         ok = ok && static_cast<bool>(std::getline(input, header));
         ok = ok && header.find("elapsed_ms,part_id,segment_id,idle_gap_ms") == 0;
+        ok = ok && header.find("q_tail_jitter_ms") != std::string::npos;
+        ok = ok && header.find("q_fb_fi_ms") == std::string::npos;
+        ok = ok && header.find("q_tail_jitter_frames") == std::string::npos;
+        ok = ok && header.find("q_depth_error_frames") == std::string::npos;
+        ok = ok && header.find("q_pacing_factor") == std::string::npos;
         std::string row;
         if (std::getline(input, row))
         {

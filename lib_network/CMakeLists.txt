@@ -3,7 +3,7 @@ add_library(
     lib_network_obj
     OBJECT
     ClockWait.cpp
-    QueueStatsCsvWriter.cpp
+    CSVWriter.cpp
     ReliableUDP.cpp
     ReedSoloman.c
     QueueAsync.cpp)

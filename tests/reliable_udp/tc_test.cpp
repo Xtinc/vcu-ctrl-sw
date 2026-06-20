@@ -26,7 +26,7 @@ namespace
 using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t TEST_MAGIC = 0x524a5443u; // RJTC
-constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v6";
+constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v7";
 constexpr const char *ARRIVAL_CSV_HEADER = "elapsed_ms,seq,interval_ms,latency_ms,size_bytes";
 
 #pragma pack(push, 1)

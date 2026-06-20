@@ -30,7 +30,7 @@ OBSOLETE_OUTPUTS = {
 }
 ARRIVAL_COLUMNS = {"elapsed_ms", "seq", "interval_ms", "latency_ms"}
 QUEUE_COLUMNS = {
-    "elapsed_ms", "q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_frames",
+    "elapsed_ms", "q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_ms",
     "q_buffered_frames", "q_adaptive_depth", "q_depth_raw", "q_pressure_frames",
     "q_skip_delta", "q_drop_delta", "q_late_delta", "q_reorder_delta",
     "q_stale_delta", "q_ovf_delta",
@@ -301,6 +301,10 @@ def process_queue(path, stages, stage_metrics):
             gaps.append({"time": timestamp, "idle_ms": as_float(row, "idle_gap_ms"), "segment": segment})
         previous_segment = segment
         values = {key: as_float(row, key) for key in keys}
+        interval_ms = values["q_avg_fi_ms"]
+        values["q_tail_jitter_frames"] = (
+            as_float(row, "q_tail_jitter_ms") / interval_ms if interval_ms > 0.0 else 0.0
+        )
         if values["q_avg_fi_ms"] > 0.0:
             input_stats.add(values["q_avg_fi_ms"])
             if values["q_short_fi_ms"] > 0.0:

@@ -2,7 +2,7 @@
 #define RELIABLE_UDP_H
 
 #include "QueueAsync.h"
-#include "QueueStatsCsvWriter.h"
+#include "CSVWriter.h"
 #include "ReedSoloman.h"
 #include "asio.hpp"
 
@@ -325,7 +325,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
 
     asio::steady_timer probe_timer_;
     ClockSync clock_sync_;
-    QueueStatsCsvWriter stats_writer_;
+    NetCSVWriter stats_writer_;
 };
 
 #endif // RELIABLE_UDP_H
