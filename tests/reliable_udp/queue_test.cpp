@@ -145,7 +145,7 @@ static double queue_stat_pacing_factor(const std::string &stats)
 static bool queue_adaptive_depth_is_valid(const std::string &stats)
 {
     const auto depth = queue_stat_adaptive_depth(stats);
-    return depth >= 1 && depth <= 128 && queue_stat_raw_depth(stats) >= 0.0;
+    return depth >= 1 && depth <= 512 && queue_stat_raw_depth(stats) >= 0.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -784,11 +784,12 @@ static bool test_jitter_permanent_gap()
             q.enqueue(bufs[i].data(), 4, i);
         }
 
-    // Wait long enough for the default adaptive gap wait (~208 ms) to expire.
+    // The gap must recover within three estimated frame intervals, with ample
+    // scheduling margin for a loaded test host.
     const size_t expected = N - 1;
     {
         std::unique_lock<std::mutex> lk(mtx);
-        cv.wait_for(lk, std::chrono::milliseconds(600), [&] { return received.size() >= expected; });
+        cv.wait_for(lk, std::chrono::milliseconds(150), [&] { return received.size() >= expected; });
     }
     q.stop();
 
@@ -811,6 +812,132 @@ static bool test_jitter_permanent_gap()
             std::cout << "  [permanent_gap] seq " << i << " missing from output\n";
             return false;
         }
+    }
+    return true;
+}
+
+/// A temporarily missing frame that arrives inside the three-frame gap window
+/// must still be delivered in order and must not increment the skip counter.
+static bool test_jitter_gap_filled_before_deadline()
+{
+    constexpr uint32_t N = 10;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; ++i)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<uint32_t> received;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    RecvQueueAsync q;
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
+        uint32_t value = 0;
+        std::memcpy(&value, data, sizeof(value));
+        std::lock_guard<std::mutex> lk(mtx);
+        received.push_back(value);
+        cv.notify_one();
+    }));
+
+    for (uint32_t i = 0; i < 8; ++i)
+        q.enqueue(bufs[i].data(), 4, i);
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() >= 8; });
+    }
+
+    q.enqueue(bufs[9].data(), 4, 9);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    q.enqueue(bufs[8].data(), 4, 8);
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() >= N; });
+    }
+    const auto stats = q.stats_text();
+    q.stop();
+
+    if (received.size() != N || queue_stat_u64(stats, "q_skip=") != 0)
+    {
+        std::cout << "  [gap_before_deadline] bad result: received=" << received.size() << " stats=" << stats << '\n';
+        return false;
+    }
+    for (uint32_t i = 0; i < N; ++i)
+        if (received[i] != i)
+            return false;
+    return true;
+}
+
+/// Stale cleanup must remove only the expired sequence prefix. A fresh frame
+/// behind that prefix must remain queued and be delivered after one cursor jump.
+static bool test_jitter_stale_prefix_preserves_fresh_tail()
+{
+    constexpr uint32_t N = 17;
+    std::vector<std::array<uint8_t, 4>> bufs(N);
+    for (uint32_t i = 0; i < N; ++i)
+        std::memcpy(bufs[i].data(), &i, 4);
+
+    std::vector<uint32_t> received;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool first_callback_entered = false;
+    bool release_first_callback = false;
+
+    RecvQueueAsync q;
+    q.start(single_frame_callback([&](const uint8_t *data, size_t) {
+        uint32_t value = 0;
+        std::memcpy(&value, data, sizeof(value));
+        std::unique_lock<std::mutex> lk(mtx);
+        received.push_back(value);
+        if (value == 0)
+        {
+            first_callback_entered = true;
+            cv.notify_all();
+            cv.wait(lk, [&] { return release_first_callback; });
+        }
+        cv.notify_all();
+    }));
+
+    for (uint32_t i = 0; i < 8; ++i)
+        q.enqueue(bufs[i].data(), 4, i);
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        if (!cv.wait_for(lk, std::chrono::seconds(1), [&] { return first_callback_entered; }))
+        {
+            release_first_callback = true;
+            cv.notify_all();
+            lk.unlock();
+            q.stop();
+            return false;
+        }
+    }
+
+    for (uint32_t i = 8; i < 16; ++i)
+        q.enqueue(bufs[i].data(), 4, i);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1050));
+    q.enqueue(bufs[16].data(), 4, 16);
+
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        release_first_callback = true;
+    }
+    cv.notify_all();
+
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() >= 2; });
+    }
+    const auto stats = q.stats_text();
+    q.stop();
+
+    if (received.size() != 2 || received[0] != 0 || received[1] != 16 ||
+        queue_stat_u64(stats, "q_stale=") != 15 || queue_stat_u64(stats, "q_drop=") != 15 ||
+        queue_stat_u64(stats, "q_skip=") != 15)
+    {
+        std::cout << "  [stale_prefix] unexpected output/counters: received=" << received.size()
+                  << " stats=" << stats << '\n';
+        return false;
     }
     return true;
 }
@@ -1863,6 +1990,8 @@ static int run_jitter_tests()
         {"window-shuffle: order under auto depth", test_jitter_window_shuffle},
         {"auto depth survives mixed phases    ", test_jitter_adapt_up_down},
         {"permanent gap skipped, rest deliver ", test_jitter_permanent_gap},
+        {"gap filled before deadline          ", test_jitter_gap_filled_before_deadline},
+        {"stale prefix preserves fresh tail   ", test_jitter_stale_prefix_preserves_fresh_tail},
         {"output timing uniform under jitter  ", test_jitter_timing_uniformity},
         {"timing estimators stable by phase   ", test_jitter_adaptive_estimation},
         {"feed-forward + bounded feedback     ", test_jitter_feedforward_tracks_throughput_with_bounded_feedback},

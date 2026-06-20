@@ -504,6 +504,7 @@ void RecvQueueAsync::sanitize_tuning_locked()
     tuning_.initial_depth = clamp_value(tuning_.initial_depth, tuning_.min_depth, tuning_.max_depth);
 
     tuning_.stale_timeout_ms = std::max(tuning_.stale_timeout_ms, MIN_FRAME_INTERVAL_MS);
+    tuning_.gap_wait_frames = std::max(tuning_.gap_wait_frames, 1.0);
     tuning_.default_frame_interval_ms = std::max(tuning_.default_frame_interval_ms, MIN_FRAME_INTERVAL_MS);
     tuning_.depth_feedback_gain = clamp_value(tuning_.depth_feedback_gain, 0.0, 0.5);
     tuning_.min_pacing_factor = clamp_value(tuning_.min_pacing_factor, 0.1, 1.0);
@@ -524,6 +525,7 @@ void RecvQueueAsync::reset_state_locked()
     expected_seq_ = 0;
     next_delivery_time_ = ClockTP{};
     gap_start_time_ = ClockTP{};
+    gap_deadline_ = ClockTP{};
 
     arrival_est_.reset();
     reorder_est_.reset();
@@ -629,25 +631,56 @@ void RecvQueueAsync::drop_frame_locked(std::list<BufferedFrame>::iterator it)
 
 void RecvQueueAsync::purge_stale_locked(ClockTP now)
 {
+    if (!primed_ || buffered_frames_.empty())
+        return;
+
     const auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                   std::chrono::duration<double, std::milli>(tuning_.stale_timeout_ms));
-    for (auto it = buffered_frames_.begin(); it != buffered_frames_.end();)
-    {
-        if (it->arrival >= cutoff)
-        {
-            ++it;
-            continue;
-        }
+    if (buffered_frames_.front().arrival >= cutoff)
+        return;
 
-        ++counters_.drop;
-        ++counters_.stale;
-        QSEstimator::Events events;
-        events.drop = 1;
-        events.stale = 1;
-        note_qs_event_locked(events);
-        auto to_drop = it++;
-        drop_frame_locked(to_drop);
+    const size_t depth_before = buffered_frames_.size();
+    const uint32_t expected_before = expected_seq_;
+    const uint32_t first_stale_seq = buffered_frames_.front().seq;
+    uint32_t last_stale_seq = first_stale_seq;
+    uint64_t stale_count = 0;
+    double max_age_ms = 0.0;
+
+    // Only remove the stale sequence prefix. A later sequence may have an
+    // older arrival timestamp due to reassembly order; scanning the whole list
+    // would create holes ahead of the playback cursor.
+    while (!buffered_frames_.empty() && buffered_frames_.front().arrival < cutoff)
+    {
+        const auto &frame = buffered_frames_.front();
+        last_stale_seq = frame.seq;
+        max_age_ms = std::max(max_age_ms, std::chrono::duration<double, std::milli>(now - frame.arrival).count());
+        drop_frame_locked(buffered_frames_.begin());
+        ++stale_count;
     }
+
+    counters_.drop += stale_count;
+    counters_.stale += stale_count;
+
+    const uint32_t resume_seq = buffered_frames_.empty() ? last_stale_seq + 1 : buffered_frames_.front().seq;
+    const uint64_t skipped = resume_seq > expected_seq_ ? static_cast<uint64_t>(resume_seq - expected_seq_) : 0;
+    counters_.skip += skipped;
+
+    QSEstimator::Events events;
+    events.drop = stale_count;
+    events.stale = stale_count;
+    events.skip = skipped;
+    note_qs_event_locked(events);
+
+    if (resume_seq > expected_seq_)
+        expected_seq_ = resume_seq;
+    gap_start_time_ = ClockTP{};
+    gap_deadline_ = ClockTP{};
+    next_delivery_time_ = now;
+
+    VIDEO_DEBUG_PRINT(
+        "[JitterBuf] stale prefix drop seq=%u..%u count=%llu age_max=%.2fms expected=%u->%u depth=%zu->%zu",
+        first_stale_seq, last_stale_seq, static_cast<unsigned long long>(stale_count), max_age_ms, expected_before,
+        expected_seq_, depth_before, buffered_frames_.size());
 }
 
 bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
@@ -673,8 +706,6 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
         update_adaptive_depth_locked();
         return false;
     }
-
-    purge_stale_locked(arrival);
 
     auto it = buffered_frames_.begin();
     while (it != buffered_frames_.end() && it->seq < abs_seq)
@@ -761,24 +792,24 @@ void RecvQueueAsync::handle_gap_locked(std::unique_lock<std::mutex> &lock, Clock
         return;
 
     if (gap_start_time_ == ClockTP{})
+    {
         gap_start_time_ = now;
+        const double base_interval_ms = std::max(tuning_.default_frame_interval_ms, estimated_interval_ms_locked());
+        gap_deadline_ =
+            now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                      std::chrono::duration<double, std::milli>(base_interval_ms * tuning_.gap_wait_frames));
+    }
 
-    const double base_interval_ms = std::max(tuning_.default_frame_interval_ms, estimated_interval_ms_locked());
-    const double wait_ms = clamp_value(base_interval_ms * static_cast<double>(buffer_ctl_.adaptive_depth + 1),
-                                       base_interval_ms, tuning_.stale_timeout_ms);
-    const auto gap_deadline = gap_start_time_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                    std::chrono::duration<double, std::milli>(wait_ms));
-    const size_t pressure_depth = buffer_ctl_.adaptive_depth;
-    const bool depth_pressure = buffered_frames_.size() > pressure_depth;
-    if (depth_pressure || now >= gap_deadline)
+    const bool depth_pressure = buffered_frames_.size() >= buffer_ctl_.adaptive_depth;
+    if (depth_pressure || now >= gap_deadline_)
     {
         skip_gap_locked(buffered_frames_.front().seq);
         return;
     }
 
-    cond_.wait_until(lock, gap_deadline, [this, pressure_depth] {
+    cond_.wait_until(lock, gap_deadline_, [this] {
         return !running_ || buffered_frames_.empty() || buffered_frames_.front().seq <= expected_seq_ ||
-               buffered_frames_.size() > pressure_depth;
+               buffered_frames_.size() >= buffer_ctl_.adaptive_depth;
     });
 }
 
@@ -791,17 +822,18 @@ void RecvQueueAsync::worker_thread()
         std::unique_lock<std::mutex> lock(mutex_);
 
         const auto now = std::chrono::steady_clock::now();
-        purge_stale_locked(now);
-
         if (!running_)
         {
             drain_locked(lock);
             break;
         }
 
+        purge_stale_locked(now);
+
         if (buffered_frames_.empty())
         {
             gap_start_time_ = ClockTP{};
+            gap_deadline_ = ClockTP{};
             cond_.wait(lock, [this] { return !running_ || !buffered_frames_.empty(); });
             continue;
         }
@@ -818,6 +850,7 @@ void RecvQueueAsync::worker_thread()
             expected_seq_ = buffered_frames_.front().seq;
             next_delivery_time_ = now;
             gap_start_time_ = ClockTP{};
+            gap_deadline_ = ClockTP{};
             continue;
         }
 
@@ -859,6 +892,7 @@ void RecvQueueAsync::deliver_one_locked(std::unique_lock<std::mutex> &lock)
 
     expected_seq_ = frame.seq + 1;
     gap_start_time_ = ClockTP{};
+    gap_deadline_ = ClockTP{};
     buffer_ctl_.consume_pressure();
     update_adaptive_depth_locked();
     next_delivery_time_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -909,6 +943,7 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
 
     expected_seq_ = next_available_seq;
     gap_start_time_ = ClockTP{};
+    gap_deadline_ = ClockTP{};
     next_delivery_time_ = std::chrono::steady_clock::now();
 }
 
