@@ -498,10 +498,8 @@ RecvQueueAsync::~RecvQueueAsync()
 
 void RecvQueueAsync::sanitize_tuning_locked()
 {
-    tuning_.max_buffered_frames = std::max<size_t>(2, tuning_.max_buffered_frames);
     tuning_.min_depth = std::max<size_t>(1, tuning_.min_depth);
-    tuning_.max_depth = std::max(tuning_.max_depth, tuning_.min_depth);
-    tuning_.max_depth = std::min(tuning_.max_depth, tuning_.max_buffered_frames);
+    tuning_.max_depth = std::max<size_t>(2, std::max(tuning_.max_depth, tuning_.min_depth));
     tuning_.min_depth = std::min(tuning_.min_depth, tuning_.max_depth);
     tuning_.initial_depth = clamp_value(tuning_.initial_depth, tuning_.min_depth, tuning_.max_depth);
 
@@ -694,15 +692,15 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     std::memcpy(queued_data, data, size);
     buffered_frames_.insert(it, {abs_seq, queued_data, size, arrival});
     const uint32_t prev_reorder_cnt = reorder_est_.reorder_cnt;
-    arrival_est_.note(abs_seq, arrival, tuning_.max_buffered_frames);
-    reorder_est_.note(abs_seq, tuning_.max_buffered_frames);
+    arrival_est_.note(abs_seq, arrival, tuning_.max_depth);
+    reorder_est_.note(abs_seq, tuning_.max_depth);
     counters_.reorder += reorder_est_.reorder_cnt - prev_reorder_cnt;
     update_adaptive_depth_locked();
 
-    while (buffered_frames_.size() > tuning_.max_buffered_frames)
+    while (buffered_frames_.size() > tuning_.max_depth)
     {
         VIDEO_DEBUG_PRINT("[JitterBuf] buffered frames overflow: size=%zu max=%zu", buffered_frames_.size(),
-                          tuning_.max_buffered_frames);
+                          tuning_.max_depth);
         auto tail = std::prev(buffered_frames_.end());
         ++counters_.drop;
         ++counters_.overflow;

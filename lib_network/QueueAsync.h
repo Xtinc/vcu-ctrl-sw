@@ -130,9 +130,8 @@ class RecvQueueAsync
     {
         size_t min_depth = 1;
         size_t initial_depth = 8;
-        size_t max_depth = 256;
-        size_t max_buffered_frames = 256;
-        double stale_timeout_ms = 2000.0;
+        size_t max_depth = 512;
+        double stale_timeout_ms = 200.0;
         double default_frame_interval_ms = 2.0;
         double depth_feedback_gain = 0.08;
         double min_pacing_factor = 0.70;
