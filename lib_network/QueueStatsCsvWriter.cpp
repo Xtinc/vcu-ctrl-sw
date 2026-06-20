@@ -16,7 +16,8 @@ namespace
 constexpr auto RECORD_PERIOD = std::chrono::milliseconds(100);
 constexpr auto IDLE_GAP = std::chrono::seconds(5);
 constexpr const char *CSV_HEADER =
-    "elapsed_ms,part_id,segment_id,idle_gap_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,q_jitter_frames,"
+    "elapsed_ms,part_id,segment_id,idle_gap_ms,q_short_fi_ms,q_avg_fi_ms,q_fb_fi_ms,q_out_fi_ms,q_jitter_ms,"
+    "q_jitter_frames,"
     "q_disorder_frames,q_max_disorder_depth,q_tail_jitter_ms,q_tail_jitter_frames,q_buffered_frames,"
     "q_adaptive_depth,q_depth_raw,q_depth_error_frames,q_pressure_frames,q_pacing_factor,q_recv_delta,"
     "q_dlv_delta,q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta";
@@ -131,7 +132,8 @@ void QueueStatsCsvWriter::write(Clock::time_point now, double idle_gap_ms, const
     const double elapsed = std::chrono::duration<double, std::milli>(now - start_time_).count();
 
     file_ << std::fixed << std::setprecision(3) << elapsed << ',' << part_id_ << ',' << segment_id_ << ','
-          << idle_gap_ms << ',' << std::setprecision(2) << stats.avg_frame_interval_ms << ','
+          << idle_gap_ms << ',' << std::setprecision(2) << stats.short_frame_interval_ms << ','
+          << stats.avg_frame_interval_ms << ','
           << stats.feedback_interval_ms << ',' << stats.output_interval_ms << ',' << stats.jitter_ms << ','
           << stats.jitter_frames << ',' << stats.disorder_frames << ',' << stats.max_disorder_depth << ','
           << stats.tail_jitter_ms << ',' << stats.tail_jitter_frames << ',' << stats.buffered_frames << ','

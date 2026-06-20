@@ -30,7 +30,7 @@ OBSOLETE_OUTPUTS = {
 }
 ARRIVAL_COLUMNS = {"elapsed_ms", "seq", "interval_ms", "latency_ms"}
 QUEUE_COLUMNS = {
-    "elapsed_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_frames",
+    "elapsed_ms", "q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_frames",
     "q_buffered_frames", "q_adaptive_depth", "q_depth_raw", "q_pressure_frames",
     "q_skip_delta", "q_drop_delta", "q_late_delta", "q_reorder_delta",
     "q_stale_delta", "q_ovf_delta",
@@ -270,13 +270,14 @@ def process_arrivals(path, stages, stage_metrics):
 
 
 def process_queue(path, stages, stage_metrics):
-    keys = ("q_avg_fi_ms", "q_out_fi_ms", "q_buffered_frames", "q_adaptive_depth",
+    keys = ("q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_buffered_frames", "q_adaptive_depth",
             "q_skip_delta", "q_drop_delta", "q_reorder_delta", "q_tail_jitter_frames",
             "q_disorder_frames", "q_pressure_frames")
     plot = {"t": []}
     for key in keys:
         plot[key] = []
     input_stats = SampleStats()
+    short_input_stats = SampleStats()
     output_stats = SampleStats()
     buffered_stats = SampleStats()
     target_stats = SampleStats()
@@ -302,6 +303,8 @@ def process_queue(path, stages, stage_metrics):
         values = {key: as_float(row, key) for key in keys}
         if values["q_avg_fi_ms"] > 0.0:
             input_stats.add(values["q_avg_fi_ms"])
+            if values["q_short_fi_ms"] > 0.0:
+                short_input_stats.add(values["q_short_fi_ms"])
             output_stats.add(values["q_out_fi_ms"])
             buffered_stats.add(values["q_buffered_frames"])
             target_stats.add(values["q_adaptive_depth"])
@@ -325,7 +328,7 @@ def process_queue(path, stages, stage_metrics):
         for key in keys:
             plot[key].append(values[key])
     return {"count": row_count, "plot": plot, "gaps": gaps, "parts": [parts[key] for key in sorted(parts)],
-            "input": input_stats.summary(),
+            "input": input_stats.summary(), "short_input": short_input_stats.summary(),
             "output": output_stats.summary(), "buffered": buffered_stats.summary(),
             "target": target_stats.summary(), "events": events}
 
@@ -347,6 +350,7 @@ def save_figure(fig, out_dir, filename):
 
 def plot_output(out_dir, arrivals, sender, stages):
     data = arrivals["plot"]
+    has_latency = arrivals["latency"]["count"] > 0
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
     axes[0].plot(data["raw_t"], data["raw_v"], linewidth=0.45, alpha=0.25, label="output interval samples")
     axes[0].plot(data["smooth_t"], data["interval_mean"], linewidth=1.2, label="rolling mean")
@@ -371,19 +375,24 @@ def plot_output(out_dir, arrivals, sender, stages):
     set_robust_upper_ylim(axes[0], data["raw_v"] + data["interval_p95"])
     axes[0].grid(True, alpha=0.25)
 
-    axes[1].plot(data["smooth_t"], data["latency_mean"], linewidth=1.1, label="latency rolling mean")
-    axes[1].plot(data["smooth_t"], data["latency_p95"], linewidth=1.1, label="latency rolling p95")
+    if has_latency:
+        axes[1].plot(data["smooth_t"], data["latency_mean"], linewidth=1.1, label="latency rolling mean")
+        axes[1].plot(data["smooth_t"], data["latency_p95"], linewidth=1.1, label="latency rolling p95")
     if stages:
         times, values = [], []
         for stage in stages:
             times.extend([stage["start_s"], stage["end_s"]])
             values.extend([stage["ideal_latency_ms"], stage["ideal_latency_ms"]])
         axes[1].plot(times, values, linestyle="--", linewidth=1.0, label="configured high latency envelope")
+    if not has_latency:
+        axes[1].text(0.5, 0.5, "Latency unavailable: clocks were not synchronized",
+                     transform=axes[1].transAxes, ha="center", va="center", fontsize=12, color="tab:red")
     axes[1].set_xlabel("time (s)")
     axes[1].set_ylabel("ms")
     axes[1].set_title("User-Visible Latency")
     axes[1].grid(True, alpha=0.25)
-    axes[1].legend(loc="upper right")
+    if has_latency or stages:
+        axes[1].legend(loc="upper right")
     annotate_stages(axes, stages)
     save_figure(fig, out_dir, "output_smoothness.png")
 
@@ -391,7 +400,10 @@ def plot_output(out_dir, arrivals, sender, stages):
 def plot_controller(out_dir, queue, stages):
     data = queue["plot"]
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
-    axes[0].plot(data["t"], data["q_avg_fi_ms"], linewidth=1.1, label="estimated input interval")
+    axes[0].plot(data["t"], data["q_short_fi_ms"], linewidth=0.9, alpha=0.8,
+                 label="short-term input mean (15 intervals)")
+    axes[0].plot(data["t"], data["q_avg_fi_ms"], linewidth=1.2,
+                 label="smoothed controller input estimate")
     axes[0].plot(data["t"], data["q_out_fi_ms"], linewidth=1.0, label="commanded output interval")
     axes[0].set_ylabel("ms")
     axes[0].set_title("Controller Interval")
@@ -511,11 +523,16 @@ def write_assessment(out_dir, arrivals, queue, sender, stages):
                 sender["mean"], interval["mean"] - sender["mean"]))
         stream.write("- rolling_cv_p95: {:.4f}\n- see: output_smoothness.png\n\n".format(cv["p95"]))
         stream.write("Latency (ms)\n")
-        for key in ("mean", "p50", "p90", "p95", "p99", "max"):
-            stream.write("- {}: {:.2f}\n".format(key, latency[key]))
-        stream.write("\nController\n- input_interval_p95: {:.2f} ms\n- commanded_output_p95: {:.2f} ms\n"
+        if latency["count"] == 0:
+            stream.write("- unavailable: clock synchronization was not established\n")
+        else:
+            for key in ("mean", "p50", "p90", "p95", "p99", "max"):
+                stream.write("- {}: {:.2f}\n".format(key, latency[key]))
+        stream.write("\nController\n- short_input_interval_p95: {:.2f} ms\n"
+                     "- smoothed_input_interval_p95: {:.2f} ms\n- commanded_output_p95: {:.2f} ms\n"
                      "- buffered_p95: {:.2f} frames\n- target_p95: {:.2f} frames\n- see: controller_terms.png\n\n".format(
-                         queue["input"]["p95"], queue["output"]["p95"], queue["buffered"]["p95"],
+                         queue["short_input"]["p95"], queue["input"]["p95"], queue["output"]["p95"],
+                         queue["buffered"]["p95"],
                          queue["target"]["p95"]))
         stream.write("Events\n")
         for key in ("skip", "late", "overflow", "drop", "stale", "reorder"):

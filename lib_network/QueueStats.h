@@ -5,6 +5,7 @@
 
 struct QueueStatsSnapshot
 {
+    double short_frame_interval_ms = 0.0;
     double avg_frame_interval_ms = 0.0;
     double feedback_interval_ms = 0.0;
     double output_interval_ms = 0.0;

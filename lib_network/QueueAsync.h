@@ -66,6 +66,7 @@ class RJEstimator
     void note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max_seq_delta);
 
     double interval_avg;
+    double interval_short_avg;
     double jitter_avg;
     double jitter_tail;
 

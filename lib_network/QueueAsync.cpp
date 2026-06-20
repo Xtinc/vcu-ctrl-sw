@@ -249,8 +249,8 @@ void SendQueueAsync::worker_thread()
 }
 
 RJEstimator::RJEstimator()
-    : interval_avg(0.0), jitter_avg(0.0), jitter_tail(0.0), has_reference(false), has_interval(false), last_seq(0),
-      last_time(ClockTP{}), window_samples(0), window_start(ClockTP{}),
+    : interval_avg(0.0), interval_short_avg(0.0), jitter_avg(0.0), jitter_tail(0.0), has_reference(false),
+      has_interval(false), last_seq(0), last_time(ClockTP{}), window_samples(0), window_start(ClockTP{}),
       jitter_hist(ema_decay(TAIL_HISTOGRAM_WINDOW_FRAMES))
 {
 }
@@ -264,6 +264,7 @@ void RJEstimator::reset()
     last_seq = 0;
     last_time = ClockTP{};
     interval_avg = 0.0;
+    interval_short_avg = 0.0;
     jitter_avg = 0.0;
     jitter_tail = 0.0;
     window_samples = 0;
@@ -282,6 +283,7 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
         {
             const double sample_interval =
                 std::max(MIN_FRAME_INTERVAL_MS, elapsed_ms / static_cast<double>(window_samples - 1));
+            interval_short_avg = sample_interval;
             const double gain = has_interval ? ema_gain(FAST_ESTIMATE_WINDOW_FRAMES) : 1.0;
             interval_avg += gain * (sample_interval - interval_avg);
             has_interval = true;
@@ -753,6 +755,7 @@ QueueStatsSnapshot RecvQueueAsync::stats_snapshot_locked() const
     const double output_interval_ms = compute_delivery_interval_locked();
 
     QueueStatsSnapshot out = stats_;
+    out.short_frame_interval_ms = arrival_est_.interval_short_avg;
     out.avg_frame_interval_ms = interval_ms;
     out.feedback_interval_ms = output_interval_ms - interval_ms;
     out.output_interval_ms = output_interval_ms;
