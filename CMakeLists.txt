@@ -33,14 +33,24 @@ endif()
 option(ENABLE_ENC_SW_MULTIPASS "Enable encoder software multi-pass" OFF)
 add_compile_definitions(AL_ENABLE_64BIT=1)
 
-find_package(Threads REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBDRM REQUIRED libdrm)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    add_compile_definitions(
+        _WIN32_WINNT=0x0601
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX)
+elseif(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Unsupported platform: ${CMAKE_SYSTEM_NAME}; only Linux and Windows are supported")
+endif()
 
-# asio
+find_package(Threads REQUIRED)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBDRM REQUIRED libdrm)
+endif()
+
 add_library(asio INTERFACE)
 target_include_directories(asio INTERFACE asio-1.30.2/include)
-target_compile_definitions(asio INTERFACE $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0601>)
 
 # Global include paths
 include_directories(
@@ -49,24 +59,20 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/extra/include
 )
 
-# ---------- Batch 1: SDK object components ----------
-# Core SDK object libraries are grouped first.
-add_subdirectory(lib_common)
 add_subdirectory(lib_rtos)
-add_subdirectory(lib_fpga)
-
-add_subdirectory(lib_bitstream)
-add_subdirectory(lib_common_enc)
-
-add_subdirectory(lib_common_dec)
-add_subdirectory(lib_parsing)
-add_subdirectory(lib_sync_ip)
 add_subdirectory(lib_network)
 
-# ---------- Batch 2: app-facing deliverables ----------
-# User app layer + final SDK libraries consumed by applications.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_subdirectory(lib_common)
+    add_subdirectory(lib_fpga)
+    add_subdirectory(lib_bitstream)
+    add_subdirectory(lib_common_enc)
+    add_subdirectory(lib_common_dec)
+    add_subdirectory(lib_parsing)
+    add_subdirectory(lib_sync_ip)
+    add_subdirectory(lib_encode)
+    add_subdirectory(lib_decode)
+    add_subdirectory(app)
+endif()
 
-add_subdirectory(lib_encode)
-add_subdirectory(lib_decode)
-add_subdirectory(app)
 add_subdirectory(tests)

@@ -3,6 +3,9 @@ cmake-build
 *.md
 *.json
 *.txt
+!tests/reliable_udp_jitter/CMakeLists.txt
+!tests/reliable_udp_jitter/README.md
+!tests/reliable_udp_jitter/reliable_udp_jitter_stages.txt
 .vs
 vcu*
 /reliable_udp_jitter_out

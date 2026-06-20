@@ -460,7 +460,7 @@ static void write_summary(const Config &cfg, const RunState &state, const std::s
     summary << "integrity_errors=" << errors << '\n';
     summary << "duplicate_count=" << duplicates << '\n';
     summary << "observed_message_loss_pct=" << loss_pct << '\n';
-    summary << "plot_command=python3 tests/plot_reliable_udp_jitter.py " << cfg.out_dir << '\n';
+    summary << "plot_command=python3 tests/reliable_udp_jitter/plot_reliable_udp_jitter.py " << cfg.out_dir << '\n';
     summary << "primary_figures=output_smoothness.png,controller_terms.png,network_effects.png\n";
 }
 
@@ -564,7 +564,7 @@ static void run_test(const Config &cfg)
     std::cout << "  Sent / received  : " << state.sent.load() << " / " << state.received.load() << '\n';
     std::cout << "  Integrity errors : " << state.integrity_errors.load() << '\n';
     std::cout << "  Duplicates       : " << state.duplicates.load() << '\n';
-    std::cout << "  Plot command     : python3 tests/plot_reliable_udp_jitter.py " << cfg.out_dir << '\n';
+    std::cout << "  Plot command     : python3 tests/reliable_udp_jitter/plot_reliable_udp_jitter.py " << cfg.out_dir << '\n';
 }
 } // namespace
 

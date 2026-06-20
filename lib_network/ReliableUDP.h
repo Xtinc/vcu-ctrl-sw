@@ -46,6 +46,12 @@ struct TRXProbe
     int32_t t2_delta_ms; ///< pong: (int32_t)(receiver_time - t1_ms), range ±2^31 ms; ping: 0.
 };
 
+static_assert(std::is_standard_layout<TRXProbe>::value, "TRXProbe must remain a standard-layout wire structure");
+static_assert(sizeof(TRXProbe) == 12, "TRXProbe wire layout changed");
+static_assert(alignof(TRXProbe) == 4, "TRXProbe alignment changed");
+static_assert(offsetof(TRXProbe, t1_ms) == 4, "TRXProbe::t1_ms offset changed");
+static_assert(offsetof(TRXProbe, t2_delta_ms) == 8, "TRXProbe::t2_delta_ms offset changed");
+
 struct ClockSync
 {
     ClockSync();
@@ -117,6 +123,14 @@ struct TRXUnit
         return header->check_sum == adler_8(header);
     }
 };
+
+static_assert(std::is_standard_layout<TRXUnit::Header>::value,
+              "TRXUnit::Header must remain a standard-layout wire structure");
+static_assert(sizeof(TRXUnit::Header) == 12, "TRXUnit::Header wire layout changed");
+static_assert(alignof(TRXUnit::Header) == 4, "TRXUnit::Header alignment changed");
+static_assert(offsetof(TRXUnit::Header, frame_seq) == 0, "TRXUnit::Header::frame_seq offset changed");
+static_assert(offsetof(TRXUnit::Header, group_seq) == 2, "TRXUnit::Header::group_seq offset changed");
+static_assert(offsetof(TRXUnit::Header, group_len) == 4, "TRXUnit::Header::group_len offset changed");
 
 struct TRXGroup
 {

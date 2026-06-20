@@ -5,6 +5,18 @@
 #include <iomanip>
 #include <sstream>
 
+extern "C"
+{
+#include "lib_rtos/lib_rtos.h"
+}
+
+#if LINUX_OS_ENVIRONMENT
+#include <pthread.h>
+#include <sched.h>
+#elif WINDOWS_OS_ENVIRONMENT
+#include <windows.h>
+#endif
+
 namespace
 {
 constexpr auto MIN_FRAME_INTERVAL_MS = 1.0;
@@ -42,11 +54,16 @@ template <typename T> static T clamp_value(const T value, const T low, const T h
 
 void set_current_thread_scheduler_policy()
 {
+#if LINUX_OS_ENVIRONMENT
     auto thread = pthread_self();
     struct sched_param param;
     param.sched_priority = sched_get_priority_max(SCHED_RR) - 1;
     pthread_setschedparam(thread, SCHED_RR, &param);
     pthread_setname_np(thread, "video_thd");
+#elif WINDOWS_OS_ENVIRONMENT
+    auto thread = GetCurrentThread();
+    SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
 }
 
 SendQueueAsync::SendQueueAsync()

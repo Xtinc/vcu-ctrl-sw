@@ -1,0 +1,15 @@
+# Stage file for:
+#   tests/reliable_udp_jitter/run_reliable_udp_jitter_tc.sh --preset staged
+#
+# Format:
+#   <seconds> <name> <netem args | normal>
+#
+# The runner always prepends 10s of fully normal network and appends 10s of
+# fully normal network. Put only the middle stages here.
+#20 jitter delay 20ms 5ms 25% distribution normal
+#20 jitter2 delay 40ms 10ms 25% distribution normal
+10 delay1 delay 20ms
+10 delay2 delay 40ms
+10 jitter1 delay 30ms 10ms
+10 jitter2 delay 10ms 5ms
+10 delay3 slot 10ms 30ms

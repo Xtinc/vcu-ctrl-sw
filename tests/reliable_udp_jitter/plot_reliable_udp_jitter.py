@@ -93,6 +93,18 @@ def read_csv(path, required_columns):
         return list(reader)
 
 
+def read_summary(path):
+    values = {}
+    if not path or not os.path.exists(path):
+        return values
+    with open(path) as f:
+        for line in f:
+            key, separator, value = line.strip().partition("=")
+            if separator:
+                values[key] = value
+    return values
+
+
 def as_float(row, key, default=0.0):
     try:
         value = row.get(key, "")
@@ -303,6 +315,14 @@ def write_assessment(out_dir, metrics):
         f.write("- summary: {}\n".format(metrics["summary"]))
         f.write("- samples: stats={}, arrivals={}\n\n".format(metrics["stats_count"], metrics["arrival_count"]))
 
+        if metrics.get("end_to_end"):
+            accounting = metrics["end_to_end"]
+            f.write("End-to-end message accounting\n")
+            f.write("- sent: {}\n".format(accounting["sent"]))
+            f.write("- received: {}\n".format(accounting["received"]))
+            f.write("- send_fail: {}\n".format(accounting["send_fail"]))
+            f.write("- observed_message_loss_pct: {}\n\n".format(fmt(accounting["loss_pct"], 3)))
+
         f.write("1. User-visible output interval smoothness\n")
         for key in ("mean", "p50", "p90", "p95", "p99", "max"):
             f.write("- interval_{}: {} ms\n".format(key, fmt(metrics["interval"].get(key, 0.0))))
@@ -350,10 +370,14 @@ def write_assessment(out_dir, metrics):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: python3 tests/plot_reliable_udp_jitter.py <out-dir>")
+    if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] != "--sender-summary"):
+        raise SystemExit(
+            "usage: python3 tests/reliable_udp_jitter/plot_reliable_udp_jitter.py "
+            "<receiver-out-dir> [--sender-summary <path>]"
+        )
 
     out_dir = sys.argv[1]
+    sender_summary = read_summary(sys.argv[3] if len(sys.argv) == 4 else "")
     arrival_path = os.path.join(out_dir, "arrival_intervals.csv")
     stats_path = os.path.join(out_dir, "queue_stats.csv")
     if not os.path.exists(arrival_path):
@@ -372,7 +396,13 @@ def main():
     t_arr = [as_float(r, "elapsed_ms") / 1000.0 for r in arrivals]
     output_intervals = [as_float(r, "interval_ms") for r in arrivals if as_float(r, "interval_ms") > 0.0]
     t_out = [t for t, r in zip(t_arr, arrivals) if as_float(r, "interval_ms") > 0.0]
-    latencies = [as_float(r, "latency_ms") for r in arrivals]
+    latency_samples = [
+        (t, as_float(r, "latency_ms"))
+        for t, r in zip(t_arr, arrivals)
+        if math.isfinite(as_float(r, "latency_ms")) and as_float(r, "latency_ms") >= 0.0
+    ]
+    t_latency = [sample[0] for sample in latency_samples]
+    latencies = [sample[1] for sample in latency_samples]
 
     t_stats = [as_float(r, "elapsed_ms") / 1000.0 for r in queue_stats]
     q_avg_fi = [as_float(r, "q_avg_fi_ms") for r in queue_stats]
@@ -411,7 +441,7 @@ def main():
     for stage in stages:
         start_s = stage["start_s"]
         end_s = stage["end_s"]
-        latency_values = sorted(v for t, v in zip(t_arr, latencies) if start_s <= t < end_s)
+        latency_values = sorted(v for t, v in zip(t_latency, latencies) if start_s <= t < end_s)
         target_values = sorted(v for t, v in zip(t_stats, q_target) if start_s <= t < end_s)
         raw_values = sorted(v for t, v in zip(t_stats, q_depth_raw) if start_s <= t < end_s)
         reorder_driver_values = sorted(v for t, v in zip(t_stats, q_reorder_driver) if start_s <= t < end_s)
@@ -449,8 +479,8 @@ def main():
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="upper right")
 
-    axes[1].plot(t_arr, latency_mean, linewidth=1.1, label="latency rolling mean")
-    axes[1].plot(t_arr, latency_p95, linewidth=1.1, label="latency rolling p95")
+    axes[1].plot(t_latency, latency_mean, linewidth=1.1, label="latency rolling mean")
+    axes[1].plot(t_latency, latency_p95, linewidth=1.1, label="latency rolling p95")
     if ideal_t:
         axes[1].plot(
             ideal_t,
@@ -547,6 +577,13 @@ def main():
     score -= min(15.0, max(0.0, interval_stats["p99"] - interval_stats["p50"]) * 0.5)
     score = clamp(score, 0.0, 100.0)
     summary = "stable output intervals" if visible_failures == 0 and cv_stats["p95"] < 0.5 else "output smoothness needs attention"
+    end_to_end = None
+    if sender_summary:
+        sent = int(sender_summary.get("sent_count", "0"))
+        send_fail = int(sender_summary.get("send_fail_count", "0"))
+        received = len(arrivals)
+        loss_pct = 100.0 * max(0, sent - received) / float(sent) if sent else 0.0
+        end_to_end = {"sent": sent, "received": received, "send_fail": send_fail, "loss_pct": loss_pct}
     write_assessment(
         out_dir,
         {
@@ -571,6 +608,7 @@ def main():
             },
             "events": event_totals,
             "stage_effects": stage_effects,
+            "end_to_end": end_to_end,
         },
     )
 
