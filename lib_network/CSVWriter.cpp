@@ -16,7 +16,7 @@ namespace
 constexpr auto RECORD_PERIOD = std::chrono::milliseconds(100);
 constexpr auto IDLE_GAP = std::chrono::seconds(5);
 constexpr const char *CSV_HEADER =
-    "elapsed_ms,part_id,segment_id,idle_gap_ms,q_short_fi_ms,q_avg_fi_ms,q_out_fi_ms,q_jitter_ms,"
+    "elapsed_s,part_id,segment_id,idle_gap_s,q_short_fi_ms,q_avg_fi_ms,q_out_fi_ms,q_jitter_ms,"
     "q_disorder_frames,q_max_disorder_depth,q_tail_jitter_ms,q_buffered_frames,q_adaptive_depth,q_depth_raw,"
     "q_pressure_frames,q_recv_delta,"
     "q_dlv_delta,q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta";
@@ -41,13 +41,12 @@ NetCSVWriter::~NetCSVWriter()
 void NetCSVWriter::start(Clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    close();
     bytes_written_ = 0;
     enabled_ = true;
     file_failed_ = false;
     has_last_frame_ = false;
     has_last_write_ = false;
-    has_baseline_ = false;
+    write_pending_ = false;
     part_id_ = 0;
     segment_id_ = 0;
     start_time_ = now;
@@ -55,13 +54,13 @@ void NetCSVWriter::start(Clock::time_point now)
     clear_files();
 }
 
-void NetCSVWriter::on_frame(Clock::time_point now, const QueueStatsSnapshot &stats)
+bool NetCSVWriter::on_frame(Clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!enabled_)
-        return;
+        return false;
 
-    double idle_gap_ms = 0.0;
+    double idle_gap_s = 0.0;
     bool force_write = false;
     if (!has_last_frame_)
     {
@@ -75,16 +74,29 @@ void NetCSVWriter::on_frame(Clock::time_point now, const QueueStatsSnapshot &sta
         if (frame_gap > IDLE_GAP)
         {
             ++segment_id_;
-            idle_gap_ms = std::chrono::duration<double, std::milli>(frame_gap).count();
+            idle_gap_s = std::chrono::duration<double>(frame_gap).count();
             force_write = true;
         }
     }
     last_frame_time_ = now;
 
     if (!force_write && has_last_write_ && now - last_write_time_ < RECORD_PERIOD)
+        return false;
+
+    pending_time_ = now;
+    pending_idle_gap_s_ = idle_gap_s;
+    write_pending_ = true;
+    return true;
+}
+
+void NetCSVWriter::write(const QueueStatsSnapshot &stats)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!enabled_ || !write_pending_)
         return;
 
-    write(now, idle_gap_ms, stats);
+    write_pending_ = false;
+    write_row(pending_time_, pending_idle_gap_s_, stats);
 }
 
 void NetCSVWriter::stop(Clock::time_point now, const QueueStatsSnapshot &stats)
@@ -93,23 +105,15 @@ void NetCSVWriter::stop(Clock::time_point now, const QueueStatsSnapshot &stats)
     if (!enabled_)
         return;
 
-    if (has_last_frame_ && file_.is_open() && !file_failed_)
-    {
-        const auto frame_gap = now - last_frame_time_;
-        double idle_gap_ms = 0.0;
-        if (frame_gap > IDLE_GAP)
-        {
-            ++segment_id_;
-            idle_gap_ms = std::chrono::duration<double, std::milli>(frame_gap).count();
-        }
-        write(now, idle_gap_ms, stats);
-    }
+    write_pending_ = false;
+    if (has_last_frame_ && !file_failed_)
+        write_row(now, 0.0, stats);
 
     close();
     enabled_ = false;
 }
 
-void NetCSVWriter::write(Clock::time_point now, double idle_gap_ms, const QueueStatsSnapshot &stats)
+void NetCSVWriter::write_row(Clock::time_point now, double idle_gap_s, const QueueStatsSnapshot &stats)
 {
     if (file_failed_)
         return;
@@ -127,19 +131,18 @@ void NetCSVWriter::write(Clock::time_point now, double idle_gap_ms, const QueueS
         return;
     }
 
-    const QueueStatsSnapshot previous = has_baseline_ ? baseline_ : QueueStatsSnapshot{};
-    const double elapsed = std::chrono::duration<double, std::milli>(now - start_time_).count();
+    const QueueStatsSnapshot previous = baseline_;
+    const double elapsed_s = std::chrono::duration<double>(now - start_time_).count();
 
-    file_ << std::fixed << std::setprecision(3) << elapsed << ',' << part_id_ << ',' << segment_id_ << ','
-          << idle_gap_ms << ',' << std::setprecision(2) << stats.short_frame_interval_ms << ','
-          << stats.avg_frame_interval_ms << ',' << stats.output_interval_ms << ',' << stats.jitter_ms << ','
-          << stats.disorder_frames << ',' << stats.max_disorder_depth << ',' << stats.tail_jitter_ms << ','
-          << stats.buffered_frames << ',' << stats.adaptive_depth << ',' << stats.raw_depth_frames << ','
-          << stats.pressure_frames << ',' << delta(stats.recv, previous.recv) << ','
-          << delta(stats.deliver, previous.deliver) << ',' << delta(stats.skip, previous.skip) << ','
-          << delta(stats.drop, previous.drop) << ',' << delta(stats.duplicate, previous.duplicate) << ','
+    file_ << std::fixed << std::setprecision(3) << elapsed_s << ',' << part_id_ << ',' << segment_id_ << ','
+          << idle_gap_s << ',' << std::setprecision(2) << stats.fi_short_ms << ',' << stats.fi_avg_ms << ','
+          << stats.fi_out_ms << ',' << stats.jitter_ms << ',' << stats.disorder_fr << ',' << stats.disorder_max_fr
+          << ',' << stats.jitter_tail_ms << ',' << stats.buf_fr << ',' << stats.depth_target_fr << ','
+          << stats.depth_raw_fr << ',' << stats.pressure_fr << ',' << delta(stats.recv, previous.recv) << ','
+          << delta(stats.dlv, previous.dlv) << ',' << delta(stats.skip, previous.skip) << ','
+          << delta(stats.drop, previous.drop) << ',' << delta(stats.dup, previous.dup) << ','
           << delta(stats.late, previous.late) << ',' << delta(stats.reorder, previous.reorder) << ','
-          << delta(stats.stale, previous.stale) << ',' << delta(stats.overflow, previous.overflow) << '\n';
+          << delta(stats.stale, previous.stale) << ',' << delta(stats.ovf, previous.ovf) << '\n';
     if (!file_)
     {
         file_failed_ = true;
@@ -151,7 +154,6 @@ void NetCSVWriter::write(Clock::time_point now, double idle_gap_ms, const QueueS
     if (position != std::streampos(-1))
         bytes_written_ = static_cast<size_t>(position);
     baseline_ = stats;
-    has_baseline_ = true;
     last_write_time_ = now;
     has_last_write_ = true;
 }

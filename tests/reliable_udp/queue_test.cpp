@@ -61,7 +61,7 @@ template <typename Callback> static RecvCallBack single_frame_callback(Callback 
 
 static bool queue_adaptive_depth_is_valid(const QueueStatsSnapshot &stats)
 {
-    return stats.adaptive_depth >= 1 && stats.adaptive_depth <= 512 && stats.raw_depth_frames >= 0.0;
+    return stats.depth_target_fr >= 1 && stats.depth_target_fr <= 512 && stats.depth_raw_fr >= 0.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,14 +295,14 @@ static bool test_jitter_stats_snapshot_is_stable()
 
     const auto snapshot1 = q.stats_snapshot();
     const auto snapshot2 = q.stats_snapshot();
-    if (snapshot1.recv != 2 || snapshot1.duplicate != 1 || snapshot2.recv != snapshot1.recv ||
-        snapshot2.duplicate != snapshot1.duplicate)
+    if (snapshot1.recv != 2 || snapshot1.dup != 1 || snapshot2.recv != snapshot1.recv ||
+        snapshot2.dup != snapshot1.dup)
     {
         std::cout << "  [stats_delta] cumulative snapshot changed while reading\n";
         ok = false;
     }
 
-    if (snapshot1.buffered_frames != 1 || snapshot1.adaptive_depth == 0)
+    if (snapshot1.buf_fr != 1 || snapshot1.depth_target_fr == 0)
     {
         std::cout << "  [stats_snapshot] unexpected queue depth\n";
         ok = false;
@@ -346,20 +346,40 @@ static bool test_jitter_idle_snapshot_is_stable()
     const auto idle = q.stats_snapshot();
     q.stop();
 
-    if (!ok || delivered < N || active.recv == 0 || active.avg_frame_interval_ms <= 0.0)
+    if (!ok || delivered < N || active.recv == 0 || active.fi_avg_ms <= 0.0)
     {
         std::cout << "  [idle_stats] active phase did not produce input stats: delivered=" << delivered << '\n';
         return false;
     }
 
-    if (idle.recv != active.recv || idle.deliver != active.deliver || idle.avg_frame_interval_ms <= 0.0 ||
-        idle.adaptive_depth == 0)
+    if (idle.recv != active.recv || idle.dlv != active.dlv || idle.fi_avg_ms <= 0.0 ||
+        idle.depth_target_fr == 0)
     {
         std::cout << "  [idle_stats] repeated snapshot changed cumulative state\n";
         return false;
     }
 
     return true;
+}
+
+static bool test_jitter_stop_drain_is_counted()
+{
+    std::array<std::array<uint8_t, 4>, 3> bufs{};
+    uint64_t callback_frames = 0;
+
+    RecvQueueAsync q;
+    q.start([&](const std::vector<QueueFrame> &frames, bool) {
+        callback_frames += frames.size();
+        return true;
+    });
+
+    bool ok = true;
+    for (uint32_t seq = 0; seq < bufs.size(); ++seq)
+        ok = ok && q.enqueue(bufs[seq].data(), bufs[seq].size(), seq);
+
+    q.stop();
+    const auto stats = q.stats_snapshot();
+    return ok && callback_frames == bufs.size() && stats.dlv == bufs.size();
 }
 
 static bool test_jitter_inorder_prefill_not_reorder()
@@ -384,7 +404,7 @@ static bool test_jitter_inorder_prefill_not_reorder()
     const auto stats = q.stats_snapshot();
     q.stop();
 
-    if (stats.reorder != 0 || stats.max_disorder_depth != 0 || stats.disorder_frames != 0.0)
+    if (stats.reorder != 0 || stats.disorder_max_fr != 0 || stats.disorder_fr != 0.0)
     {
         std::cout << "  [inorder_prefill] in-order prefill counted as reorder\n";
         return false;
@@ -423,7 +443,7 @@ static bool test_jitter_inorder_backlog_not_pressure()
     if (!ok)
         return false;
 
-    if (stats.pressure_frames != 0)
+    if (stats.pressure_fr != 0)
     {
         std::cout << "  [inorder_backlog] in-order backlog triggered pressure\n";
         return false;
@@ -1076,11 +1096,11 @@ static bool test_jitter_feedforward_tracks_throughput_with_bounded_feedback()
     }
 
     const auto pressure_stats = q.stats_snapshot();
-    const double avg_interval_ms = pressure_stats.avg_frame_interval_ms;
+    const double avg_interval_ms = pressure_stats.fi_avg_ms;
     const double pacing_factor =
-        avg_interval_ms > 0.0 ? pressure_stats.output_interval_ms / avg_interval_ms : 0.0;
-    const auto buffered = pressure_stats.buffered_frames;
-    const auto adaptive = pressure_stats.adaptive_depth;
+        avg_interval_ms > 0.0 ? pressure_stats.fi_out_ms / avg_interval_ms : 0.0;
+    const auto buffered = pressure_stats.buf_fr;
+    const auto adaptive = pressure_stats.depth_target_fr;
 
     {
         std::unique_lock<std::mutex> lk(mtx);
@@ -1095,7 +1115,7 @@ static bool test_jitter_feedforward_tracks_throughput_with_bounded_feedback()
         std::cout << "  [feedforward_feedback] bad pressure response\n";
         return false;
     }
-    if (delivered < TOTAL || final_stats.late != 0 || final_stats.overflow != 0)
+    if (delivered < TOTAL || final_stats.late != 0 || final_stats.ovf != 0)
     {
         std::cout << "  [feedforward_feedback] bad final state: delivered=" << delivered << "/" << TOTAL << '\n';
         return false;
@@ -1160,8 +1180,8 @@ static bool test_jitter_one_sided_fast_arrivals()
         return false;
     }
     const double tail_jitter_frames =
-        stats.avg_frame_interval_ms > 0.0 ? stats.tail_jitter_ms / stats.avg_frame_interval_ms : 0.0;
-    if (tail_jitter_frames > 0.75 || stats.adaptive_depth > 6)
+        stats.fi_avg_ms > 0.0 ? stats.jitter_tail_ms / stats.fi_avg_ms : 0.0;
+    if (tail_jitter_frames > 0.75 || stats.depth_target_fr > 6)
     {
         std::cout << "  [one_sided_fast] compressed arrivals raised tail jitter/depth\n";
         return false;
@@ -1226,7 +1246,7 @@ static bool test_jitter_one_sided_slow_tail()
         std::cout << "  [one_sided_slow] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (stats.tail_jitter_ms < 4.0 || stats.raw_depth_frames <= 4.0)
+    if (stats.jitter_tail_ms < 4.0 || stats.depth_raw_fr <= 4.0)
     {
         std::cout << "  [one_sided_slow] slow tail did not raise jitter/depth\n";
         return false;
@@ -1281,7 +1301,7 @@ static bool test_jitter_one_sided_tail_recovers()
     }
 
     const auto burst_stats = q.stats_snapshot();
-    const double burst_tail_ms = burst_stats.tail_jitter_ms;
+    const double burst_tail_ms = burst_stats.jitter_tail_ms;
 
     for (; seq < TOTAL; seq++)
     {
@@ -1301,14 +1321,14 @@ static bool test_jitter_one_sided_tail_recovers()
     const auto recovered_stats = q.stats_snapshot();
     q.stop();
 
-    const double recovered_tail_ms = recovered_stats.tail_jitter_ms;
+    const double recovered_tail_ms = recovered_stats.jitter_tail_ms;
     if (delivered < TOTAL)
     {
         std::cout << "  [one_sided_recover] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
     if (burst_tail_ms < 4.0 || recovered_tail_ms >= burst_tail_ms * 0.70 || recovered_stats.late != 0 ||
-        recovered_stats.overflow != 0)
+        recovered_stats.ovf != 0)
     {
         std::cout << "  [one_sided_recover] bad recovery: burst=" << burst_tail_ms
                   << "ms recovered=" << recovered_tail_ms << "ms\n";
@@ -1885,7 +1905,8 @@ static bool test_queue_stats_csv_writer_rotation()
         for (uint64_t index = 0; index < 30; ++index)
         {
             snapshot.recv = index + 1;
-            writer.on_frame(start + std::chrono::milliseconds(101 * index), snapshot);
+            if (writer.on_frame(start + std::chrono::milliseconds(101 * index)))
+                writer.write(snapshot);
         }
         writer.stop(start + std::chrono::milliseconds(3000), snapshot);
     }
@@ -1898,7 +1919,7 @@ static bool test_queue_stats_csv_writer_rotation()
         std::ifstream input(candidate);
         std::string header;
         ok = ok && static_cast<bool>(std::getline(input, header));
-        ok = ok && header.find("elapsed_ms,part_id,segment_id,idle_gap_ms") == 0;
+        ok = ok && header.find("elapsed_s,part_id,segment_id,idle_gap_s") == 0;
         ok = ok && header.find("q_tail_jitter_ms") != std::string::npos;
         ok = ok && header.find("q_fb_fi_ms") == std::string::npos;
         ok = ok && header.find("q_tail_jitter_frames") == std::string::npos;
@@ -1927,6 +1948,52 @@ static bool test_queue_stats_csv_writer_rotation()
     return ok;
 }
 
+static std::string csv_field(const std::string &row, size_t field_index)
+{
+    size_t begin = 0;
+    for (size_t index = 0; index < field_index; ++index)
+    {
+        begin = row.find(',', begin);
+        if (begin == std::string::npos)
+            return {};
+        ++begin;
+    }
+    const auto end = row.find(',', begin);
+    return row.substr(begin, end == std::string::npos ? end : end - begin);
+}
+
+static bool test_queue_stats_stop_keeps_segment()
+{
+    const std::string path = "queue_stats_writer_stop_test.csv";
+    std::remove(path.c_str());
+
+    const auto start = std::chrono::steady_clock::now();
+    QueueStatsSnapshot snapshot;
+    bool throttled = false;
+    {
+        NetCSVWriter writer(path);
+        writer.start(start);
+        snapshot.recv = 1;
+        if (writer.on_frame(start))
+            writer.write(snapshot);
+        throttled = !writer.on_frame(start + std::chrono::milliseconds(50));
+        snapshot.recv = 2;
+        writer.stop(start + std::chrono::seconds(6), snapshot);
+    }
+
+    std::ifstream input(path);
+    std::string header;
+    std::string first;
+    std::string final;
+    const bool rows_ok = static_cast<bool>(std::getline(input, header)) && static_cast<bool>(std::getline(input, first)) &&
+                         static_cast<bool>(std::getline(input, final));
+    const bool ok = throttled && rows_ok && csv_field(first, 2) == "1" && csv_field(final, 2) == "1" &&
+                    csv_field(final, 3) == "0.000";
+    input.close();
+    std::remove(path.c_str());
+    return ok;
+}
+
 static int run_jitter_tests()
 {
     struct Test
@@ -1942,6 +2009,7 @@ static int run_jitter_tests()
         {"callback retains until release      ", test_jitter_callback_retains_until_release},
         {"stats snapshot is stable           ", test_jitter_stats_snapshot_is_stable},
         {"idle snapshot is stable            ", test_jitter_idle_snapshot_is_stable},
+        {"stop drain updates delivery count  ", test_jitter_stop_drain_is_counted},
         {"in-order prefill is not reorder     ", test_jitter_inorder_prefill_not_reorder},
         {"in-order backlog is not pressure    ", test_jitter_inorder_backlog_not_pressure},
         {"auto depth bounded after reorder    ", test_jitter_depth_recovers},
@@ -1964,6 +2032,7 @@ static int run_jitter_tests()
         {"QS delivery jitter revokes          ", test_qs_estimator_delivery_jitter_revokes_immediate},
         {"QS two-frame interval allowed       ", test_qs_estimator_two_frame_interval_allowed},
         {"queue stats CSV rotation            ", test_queue_stats_csv_writer_rotation},
+        {"queue stats stop keeps segment      ", test_queue_stats_stop_keeps_segment},
         {"send queue fill API                 ", test_send_queue_fill},
     };
 

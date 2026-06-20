@@ -1012,7 +1012,8 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
         {
             VIDEO_ERROR_PRINT("Failed to enqueue received message");
         }
-        stats_writer_.on_frame(std::chrono::steady_clock::now(), usr_queue_->stats_snapshot());
+        if (stats_writer_.on_frame(std::chrono::steady_clock::now()))
+            stats_writer_.write(usr_queue_->stats_snapshot());
         recv_pool_.deallocate(complete_message);
         receive_frames_.erase(it);
     }

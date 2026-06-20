@@ -43,7 +43,7 @@ constexpr uint32_t TEST_MAGIC = 0x524a4e54u; // RJNT
 constexpr size_t SEND_INTERVAL_RESERVOIR_SIZE = 65536;
 constexpr size_t RECENT_SEQUENCE_WINDOW_SIZE = 4096;
 constexpr const char *ARRIVAL_HEADER =
-    "elapsed_ms,seq,interval_ms,latency_ms,qs_immediate";
+    "elapsed_s,seq,interval_ms,latency_ms,qs_immediate";
 
 struct NetworkHeader
 {
@@ -162,6 +162,11 @@ struct ReceiverState
 double elapsed_ms(SteadyClock::time_point start, SteadyClock::time_point now)
 {
     return std::chrono::duration<double, std::milli>(now - start).count();
+}
+
+double elapsed_s(SteadyClock::time_point start, SteadyClock::time_point now)
+{
+    return std::chrono::duration<double>(now - start).count();
 }
 
 uint64_t wall_time_us()
@@ -455,7 +460,7 @@ void run_receiver(const Config &cfg)
             const double latency = synced ? (static_cast<double>(wall_time_us()) -
                                              static_cast<double>(header.send_wall_us) +
                                              static_cast<double>(udp->offset_ms()) * 1000.0) / 1000.0 : -1.0;
-            state.arrivals << std::fixed << std::setprecision(3) << elapsed_ms(state.start, steady_now) << ','
+            state.arrivals << std::fixed << std::setprecision(3) << elapsed_s(state.start, steady_now) << ','
                            << header.seq << ',' << interval << ',' << latency << ',' << (allow_immediate ? 1 : 0)
                            << '\n';
             state.last_arrival = steady_now;

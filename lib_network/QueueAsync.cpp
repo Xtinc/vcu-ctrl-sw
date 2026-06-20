@@ -750,26 +750,26 @@ QueueStatsSnapshot RecvQueueAsync::stats_snapshot_locked() const
     const double output_interval_ms = compute_delivery_interval_locked();
 
     QueueStatsSnapshot out;
-    out.short_frame_interval_ms = arrival_est_.interval_short_avg;
-    out.avg_frame_interval_ms = interval_ms;
-    out.output_interval_ms = output_interval_ms;
+    out.fi_short_ms = arrival_est_.interval_short_avg;
+    out.fi_avg_ms = interval_ms;
+    out.fi_out_ms = output_interval_ms;
     out.jitter_ms = arrival_est_.jitter_avg;
-    out.tail_jitter_ms = arrival_est_.jitter_tail;
-    out.disorder_frames = effective_disorder_frames;
-    out.max_disorder_depth = reorder_est_.max_disorder_depth;
-    out.buffered_frames = buffered_frames_.size();
-    out.adaptive_depth = buffer_ctl_.adaptive_depth;
-    out.raw_depth_frames = buffer_ctl_.raw_depth_frames;
-    out.pressure_frames = buffer_ctl_.pressure_frames_remaining;
+    out.jitter_tail_ms = arrival_est_.jitter_tail;
+    out.disorder_fr = effective_disorder_frames;
+    out.disorder_max_fr = reorder_est_.max_disorder_depth;
+    out.buf_fr = buffered_frames_.size();
+    out.depth_target_fr = buffer_ctl_.adaptive_depth;
+    out.depth_raw_fr = buffer_ctl_.raw_depth_frames;
+    out.pressure_fr = buffer_ctl_.pressure_frames_remaining;
     out.recv = recv_count_;
-    out.deliver = deliver_count_;
+    out.dlv = deliver_count_;
     out.skip = skip_count_;
     out.drop = drop_count_;
-    out.duplicate = duplicate_count_;
+    out.dup = duplicate_count_;
     out.late = late_count_;
     out.reorder = reorder_est_.reorder_cnt;
     out.stale = stale_count_;
-    out.overflow = overflow_count_;
+    out.ovf = overflow_count_;
     return out;
 }
 
@@ -942,6 +942,7 @@ void RecvQueueAsync::drain_locked(std::unique_lock<std::mutex> &lock)
     {
         auto frame = buffered_frames_.front();
         buffered_frames_.pop_front();
+        ++deliver_count_;
         delivered_frames_.push_back({frame.data, frame.size});
 
         bool should_release = true;

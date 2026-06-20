@@ -28,9 +28,9 @@ OBSOLETE_OUTPUTS = {
     "queue_counters.png", "network_vs_controller.png", "latency_ideal_vs_actual.png",
     "parameter_influence.png",
 }
-ARRIVAL_COLUMNS = {"elapsed_ms", "seq", "interval_ms", "latency_ms"}
+ARRIVAL_COLUMNS = {"elapsed_s", "seq", "interval_ms", "latency_ms"}
 QUEUE_COLUMNS = {
-    "elapsed_ms", "q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_ms",
+    "elapsed_s", "q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_ms",
     "q_buffered_frames", "q_adaptive_depth", "q_depth_raw", "q_pressure_frames",
     "q_skip_delta", "q_drop_delta", "q_late_delta", "q_reorder_delta",
     "q_stale_delta", "q_ovf_delta",
@@ -223,7 +223,7 @@ def process_arrivals(path, stages, stage_metrics):
 
     for row in csv_rows(path, ARRIVAL_COLUMNS):
         row_count += 1
-        timestamp = as_float(row, "elapsed_ms") / 1000.0
+        timestamp = as_float(row, "elapsed_s")
         last_time = timestamp
         qse = 1 if as_float(row, "qs_immediate") > 0 else 0
         if qse != last_qse:
@@ -271,7 +271,7 @@ def process_arrivals(path, stages, stage_metrics):
 
 def process_queue(path, stages, stage_metrics):
     keys = ("q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_buffered_frames", "q_adaptive_depth",
-            "q_skip_delta", "q_drop_delta", "q_reorder_delta", "q_tail_jitter_frames",
+            "q_skip_delta", "q_drop_delta", "q_reorder_delta", "q_tail_jitter_ms", "q_tail_jitter_frames",
             "q_disorder_frames", "q_pressure_frames")
     plot = {"t": []}
     for key in keys:
@@ -288,7 +288,7 @@ def process_queue(path, stages, stage_metrics):
     row_count = 0
     for row in csv_rows(path, QUEUE_COLUMNS, include_rotated=True):
         row_count += 1
-        timestamp = as_float(row, "elapsed_ms") / 1000.0
+        timestamp = as_float(row, "elapsed_s")
         part_id = int(as_float(row, "part_id", 0.0))
         part = parts.setdefault(part_id, {"part_id": part_id, "start_s": timestamp, "end_s": timestamp, "rows": 0})
         part["end_s"] = timestamp
@@ -298,7 +298,7 @@ def process_queue(path, stages, stage_metrics):
             for key in keys:
                 plot[key].append(float("nan"))
             plot["t"].append(timestamp)
-            gaps.append({"time": timestamp, "idle_ms": as_float(row, "idle_gap_ms"), "segment": segment})
+            gaps.append({"time": timestamp, "idle_s": as_float(row, "idle_gap_s"), "segment": segment})
         previous_segment = segment
         values = {key: as_float(row, key) for key in keys}
         interval_ms = values["q_avg_fi_ms"]
@@ -401,16 +401,30 @@ def plot_output(out_dir, arrivals, sender, stages):
     save_figure(fig, out_dir, "output_smoothness.png")
 
 
-def plot_controller(out_dir, queue, stages):
+def plot_controller(out_dir, queue, arrivals, stages):
     data = queue["plot"]
+    output = arrivals["plot"]
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
-    axes[0].plot(data["t"], data["q_short_fi_ms"], linewidth=0.9, alpha=0.8,
-                 label="short-term input mean (15 intervals)")
-    axes[0].plot(data["t"], data["q_avg_fi_ms"], linewidth=1.2,
-                 label="smoothed controller input estimate")
-    axes[0].plot(data["t"], data["q_out_fi_ms"], linewidth=1.0, label="commanded output interval")
+    input_mean = [value if value > 0.0 else float("nan") for value in data["q_short_fi_ms"]]
+    input_tail = [mean + tail if math.isfinite(mean) else float("nan")
+                  for mean, tail in zip(input_mean, data["q_tail_jitter_ms"])]
+    axes[0].fill_between(data["t"], input_mean, input_tail, color="tab:red", alpha=0.18,
+                         label="estimated input late-jitter envelope")
+    axes[0].plot(data["t"], input_mean, color="tab:red", linewidth=1.0,
+                 label="FEC output / queue input mean (15 intervals)")
+    axes[0].plot(output["raw_t"], output["raw_v"], color="tab:blue", linewidth=0.45, alpha=0.25,
+                 label="controlled output interval (per frame)")
+    axes[0].plot(output["smooth_t"], output["interval_mean"], color="tab:blue", linewidth=1.2,
+                 label="controlled output rolling mean")
+    axes[0].plot(output["smooth_t"], output["interval_p95"], color="tab:cyan", linewidth=1.0,
+                 label="controlled output rolling p95")
     axes[0].set_ylabel("ms")
-    axes[0].set_title("Controller Interval")
+    axes[0].set_title("Network-Affected Input vs Controlled Output")
+    input_upper = max((value for value in input_tail if math.isfinite(value)), default=0.0)
+    output_upper = max(output["interval_p95"], default=0.0)
+    if output["raw_v"]:
+        output_upper = max(output_upper, percentile(output["raw_v"], 0.99))
+    axes[0].set_ylim(bottom=0.0, top=max(1.0, input_upper, output_upper) * 1.08)
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="upper right")
     axes[1].plot(data["t"], data["q_buffered_frames"], linewidth=1.1, label="actual depth")
@@ -582,7 +596,7 @@ def main():
                   "rate": float(summary.get("payload_rate_mbps", 0))}
     remove_old_outputs(args.out_dir)
     plot_output(args.out_dir, arrivals, sender, stages)
-    plot_controller(args.out_dir, queue, stages)
+    plot_controller(args.out_dir, queue, arrivals, stages)
     plot_network(args.out_dir, queue, stages)
     write_assessment(args.out_dir, arrivals, queue, sender, stage_rows(stages, stage_metrics))
 

@@ -18,11 +18,12 @@ class NetCSVWriter
     ~NetCSVWriter();
 
     void start(Clock::time_point now);
-    void on_frame(Clock::time_point now, const QueueStatsSnapshot &stats);
+    bool on_frame(Clock::time_point now);
+    void write(const QueueStatsSnapshot &stats);
     void stop(Clock::time_point now, const QueueStatsSnapshot &stats);
 
   private:
-    void write(Clock::time_point now, double idle_gap_ms, const QueueStatsSnapshot &stats);
+    void write_row(Clock::time_point now, double idle_gap_s, const QueueStatsSnapshot &stats);
     bool open();
     bool rotate();
     void clear_files();
@@ -39,12 +40,14 @@ class NetCSVWriter
     bool file_failed_ = false;
     bool has_last_frame_ = false;
     bool has_last_write_ = false;
-    bool has_baseline_ = false;
+    bool write_pending_ = false;
     uint64_t part_id_ = 0;
     uint64_t segment_id_ = 0;
     Clock::time_point start_time_{};
     Clock::time_point last_frame_time_{};
     Clock::time_point last_write_time_{};
+    Clock::time_point pending_time_{};
+    double pending_idle_gap_s_ = 0.0;
     QueueStatsSnapshot baseline_;
 };
 

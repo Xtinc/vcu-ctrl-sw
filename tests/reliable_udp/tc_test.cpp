@@ -26,8 +26,8 @@ namespace
 using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t TEST_MAGIC = 0x524a5443u; // RJTC
-constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v7";
-constexpr const char *ARRIVAL_CSV_HEADER = "elapsed_ms,seq,interval_ms,latency_ms,size_bytes";
+constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v8";
+constexpr const char *ARRIVAL_CSV_HEADER = "elapsed_s,seq,interval_ms,latency_ms,size_bytes";
 
 #pragma pack(push, 1)
 struct JitterMsgHdr
@@ -89,6 +89,11 @@ static uint64_t elapsed_us(Clock::time_point start, Clock::time_point now)
 static double elapsed_ms(Clock::time_point start, Clock::time_point now)
 {
     return std::chrono::duration<double, std::milli>(now - start).count();
+}
+
+static double elapsed_s(Clock::time_point start, Clock::time_point now)
+{
+    return std::chrono::duration<double>(now - start).count();
 }
 
 static uint32_t adler32_compute(const uint8_t *data, size_t len)
@@ -223,7 +228,7 @@ static void handle_received_frames(RunState &state, const std::vector<QueueFrame
             (static_cast<double>(elapsed_us(state.start_time, now)) - static_cast<double>(hdr.send_elapsed_us)) /
             1000.0;
 
-        state.arrival_csv << std::fixed << std::setprecision(3) << elapsed_ms(state.start_time, now) << ',' << hdr.seq
+        state.arrival_csv << std::fixed << std::setprecision(3) << elapsed_s(state.start_time, now) << ',' << hdr.seq
                           << ',' << interval << ',' << latency << ',' << frame.size << '\n';
 
         state.last_arrival = now;
