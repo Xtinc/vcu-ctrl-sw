@@ -325,8 +325,10 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
 
         const double q95_ms = jitter_hist.quantile(JITTER_TAIL_QUANTILE);
         const double tail_sample_ms = std::isfinite(q95_ms) ? std::max(q95_ms, late_sample_ms) : late_sample_ms;
-        jitter_tail += (tail_sample_ms >= jitter_tail ? 1.0 : ema_gain(SLOW_ESTIMATE_WINDOW_FRAMES)) *
-                       (tail_sample_ms - jitter_tail);
+        if (tail_sample_ms >= jitter_tail)
+            jitter_tail += std::min(tail_sample_ms - jitter_tail, interval_avg);
+        else
+            jitter_tail += ema_gain(SLOW_ESTIMATE_WINDOW_FRAMES) * (tail_sample_ms - jitter_tail);
     }
 
     last_seq = abs_seq;
