@@ -649,8 +649,8 @@ void RecvQueueAsync::purge_stale_locked(ClockTP now)
     if (buffered_frames_.front().arrival >= cutoff)
         return;
 
-    const size_t depth_before = buffered_frames_.size();
-    const uint32_t expected_before = expected_seq_;
+    // const size_t depth_before = buffered_frames_.size();
+    // const uint32_t expected_before = expected_seq_;
     const uint32_t first_stale_seq = buffered_frames_.front().seq;
     uint32_t last_stale_seq = first_stale_seq;
     uint64_t stale_count = 0;
@@ -922,7 +922,7 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
         return;
 
     const uint32_t missing = next_available_seq - expected_seq_;
-    const double interval_ms = estimated_interval_ms_locked();
+    // const double interval_ms = estimated_interval_ms_locked();
     // VIDEO_DEBUG_PRINT(
     //     "[JitterBuf] gap skip expected=%u next=%u miss=%u depth=%zu avg_fi=%.2fms jitter=%.2fms disorder=%.2f",
     //     expected_seq_, next_available_seq, missing, buffered_frames_.size(), interval_ms, arrival_est_.jitter_avg,
