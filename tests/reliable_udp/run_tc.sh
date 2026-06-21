@@ -380,7 +380,7 @@ fi
 
 echo
 echo "Done. Key outputs:"
-echo "  ${OUT_DIR}/output_smoothness.png"
-echo "  ${OUT_DIR}/controller_terms.png"
-echo "  ${OUT_DIR}/network_effects.png"
+echo "  ${OUT_DIR}/output_smoothness_*.png"
+echo "  ${OUT_DIR}/controller_terms_*.png"
+echo "  ${OUT_DIR}/network_effects_*.png"
 echo "  ${OUT_DIR}/controller_assessment.txt"

@@ -7,7 +7,7 @@
  * renders the output on-screen via DRM/KMS zero-copy.
  *
  * Usage:
- *   vcu_dec --port <port> [--drm <device>]
+ *   vcu_dec --port <port> --reply-addr <addr> --reply-port <port> [--drm <device>]
  *
  *   --port <port>   Local UDP port to receive encoded bitstream on (required).
  *   Codec           Fixed to H265/HEVC.
@@ -46,12 +46,12 @@ static constexpr uint32_t kInputBufSize = 4u * 1024u * 1024u;
 
 static void print_usage(const char *app)
 {
-    VIDEO_ERROR_PRINT("Usage: %s --port <port> [--drm <device>] [--reply-addr <addr> --reply-port <port>]", app);
+    VIDEO_ERROR_PRINT("Usage: %s --port <port> --reply-addr <addr> --reply-port <port> [--drm <device>]", app);
     VIDEO_ERROR_PRINT("  --port <port>               Local UDP port to receive encoded bitstream on (required).");
     VIDEO_ERROR_PRINT("  codec                       Fixed to H265/HEVC.");
     VIDEO_ERROR_PRINT("  --drm <device>              DRM device node (default: /dev/dri/card0).");
-    VIDEO_ERROR_PRINT("  --reply-addr <addr>         Encoder address to reply RTT probes to (optional).");
-    VIDEO_ERROR_PRINT("  --reply-port <port>         Encoder UDP port to reply RTT probes to (optional).");
+    VIDEO_ERROR_PRINT("  --reply-addr <addr>         Encoder address to reply RTT probes to (required).");
+    VIDEO_ERROR_PRINT("  --reply-port <port>         Encoder UDP port to reply RTT probes to (required).");
 }
 
 static bool parse_options(int argc, char *argv[], AppOptions &options)
@@ -136,6 +136,12 @@ static bool parse_options(int argc, char *argv[], AppOptions &options)
         return false;
     }
 
+    if (options.reply_addr.empty() || options.reply_port == 0)
+    {
+        VIDEO_ERROR_PRINT("--reply-addr and --reply-port are required.");
+        return false;
+    }
+
     return true;
 }
 
@@ -161,11 +167,9 @@ int main(int argc, char *argv[])
     cfg.low_delay_mode = false;
     cfg.drm_device = options.drm_device;
     cfg.udp_local_port = options.udp_port;
-    cfg.udp_reply_addr = options.reply_addr;
-    cfg.udp_reply_port = options.reply_port;
 
     DecMgr dec_mgr(cfg);
-    if (!dec_mgr.start())
+    if (!dec_mgr.start(options.reply_addr, options.reply_port))
     {
         VIDEO_ERROR_PRINT("Failed to start DecMgr pipeline");
         return EXIT_FAILURE;

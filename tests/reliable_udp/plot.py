@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import bisect
 import csv
+import glob
 import math
 import os
+from array import array
 from collections import deque
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -12,9 +15,11 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 SAVE_DPI = 300
 ROLLING_WINDOW = 100
+DEFAULT_PLOT_WINDOW_SECONDS = 600.0
 OUTPUTS = {
     "output_smoothness.png",
     "controller_terms.png",
@@ -58,11 +63,22 @@ def percentile(values, p):
     return ordered[lo] + (pos - lo) * (ordered[hi] - ordered[lo])
 
 
+def percentile_sorted(ordered, p):
+    if len(ordered) == 0:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = p * (len(ordered) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (pos - lo) * (ordered[hi] - ordered[lo])
+
+
 class SampleStats:
     """Exact statistics over all captured values."""
 
     def __init__(self):
-        self.values = []
+        self.values = array("d")
         self.count = 0
         self.total = 0.0
         self.maximum = 0.0
@@ -74,18 +90,20 @@ class SampleStats:
         self.values.append(value)
 
     def summary(self):
+        # NumPy keeps the temporary sort buffer compact for multi-million-row logs.
+        ordered = np.sort(np.frombuffer(self.values, dtype=np.float64))
         return {
             "count": self.count,
             "mean": self.total / self.count if self.count else 0.0,
-            "p50": percentile(self.values, 0.50),
-            "p90": percentile(self.values, 0.90),
-            "p95": percentile(self.values, 0.95),
-            "p99": percentile(self.values, 0.99),
+            "p50": percentile_sorted(ordered, 0.50),
+            "p90": percentile_sorted(ordered, 0.90),
+            "p95": percentile_sorted(ordered, 0.95),
+            "p99": percentile_sorted(ordered, 0.99),
             "max": self.maximum,
         }
 
 
-def csv_rows(path, required, include_rotated=False):
+def csv_paths(path, include_rotated=False):
     paths = [path]
     if include_rotated:
         archives = []
@@ -94,6 +112,11 @@ def csv_rows(path, required, include_rotated=False):
             archives.append("{}.{}".format(path, index))
             index += 1
         paths = list(reversed(archives)) + paths
+    return paths
+
+
+def csv_rows(path, required, include_rotated=False):
+    paths = csv_paths(path, include_rotated)
 
     for current_path in paths:
         with open(current_path, newline="") as stream:
@@ -207,24 +230,50 @@ class StageMetrics:
         self.bad_events = 0.0
 
 
-def process_arrivals(path, stages, stage_metrics):
+def empty_arrival_plot():
+    return {"raw_t": [], "raw_v": [], "smooth_t": [], "interval_mean": [], "interval_p95": [],
+            "latency_mean": [], "latency_p95": [], "qse_t": [], "qse_v": []}
+
+
+def process_arrivals(path, stages, stage_metrics, window_seconds, emit_window):
     interval_stats = SampleStats()
     latency_stats = SampleStats()
     cv_stats = SampleStats()
     recent_intervals = deque()
+    sorted_intervals = []
     interval_sum = 0.0
     interval_sum_sq = 0.0
     recent_latencies = deque()
-    plot = {"raw_t": [], "raw_v": [], "smooth_t": [], "interval_mean": [], "interval_p95": [],
-            "latency_mean": [], "latency_p95": [], "qse_t": [], "qse_v": []}
+    sorted_latencies = []
+    latency_sum = 0.0
+    plot = empty_arrival_plot()
     last_qse = None
     last_time = 0.0
     row_count = 0
+    window_start = None
+
+    def flush_window(end_time):
+        if not plot["raw_t"]:
+            return
+        if plot["qse_t"]:
+            plot["qse_t"].append(end_time)
+            plot["qse_v"].append(plot["qse_v"][-1])
+        emit_window(window_start, end_time, plot)
 
     for row in csv_rows(path, ARRIVAL_COLUMNS):
         row_count += 1
         timestamp = as_float(row, "elapsed_s")
         last_time = timestamp
+        row_window_start = math.floor(timestamp / window_seconds) * window_seconds
+        if window_start is None:
+            window_start = row_window_start
+        elif row_window_start != window_start:
+            flush_window(window_start + window_seconds)
+            plot = empty_arrival_plot()
+            window_start = row_window_start
+            if last_qse is not None:
+                plot["qse_t"].append(window_start)
+                plot["qse_v"].append(last_qse)
         qse = 1 if as_float(row, "qs_immediate") > 0 else 0
         if qse != last_qse:
             plot["qse_t"].append(timestamp)
@@ -235,8 +284,12 @@ def process_arrivals(path, stages, stage_metrics):
         if math.isfinite(latency) and latency >= 0.0:
             latency_stats.add(latency)
             recent_latencies.append(latency)
+            bisect.insort(sorted_latencies, latency)
+            latency_sum += latency
             if len(recent_latencies) > ROLLING_WINDOW:
-                recent_latencies.popleft()
+                removed = recent_latencies.popleft()
+                latency_sum -= removed
+                sorted_latencies.pop(bisect.bisect_left(sorted_latencies, removed))
             stage_index = stage_for_time(stages, timestamp)
             if stage_index is not None:
                 stage_metrics[stage_index].latency.add(latency)
@@ -246,12 +299,14 @@ def process_arrivals(path, stages, stage_metrics):
             continue
         interval_stats.add(interval)
         recent_intervals.append(interval)
+        bisect.insort(sorted_intervals, interval)
         interval_sum += interval
         interval_sum_sq += interval * interval
         if len(recent_intervals) > ROLLING_WINDOW:
             removed = recent_intervals.popleft()
             interval_sum -= removed
             interval_sum_sq -= removed * removed
+            sorted_intervals.pop(bisect.bisect_left(sorted_intervals, removed))
         mean = interval_sum / len(recent_intervals)
         variance = max(0.0, interval_sum_sq / len(recent_intervals) - mean * mean)
         cv_stats.add(math.sqrt(variance) / mean if mean > 0.0 else 0.0)
@@ -259,13 +314,12 @@ def process_arrivals(path, stages, stage_metrics):
         plot["raw_v"].append(interval)
         plot["smooth_t"].append(timestamp)
         plot["interval_mean"].append(mean)
-        plot["interval_p95"].append(percentile(list(recent_intervals), 0.95))
-        plot["latency_mean"].append(sum(recent_latencies) / len(recent_latencies) if recent_latencies else float("nan"))
-        plot["latency_p95"].append(percentile(list(recent_latencies), 0.95) if recent_latencies else float("nan"))
-    if plot["qse_t"]:
-        plot["qse_t"].append(last_time)
-        plot["qse_v"].append(plot["qse_v"][-1])
-    return {"count": row_count, "plot": plot, "interval": interval_stats.summary(),
+        plot["interval_p95"].append(percentile_sorted(sorted_intervals, 0.95))
+        plot["latency_mean"].append(latency_sum / len(recent_latencies) if recent_latencies else float("nan"))
+        plot["latency_p95"].append(percentile_sorted(sorted_latencies, 0.95) if recent_latencies else float("nan"))
+    if window_start is not None:
+        flush_window(last_time)
+    return {"count": row_count, "interval": interval_stats.summary(),
             "latency": latency_stats.summary(), "cv": cv_stats.summary()}
 
 
@@ -273,9 +327,9 @@ def process_queue(path, stages, stage_metrics):
     keys = ("q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_buffered_frames", "q_adaptive_depth",
             "q_skip_delta", "q_drop_delta", "q_reorder_delta", "q_tail_jitter_ms", "q_tail_jitter_frames",
             "q_disorder_frames", "q_pressure_frames")
-    plot = {"t": []}
+    plot = {"t": array("d")}
     for key in keys:
-        plot[key] = []
+        plot[key] = array("d")
     input_stats = SampleStats()
     short_input_stats = SampleStats()
     output_stats = SampleStats()
@@ -352,9 +406,9 @@ def save_figure(fig, out_dir, filename):
     print("wrote {}".format(path))
 
 
-def plot_output(out_dir, arrivals, sender, stages):
+def plot_output(out_dir, arrivals, sender, stages, filename, time_range):
     data = arrivals["plot"]
-    has_latency = arrivals["latency"]["count"] > 0
+    has_latency = any(math.isfinite(value) for value in data["latency_mean"])
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
     axes[0].plot(data["raw_t"], data["raw_v"], linewidth=0.45, alpha=0.25, label="output interval samples")
     axes[0].plot(data["smooth_t"], data["interval_mean"], linewidth=1.2, label="rolling mean")
@@ -398,10 +452,11 @@ def plot_output(out_dir, arrivals, sender, stages):
     if has_latency or stages:
         axes[1].legend(loc="upper right")
     annotate_stages(axes, stages)
-    save_figure(fig, out_dir, "output_smoothness.png")
+    axes[1].set_xlim(*time_range)
+    save_figure(fig, out_dir, filename)
 
 
-def plot_controller(out_dir, queue, arrivals, stages):
+def plot_controller(out_dir, queue, arrivals, stages, filename, time_range):
     data = queue["plot"]
     output = arrivals["plot"]
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
@@ -435,10 +490,11 @@ def plot_controller(out_dir, queue, arrivals, stages):
     axes[1].grid(True, alpha=0.25)
     axes[1].legend(loc="upper right")
     annotate_stages(axes, stages)
-    save_figure(fig, out_dir, "controller_terms.png")
+    axes[1].set_xlim(*time_range)
+    save_figure(fig, out_dir, filename)
 
 
-def plot_network(out_dir, queue, stages):
+def plot_network(out_dir, queue, stages, filename, time_range):
     data = queue["plot"]
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
     event_lines = (("q_reorder_delta", "reorder events"), ("q_skip_delta", "skipped frames"),
@@ -484,25 +540,39 @@ def plot_network(out_dir, queue, stages):
     axes[1].grid(True, alpha=0.25)
     axes[1].legend(loc="upper right")
     annotate_stages(axes, stages)
-    save_figure(fig, out_dir, "network_effects.png")
+    axes[1].set_xlim(*time_range)
+    save_figure(fig, out_dir, filename)
 
 
 def stage_rows(stages, metrics):
     rows = []
     for stage, values in zip(stages, metrics):
+        target = values.target.summary()
+        raw = values.raw.summary()
+        reorder = values.reorder_driver.summary()
+        jitter = values.jitter_driver.summary()
+        pressure = values.pressure_driver.summary()
+        latency = values.latency.summary()
         rows.append({
             "stage": stage["stage"], "start_s": stage["start_s"], "end_s": stage["end_s"],
-            "target_p50_frames": values.target.summary()["p50"],
-            "target_p95_frames": values.target.summary()["p95"],
-            "raw_p50_frames": values.raw.summary()["p50"],
-            "reorder_p95_frames": values.reorder_driver.summary()["p95"],
-            "jitter_driver_p95_frames": values.jitter_driver.summary()["p95"],
-            "pressure_p95_frames": values.pressure_driver.summary()["p95"],
-            "latency_p50_ms": values.latency.summary()["p50"],
-            "latency_p95_ms": values.latency.summary()["p95"],
+            "target_p50_frames": target["p50"],
+            "target_p95_frames": target["p95"],
+            "raw_p50_frames": raw["p50"],
+            "reorder_p95_frames": reorder["p95"],
+            "jitter_driver_p95_frames": jitter["p95"],
+            "pressure_p95_frames": pressure["p95"],
+            "latency_p50_ms": latency["p50"],
+            "latency_p95_ms": latency["p95"],
             "reorder_events": values.reorder_events, "bad_events": values.bad_events,
         })
     return rows
+
+
+def queue_plot_window(queue, start_s, end_s):
+    data = queue["plot"]
+    first = bisect.bisect_left(data["t"], start_s)
+    last = bisect.bisect_right(data["t"], end_s)
+    return {key: values[first:last] for key, values in data.items()}
 
 
 def write_assessment(out_dir, arrivals, queue, sender, stages):
@@ -539,7 +609,7 @@ def write_assessment(out_dir, arrivals, queue, sender, stages):
         if sender:
             stream.write("- sender_mean: {:.2f}\n- receive_minus_send_mean: {:.2f}\n".format(
                 sender["mean"], interval["mean"] - sender["mean"]))
-        stream.write("- rolling_cv_p95: {:.4f}\n- see: output_smoothness.png\n\n".format(cv["p95"]))
+        stream.write("- rolling_cv_p95: {:.4f}\n- see: output_smoothness_*.png\n\n".format(cv["p95"]))
         stream.write("Latency (ms)\n")
         if latency["count"] == 0:
             stream.write("- unavailable: clock synchronization was not established\n")
@@ -548,14 +618,14 @@ def write_assessment(out_dir, arrivals, queue, sender, stages):
                 stream.write("- {}: {:.2f}\n".format(key, latency[key]))
         stream.write("\nController\n- short_input_interval_p95: {:.2f} ms\n"
                      "- smoothed_input_interval_p95: {:.2f} ms\n- commanded_output_p95: {:.2f} ms\n"
-                     "- buffered_p95: {:.2f} frames\n- target_p95: {:.2f} frames\n- see: controller_terms.png\n\n".format(
+                     "- buffered_p95: {:.2f} frames\n- target_p95: {:.2f} frames\n- see: controller_terms_*.png\n\n".format(
                          queue["short_input"]["p95"], queue["input"]["p95"], queue["output"]["p95"],
                          queue["buffered"]["p95"],
                          queue["target"]["p95"]))
         stream.write("Events\n")
         for key in ("skip", "late", "overflow", "drop", "stale", "reorder"):
             stream.write("- {}: {}\n".format(key, int(events[key])))
-        stream.write("- see: network_effects.png\n")
+        stream.write("- see: network_effects_*.png\n")
         if stages:
             stream.write("\nStage effects\nstage,start_s,end_s,target_p50_frames,target_p95_frames,raw_p50_frames,"
                          "reorder_p95_frames,jitter_driver_p95_frames,pressure_p95_frames,latency_p50_ms,"
@@ -573,21 +643,26 @@ def remove_old_outputs(out_dir):
         path = os.path.join(out_dir, name)
         if os.path.exists(path):
             os.remove(path)
+    for prefix in ("output_smoothness_", "controller_terms_", "network_effects_"):
+        for path in glob.glob(os.path.join(out_dir, prefix + "*.png")):
+            os.remove(path)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate bounded-memory ReliableUDP controller plots.")
     parser.add_argument("out_dir", help="directory containing arrival_intervals.csv and queue_stats.csv")
     parser.add_argument("--sender-summary", help="optional sender_summary.txt")
+    parser.add_argument("--plot-window-seconds", type=float, default=DEFAULT_PLOT_WINDOW_SECONDS,
+                        help="seconds shown in each full-resolution plot set (default: %(default)s)")
     args = parser.parse_args()
+    if not math.isfinite(args.plot_window_seconds) or args.plot_window_seconds <= 0.0:
+        parser.error("--plot-window-seconds must be greater than zero")
     arrival_path = os.path.join(args.out_dir, "arrival_intervals.csv")
     queue_path = os.path.join(args.out_dir, "queue_stats.csv")
     if not os.path.exists(arrival_path) or not os.path.exists(queue_path):
         raise SystemExit("missing arrival_intervals.csv or queue_stats.csv in {}".format(args.out_dir))
     stages = read_stages(args.out_dir)
     stage_metrics = [StageMetrics() for _ in stages]
-    arrivals = process_arrivals(arrival_path, stages, stage_metrics)
-    queue = process_queue(queue_path, stages, stage_metrics)
     summary = read_summary(args.sender_summary)
     sender = None
     if "send_interval_mean_ms" in summary:
@@ -595,9 +670,27 @@ def main():
                   "sent": int(summary.get("sent_count", 0)), "failed": int(summary.get("send_fail_count", 0)),
                   "rate": float(summary.get("payload_rate_mbps", 0))}
     remove_old_outputs(args.out_dir)
-    plot_output(args.out_dir, arrivals, sender, stages)
-    plot_controller(args.out_dir, queue, arrivals, stages)
-    plot_network(args.out_dir, queue, stages)
+    queue = process_queue(queue_path, stages, stage_metrics)
+    page = 0
+
+    def emit_window(start_s, end_s, arrival_plot):
+        nonlocal page
+        page += 1
+        suffix = "_{:03d}_{:07.0f}-{:07.0f}s.png".format(page, start_s, end_s)
+        time_range = (start_s, end_s)
+        window_stages = [stage for stage in stages
+                         if stage["end_s"] > start_s and stage["start_s"] < end_s]
+        window_arrivals = {"plot": arrival_plot}
+        window_queue = dict(queue)
+        window_queue["plot"] = queue_plot_window(queue, start_s, end_s)
+        plot_output(args.out_dir, window_arrivals, sender, window_stages,
+                    "output_smoothness" + suffix, time_range)
+        plot_controller(args.out_dir, window_queue, window_arrivals, window_stages,
+                        "controller_terms" + suffix, time_range)
+        plot_network(args.out_dir, window_queue, window_stages, "network_effects" + suffix, time_range)
+
+    arrivals = process_arrivals(arrival_path, stages, stage_metrics,
+                                args.plot_window_seconds, emit_window)
     write_assessment(args.out_dir, arrivals, queue, sender, stage_rows(stages, stage_metrics))
 
 

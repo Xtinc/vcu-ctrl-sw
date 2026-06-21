@@ -38,7 +38,7 @@ DecMgr::~DecMgr()
     stop();
 }
 
-bool DecMgr::start()
+bool DecMgr::start(const std::string &udp_reply_addr, uint16_t udp_reply_port)
 {
     if (m_running.exchange(true))
     {
@@ -49,6 +49,13 @@ bool DecMgr::start()
     if (m_cfg.udp_local_port == 0)
     {
         VIDEO_ERROR_PRINT("DecMgr: invalid UDP local port 0");
+        m_running.store(false);
+        return false;
+    }
+
+    if (udp_reply_addr.empty() || udp_reply_port == 0)
+    {
+        VIDEO_ERROR_PRINT("DecMgr: invalid RTT reply destination %s:%u", udp_reply_addr.c_str(), udp_reply_port);
         m_running.store(false);
         return false;
     }
@@ -90,13 +97,11 @@ bool DecMgr::start()
 
         m_receiver->start();
 
-        if (!m_cfg.udp_reply_addr.empty() && m_cfg.udp_reply_port > 0)
+        if (!m_receiver->add_destination(udp_reply_addr, udp_reply_port))
         {
-            if (!m_receiver->add_destination(m_cfg.udp_reply_addr, m_cfg.udp_reply_port))
-            {
-                VIDEO_ERROR_PRINT("DecMgr: failed to set RTT reply destination %s:%u", m_cfg.udp_reply_addr.c_str(),
-                                  m_cfg.udp_reply_port);
-            }
+            VIDEO_ERROR_PRINT("DecMgr: failed to set RTT reply destination %s:%u", udp_reply_addr.c_str(),
+                              udp_reply_port);
+            throw std::runtime_error("DecMgr: add RTT reply destination failed");
         }
 
         return true;

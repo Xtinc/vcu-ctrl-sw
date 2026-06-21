@@ -47,8 +47,6 @@ struct DecMgrConfig
     int desired_height = 0;                          ///< Preferred display height (0 = no preference)
     int desired_refresh = 0;                         ///< Preferred refresh rate in Hz (0 = auto)
     uint16_t udp_local_port = 0;                     ///< Local UDP port to receive bitstream on (required, > 0)
-    std::string udp_reply_addr;                      ///< Encoder address for RTT probes (optional)
-    uint16_t udp_reply_port = 0;                     ///< Encoder UDP port for RTT probes (0 = disabled)
 };
 
 /**
@@ -65,7 +63,7 @@ struct DecMgrConfig
  *   cfg.drm_device = "/dev/dri/card0";
  *
  *   DecMgr mgr(cfg);
- *   if (!mgr.start()) {
+ *   if (!mgr.start("192.0.2.10", 5004)) {
  *       // handle error
  *   }
  *
@@ -153,10 +151,13 @@ class DecMgr
     DecMgr &operator=(DecMgr &&) = delete;
 
     /**
-     * @brief Initialize the decoder+display pipeline.
+     * @brief Initialize the decoder+display pipeline and set the RTT reply destination.
      *
      * Allocates and initializes the DRM/KMS display and hardware decoder.
      * Opens the VCU device, creates buffer pools, and starts the DRM event thread.
+     *
+     * @param udp_reply_addr Encoder address used for RTT probes during this run.
+     * @param udp_reply_port Encoder UDP port used for RTT probes during this run. Must be > 0.
      *
      * @return true   Pipeline successfully started and ready to accept data.
      * @return false  Initialization failed, or start() was already called.
@@ -166,11 +167,12 @@ class DecMgr
      *
      * @par Failure reasons
      * - Pipeline already running (start() called twice)
+     * - RTT reply address is empty, invalid, or the reply port is zero
      * - DRM device cannot be opened (permission/availability)
      * - VCU decoder device unavailable or in use
      * - Buffer allocation failure (out of DMA memory)
      */
-    bool start();
+    bool start(const std::string &udp_reply_addr, uint16_t udp_reply_port);
 
     /**
      * @brief Gracefully stop the pipeline and release all resources.
