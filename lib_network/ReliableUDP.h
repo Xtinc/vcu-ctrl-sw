@@ -307,6 +307,8 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     uint16_t next_frame_id_;
     uint16_t last_frame_id_;
     uint16_t last_group_id_;
+    bool has_last_receive_activity_;
+    std::chrono::steady_clock::time_point last_receive_activity_;
     std::list<TRXGroup> receive_groups_;
     std::list<TRXFrame> receive_frames_;
 

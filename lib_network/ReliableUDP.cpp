@@ -5,6 +5,7 @@ using asio::ip::udp;
 
 constexpr static auto TRX_RS_FEC_GROUP_UNIT_NUMS = MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY;
 constexpr static auto TRX_XOR_FEC_GROUP_UNIT_NUMS = MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY;
+constexpr static auto RECEIVE_EPOCH_IDLE_TIMEOUT = std::chrono::milliseconds(1000);
 
 static inline uint32_t get_time_ms()
 {
@@ -147,7 +148,8 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
       send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), has_active_conn_uuid_(false),
       active_conn_uuid_(0), destination_set_(false), frame_cycle_(1), group_cycle_(1), next_group_id_(1),
-      next_frame_id_(1), last_frame_id_(0), last_group_id_(0), usr_queue_(std::make_unique<RecvQueueAsync>()),
+      next_frame_id_(1), last_frame_id_(0), last_group_id_(0), has_last_receive_activity_(false),
+      last_receive_activity_(std::chrono::steady_clock::time_point{}), usr_queue_(std::make_unique<RecvQueueAsync>()),
       send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
       last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
       last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
@@ -610,6 +612,12 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
     {
         reset_receive_state_for_new_epoch(uid);
     }
+    else if (has_last_receive_activity_ && now - last_receive_activity_ > RECEIVE_EPOCH_IDLE_TIMEOUT)
+    {
+        reset_receive_state_for_new_epoch(uid);
+    }
+    has_last_receive_activity_ = true;
+    last_receive_activity_ = now;
 
     if (last_group_id_ > 3 * 0xffffu / 4 && seq < 0xffffu / 4)
     {
@@ -724,7 +732,10 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
 
 void ReliableUDP::reset_receive_state_for_new_epoch(uint16_t uid)
 {
-    VIDEO_INFO_PRINT("Remote stream epoch changed: %u -> %u, reset receive state", active_conn_uuid_, uid);
+    if (uid == active_conn_uuid_)
+        VIDEO_INFO_PRINT("Remote stream idle discontinuity, reset receive epoch uuid=%u", uid);
+    else
+        VIDEO_INFO_PRINT("Remote stream epoch changed: %u -> %u, reset receive state", active_conn_uuid_, uid);
 
     for (auto &group : receive_groups_)
     {
