@@ -107,9 +107,9 @@ static const drmModeModeInfo *select_best_mode(const drmModeConnector *conn, int
         const drmModeModeInfo *mi = &conn->modes[i];
         const int s = score_drm_mode(mi, desired_width, desired_height, desired_refresh);
         const uint32_t mHz = mode_vrefresh_mHz(mi);
-        VIDEO_DEBUG_PRINT("DRMDisplay: mode[%d] %dx%d@%u.%03uHz (clock=%ukHz, type=0x%x) score=%d%s", i, mi->hdisplay,
-                          mi->vdisplay, mHz / 1000, mHz % 1000, mi->clock, mi->type, s,
-                          s == 0 ? " (filtered)" : (mi->type & DRM_MODE_TYPE_PREFERRED ? " [PREFERRED]" : ""));
+        VIDEO_INFO_PRINT("DRMDisplay: mode[%d] %dx%d@%u.%03uHz (clock=%ukHz, type=0x%x) score=%d%s", i, mi->hdisplay,
+                         mi->vdisplay, mHz / 1000, mHz % 1000, mi->clock, mi->type, s,
+                         s == 0 ? " (filtered)" : (mi->type & DRM_MODE_TYPE_PREFERRED ? " [PREFERRED]" : ""));
         if (s > best_score)
         {
             best_score = s;
@@ -435,8 +435,8 @@ void DRMDisplayBase::init_drm()
         {
             m_selected_mode = *best;
             m_frame_ns = mode_frame_duration(best);
-            VIDEO_DEBUG_PRINT("DRMDisplay: selected mode %dx%d@%uHz (clock=%ukHz) -> frame %.3f ms", best->hdisplay,
-                              best->vdisplay, best->vrefresh, best->clock, m_frame_ns.count() * 1e-6);
+            VIDEO_INFO_PRINT("DRMDisplay: selected mode %dx%d@%uHz (clock=%ukHz) -> frame %.3f ms", best->hdisplay,
+                             best->vdisplay, best->vrefresh, best->clock, m_frame_ns.count() * 1e-6);
         }
         else
         {
@@ -534,8 +534,8 @@ void DRMDisplayBase::init_drm()
         throw std::runtime_error("DRMDisplay: connector is missing CRTC_ID property");
     }
 
-    VIDEO_DEBUG_PRINT("DRMDisplay: fd=%d connector=%u crtc=%u plane=%u pipe=%d", m_drm_fd, m_conn_id, m_crtc_id,
-                      m_plane_id, m_pipe);
+    VIDEO_INFO_PRINT("DRMDisplay: fd=%d connector=%u crtc=%u plane=%u pipe=%d", m_drm_fd, m_conn_id, m_crtc_id,
+                     m_plane_id, m_pipe);
 }
 
 void DRMDisplayBase::close_drm()
@@ -947,8 +947,7 @@ bool DRMDisplay::set_output_resolution(uint32_t w, uint32_t h)
     {
         std::lock_guard<std::mutex> lk(m_mutex);
         if (m_selected_mode.hdisplay >= w && m_selected_mode.vdisplay >= h &&
-            m_cfg.desired_width == static_cast<int>(w) &&
-            m_cfg.desired_height == static_cast<int>(h))
+            m_cfg.desired_width == static_cast<int>(w) && m_cfg.desired_height == static_cast<int>(h))
         {
             return true;
         }
@@ -1251,8 +1250,8 @@ void DRMDisplayDumb::alloc_dumb_bufs()
                     (kColours[i] >> 8) & 0xFF,  // G
                     (kColours[i] >> 0) & 0xFF); // B
 
-        VIDEO_DEBUG_PRINT("DRMDisplayDumb: buf[%d] gem=%u fb=%u pitch=%u size=%llu", i, b.gem_handle, b.fb_id, b.pitch,
-                          static_cast<unsigned long long>(b.size));
+        VIDEO_INFO_PRINT("DRMDisplayDumb: buf[%d] gem=%u fb=%u pitch=%u size=%llu", i, b.gem_handle, b.fb_id, b.pitch,
+                         static_cast<unsigned long long>(b.size));
     }
 }
 

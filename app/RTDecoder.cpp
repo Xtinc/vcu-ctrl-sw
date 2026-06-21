@@ -333,7 +333,7 @@ void RTDecoder::on_sdk_display(AL_TBuffer *pFrame, AL_TInfoDecode *pInfo)
         // AL_OUTPUT_PRIMARY / AL_OUTPUT_LCEVC: only relevant for multi-layer (LCEVC) decode
         // which RTDecoder does not support. Log and drop — do NOT call PutDisplayPicture,
         // consistent with exe_decoder reference implementation.
-        VIDEO_DEBUG_PRINT("RTDecoder: unexpected non-main output (eOutputID=%d), dropping frame", pInfo->eOutputID);
+        // VIDEO_DEBUG_PRINT("RTDecoder: unexpected non-main output (eOutputID=%d), dropping frame", pInfo->eOutputID);
         return;
     }
 
@@ -461,7 +461,7 @@ void RTDecoder::signal_error(AL_ERR err)
     }
     else if (AL_IS_WARNING_CODE(err))
     {
-        VIDEO_DEBUG_PRINT("Decoder warning: %s", AL_Codec_ErrorToString(err));
+        VIDEO_ERROR_PRINT("Decoder warning: %s", AL_Codec_ErrorToString(err));
     }
 }
 

@@ -682,10 +682,10 @@ void RecvQueueAsync::purge_stale_locked(ClockTP now)
     gap_deadline_ = ClockTP{};
     next_delivery_time_ = now;
 
-    VIDEO_DEBUG_PRINT(
-        "[JitterBuf] stale prefix drop seq=%u..%u count=%llu age_max=%.2fms expected=%u->%u depth=%zu->%zu",
-        first_stale_seq, last_stale_seq, static_cast<unsigned long long>(stale_count), max_age_ms, expected_before,
-        expected_seq_, depth_before, buffered_frames_.size());
+    // VIDEO_DEBUG_PRINT(
+    //     "[JitterBuf] stale prefix drop seq=%u..%u count=%llu age_max=%.2fms expected=%u->%u depth=%zu->%zu",
+    //     first_stale_seq, last_stale_seq, static_cast<unsigned long long>(stale_count), max_age_ms, expected_before,
+    //     expected_seq_, depth_before, buffered_frames_.size());
 }
 
 bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
@@ -731,8 +731,8 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
 
     while (buffered_frames_.size() > tuning_.max_depth)
     {
-        VIDEO_DEBUG_PRINT("[JitterBuf] buffered frames overflow: size=%zu max=%zu", buffered_frames_.size(),
-                          tuning_.max_depth);
+        // VIDEO_DEBUG_PRINT("[JitterBuf] buffered frames overflow: size=%zu max=%zu", buffered_frames_.size(),
+        //                   tuning_.max_depth);
         auto tail = std::prev(buffered_frames_.end());
         ++drop_count_;
         ++overflow_count_;
@@ -923,10 +923,10 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
 
     const uint32_t missing = next_available_seq - expected_seq_;
     const double interval_ms = estimated_interval_ms_locked();
-    VIDEO_DEBUG_PRINT(
-        "[JitterBuf] gap skip expected=%u next=%u miss=%u depth=%zu avg_fi=%.2fms jitter=%.2fms disorder=%.2f",
-        expected_seq_, next_available_seq, missing, buffered_frames_.size(), interval_ms, arrival_est_.jitter_avg,
-        reorder_est_.depth_frames);
+    // VIDEO_DEBUG_PRINT(
+    //     "[JitterBuf] gap skip expected=%u next=%u miss=%u depth=%zu avg_fi=%.2fms jitter=%.2fms disorder=%.2f",
+    //     expected_seq_, next_available_seq, missing, buffered_frames_.size(), interval_ms, arrival_est_.jitter_avg,
+    //     reorder_est_.depth_frames);
 
     skip_count_ += missing;
     qs_continuity_broken_ = true;

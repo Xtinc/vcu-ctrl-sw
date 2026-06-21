@@ -971,7 +971,6 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
     if (last_frame_id_ > 3 * 0xffffu / 4 && frame_seq < 0xffffu / 4)
     {
         frame_cycle_++;
-        VIDEO_DEBUG_PRINT("Frame wrap around detected: %u -> %u", last_frame_id_, frame_seq);
     }
     last_frame_id_ = frame_seq;
 
@@ -1044,8 +1043,8 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
     if (receive_frames_.size() > MAX_TRX_RECEIVE_FRAMES)
     {
         auto &oldest_frame = receive_frames_.back();
-        VIDEO_DEBUG_PRINT("Cleaning up frame (%u,%u) with %zu fragments, expected %u", oldest_frame.frame_cyc,
-                          oldest_frame.frame_seq, oldest_frame.fragments.size(), oldest_frame.group_num);
+        // VIDEO_DEBUG_PRINT("Cleaning up frame (%u,%u) with %zu fragments, expected %u", oldest_frame.frame_cyc,
+        //                   oldest_frame.frame_seq, oldest_frame.fragments.size(), oldest_frame.group_num);
         for (const auto &frag : oldest_frame.fragments)
         {
             recv_pool_.deallocate(frag.second);
