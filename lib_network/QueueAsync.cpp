@@ -29,6 +29,7 @@ constexpr double TAIL_HISTOGRAM_WINDOW_FRAMES = 1000.0;
 // estimator tail quantile and feed-forward interval sample window.
 constexpr double JITTER_TAIL_QUANTILE = 0.95;
 constexpr size_t FEEDFORWARD_INTERVAL_WINDOW_FRAMES = 16;
+constexpr double JITTER_TAIL_SINGLE_FACTOR = 4.0;
 
 constexpr double DEPTH_SETTLE_EPSILON_FRAMES = 0.25;
 constexpr double QS_STABLE_WINDOW_SECONDS = 30.0;
@@ -326,7 +327,7 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
         const double q95_ms = jitter_hist.quantile(JITTER_TAIL_QUANTILE);
         const double tail_sample_ms = std::isfinite(q95_ms) ? std::max(q95_ms, late_sample_ms) : late_sample_ms;
         if (tail_sample_ms >= jitter_tail)
-            jitter_tail += std::min(tail_sample_ms - jitter_tail, interval_avg);
+            jitter_tail += std::min(tail_sample_ms - jitter_tail, JITTER_TAIL_SINGLE_FACTOR * interval_avg);
         else
             jitter_tail += ema_gain(SLOW_ESTIMATE_WINDOW_FRAMES) * (tail_sample_ms - jitter_tail);
     }
