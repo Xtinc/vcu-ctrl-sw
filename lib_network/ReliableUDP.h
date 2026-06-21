@@ -1,8 +1,8 @@
 #ifndef RELIABLE_UDP_H
 #define RELIABLE_UDP_H
 
-#include "QueueAsync.h"
 #include "CSVWriter.h"
+#include "QueueAsync.h"
 #include "ReedSoloman.h"
 #include "asio.hpp"
 
@@ -246,6 +246,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     bool send(const uint8_t *data, size_t size);
     bool send_fill(size_t size, FillCallback callback);
     void set_receive_callback(RecvCallBack callback);
+    void set_observe_callback(ObsvCallback observer);
     double send_rate();
     double recv_rate();
     double lost_rate();
@@ -313,6 +314,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::list<TRXFrame> receive_frames_;
 
     std::unique_ptr<RecvQueueAsync> usr_queue_;
+    ObsvCallback receive_input_observer_;
     std::unique_ptr<SendQueueAsync> send_queue_;
     std::atomic<uint64_t> lost_packets_;
     std::atomic<uint64_t> send_bytes_;

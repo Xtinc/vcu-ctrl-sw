@@ -54,6 +54,10 @@ statistics to approximately 256 MiB. The `part_id` column increases on every
 rotation; the first and last `elapsed_s` values for each part identify its
 data range independently of the archive filename.
 
+The test receiver also enables the optional controller-input observer and
+writes `input_intervals.csv`. Production users do not enable this observer;
+their normal runtime output remains only `queue_stats.csv`.
+
 Copy `sender_out/sender_summary.txt` to the analysis host, then run:
 
 ```sh

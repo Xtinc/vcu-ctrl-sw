@@ -26,8 +26,9 @@ namespace
 using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t TEST_MAGIC = 0x524a5443u; // RJTC
-constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v8";
+constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_jitter_tc_v9";
 constexpr const char *ARRIVAL_CSV_HEADER = "elapsed_s,seq,interval_ms,latency_ms,size_bytes";
+constexpr const char *INPUT_CSV_HEADER = "elapsed_s,interval_ms";
 
 #pragma pack(push, 1)
 struct JitterMsgHdr
@@ -58,8 +59,11 @@ struct RunState
 
     Clock::time_point start_time;
     Clock::time_point last_arrival;
+    Clock::time_point last_input{};
     bool has_last_arrival = false;
+    bool has_last_input = false;
     std::ofstream arrival_csv;
+    std::ofstream input_csv;
     std::mutex arrival_mutex;
     std::unordered_set<uint32_t> seen;
 
@@ -94,6 +98,16 @@ static double elapsed_ms(Clock::time_point start, Clock::time_point now)
 static double elapsed_s(Clock::time_point start, Clock::time_point now)
 {
     return std::chrono::duration<double>(now - start).count();
+}
+
+static void handle_controller_input(RunState &state, Clock::time_point now)
+{
+    std::lock_guard<std::mutex> lock(state.arrival_mutex);
+    const double interval = state.has_last_input ? elapsed_ms(state.last_input, now) : 0.0;
+    state.input_csv << std::fixed << std::setprecision(3) << elapsed_s(state.start_time, now) << ',' << interval
+                    << '\n';
+    state.last_input = now;
+    state.has_last_input = true;
 }
 
 static uint32_t adler32_compute(const uint8_t *data, size_t len)
@@ -322,6 +336,7 @@ static void run_test(const Config &cfg)
         throw std::runtime_error("failed to enter output directory: " + output_dir);
 
     const std::string arrival_path = "arrival_intervals.csv";
+    const std::string input_path = "input_intervals.csv";
     const std::string summary_path = "summary.txt";
 
     auto &ioc = BG_SERVICE;
@@ -332,8 +347,13 @@ static void run_test(const Config &cfg)
     if (!state.arrival_csv)
         throw std::runtime_error("failed to open " + arrival_path);
     state.arrival_csv << ARRIVAL_CSV_HEADER << '\n';
+    state.input_csv.open(input_path.c_str(), std::ios::out | std::ios::trunc);
+    if (!state.input_csv)
+        throw std::runtime_error("failed to open " + input_path);
+    state.input_csv << INPUT_CSV_HEADER << '\n';
 
     auto receiver = std::make_shared<ReliableUDP>(ioc, cfg.receiver_port);
+    receiver->set_observe_callback([&state](Clock::time_point now) { handle_controller_input(state, now); });
     receiver->set_receive_callback([&state](const std::vector<QueueFrame> &frames, bool) {
         handle_received_frames(state, frames);
         return true;
@@ -391,6 +411,7 @@ static void run_test(const Config &cfg)
     {
         std::lock_guard<std::mutex> lock(state.arrival_mutex);
         state.arrival_csv.flush();
+        state.input_csv.flush();
     }
     const double elapsed_seconds = std::chrono::duration<double>(Clock::now() - start).count();
     write_summary(cfg, state, summary_path, elapsed_seconds);

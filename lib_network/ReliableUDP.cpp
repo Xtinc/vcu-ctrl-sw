@@ -232,6 +232,11 @@ void ReliableUDP::set_receive_callback(RecvCallBack callback)
     usr_queue_->start(std::move(callback));
 }
 
+void ReliableUDP::set_observe_callback(ObsvCallback observer)
+{
+    receive_input_observer_ = std::move(observer);
+}
+
 bool ReliableUDP::add_destination(const std::string &address, unsigned short port)
 {
     if (!running_)
@@ -1019,12 +1024,19 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
         }
 
         uint32_t abs_seq = (static_cast<uint32_t>(frame_cycle_) << 16) | frame_seq;
+        const auto input_time = std::chrono::steady_clock::now();
+        if (receive_input_observer_)
+        {
+            receive_input_observer_(input_time);
+        }
         if (!usr_queue_->enqueue(complete_message, total_length, abs_seq))
         {
             VIDEO_ERROR_PRINT("Failed to enqueue received message");
         }
-        if (stats_writer_.on_frame(std::chrono::steady_clock::now()))
+        if (stats_writer_.on_frame(input_time))
+        {
             stats_writer_.write(usr_queue_->stats_snapshot());
+        }
         recv_pool_.deallocate(complete_message);
         receive_frames_.erase(it);
     }

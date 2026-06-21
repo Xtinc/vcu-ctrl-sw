@@ -44,6 +44,7 @@ constexpr size_t SEND_INTERVAL_RESERVOIR_SIZE = 65536;
 constexpr size_t RECENT_SEQUENCE_WINDOW_SIZE = 4096;
 constexpr const char *ARRIVAL_HEADER =
     "elapsed_s,seq,interval_ms,latency_ms,qs_immediate";
+constexpr const char *INPUT_HEADER = "elapsed_s,interval_ms";
 
 struct NetworkHeader
 {
@@ -116,10 +117,24 @@ struct SenderState
 
 struct ReceiverState
 {
-    explicit ReceiverState(SteadyClock::time_point start, const std::string &arrival_path)
-        : start(start), next_flush(start + std::chrono::seconds(1)), arrivals(arrival_path)
+    explicit ReceiverState(SteadyClock::time_point start, const std::string &arrival_path,
+                           const std::string &input_path)
+        : start(start), next_flush(start + std::chrono::seconds(1)), arrivals(arrival_path), inputs(input_path)
     {
         arrivals << ARRIVAL_HEADER << '\n';
+        inputs << INPUT_HEADER << '\n';
+    }
+
+    void note_input(SteadyClock::time_point now)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const double interval = has_last_input
+                                    ? std::chrono::duration<double, std::milli>(now - last_input).count()
+                                    : 0.0;
+        const double elapsed = std::chrono::duration<double>(now - start).count();
+        inputs << std::fixed << std::setprecision(3) << elapsed << ',' << interval << '\n';
+        last_input = now;
+        has_last_input = true;
     }
 
     bool remember_sequence(uint32_t seq)
@@ -141,6 +156,7 @@ struct ReceiverState
         {
             std::lock_guard<std::mutex> lock(mutex);
             arrivals.flush();
+            inputs.flush();
             next_flush = now + std::chrono::seconds(1);
         }
     }
@@ -148,7 +164,9 @@ struct ReceiverState
     SteadyClock::time_point start;
     SteadyClock::time_point next_flush;
     SteadyClock::time_point last_arrival{};
+    SteadyClock::time_point last_input{};
     bool has_last_arrival = false;
+    bool has_last_input = false;
     std::atomic<bool> first_frame{false};
     uint64_t received = 0;
     uint64_t integrity_errors = 0;
@@ -157,6 +175,7 @@ struct ReceiverState
     std::set<uint32_t> recent_sequences;
     std::deque<uint32_t> sequence_order;
     std::ofstream arrivals;
+    std::ofstream inputs;
 };
 
 double elapsed_ms(SteadyClock::time_point start, SteadyClock::time_point now)
@@ -428,10 +447,11 @@ void run_receiver(const Config &cfg)
     const auto output_dir = absolute_path(cfg.out_dir);
     if (!change_directory(output_dir))
         throw std::runtime_error("cannot enter output directory " + output_dir);
-    ReceiverState state(SteadyClock::now(), "arrival_intervals.csv");
+    ReceiverState state(SteadyClock::now(), "arrival_intervals.csv", "input_intervals.csv");
 
     std::shared_ptr<ReliableUDP> udp;
     udp = std::make_shared<ReliableUDP>(BG_SERVICE, cfg.local_port);
+    udp->set_observe_callback([&state](SteadyClock::time_point now) { state.note_input(now); });
     udp->set_receive_callback([&state, &udp](const std::vector<QueueFrame> &frames, bool allow_immediate) {
         std::lock_guard<std::mutex> lock(state.mutex);
         for (const auto &frame : frames)
@@ -495,6 +515,7 @@ void run_receiver(const Config &cfg)
     const auto offset = udp->offset_ms();
     udp->stop();
     state.arrivals.flush();
+    state.inputs.flush();
 
     std::ofstream summary("receiver_summary.txt");
     write_common_summary(summary, cfg);

@@ -16,6 +16,7 @@ struct QueueFrame
 using RecvCallBack = std::function<bool(const std::vector<QueueFrame> &frames, bool allow_immediate)>;
 using SendCallBack = std::function<void(const uint8_t *data, size_t size)>;
 using FillCallback = std::function<void(uint8_t *data, size_t size)>;
+using ObsvCallback = std::function<void(std::chrono::steady_clock::time_point)>;
 
 constexpr size_t SEND_QUEUE_DEPTH = 128;
 constexpr size_t SEND_QUEUE_MAX_PACKET_SIZE = 65535;
