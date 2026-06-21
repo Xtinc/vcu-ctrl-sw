@@ -1024,16 +1024,16 @@ void ReliableUDP::assemble_complete_message(uint16_t frame_seq, uint16_t group_n
         }
 
         uint32_t abs_seq = (static_cast<uint32_t>(frame_cycle_) << 16) | frame_seq;
-        const auto input_time = std::chrono::steady_clock::now();
+        const auto itime = std::chrono::steady_clock::now();
         if (receive_input_observer_)
         {
-            receive_input_observer_(input_time);
+            receive_input_observer_(itime);
         }
         if (!usr_queue_->enqueue(complete_message, total_length, abs_seq))
         {
             VIDEO_ERROR_PRINT("Failed to enqueue received message");
         }
-        if (stats_writer_.on_frame(input_time))
+        if (stats_writer_.on_frame(itime))
         {
             stats_writer_.write(usr_queue_->stats_snapshot());
         }
