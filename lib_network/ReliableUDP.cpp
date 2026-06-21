@@ -146,14 +146,14 @@ static std::once_flag fec_init_flag;
 // ReliableUDP implementation
 ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port)
     : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
-      send_pool_(25), recv_pool_(25), recv_packets_(0), rs_(nullptr), target_uid_(0), has_active_conn_uuid_(false),
-      active_conn_uuid_(0), destination_set_(false), frame_cycle_(1), group_cycle_(1), next_group_id_(1),
-      next_frame_id_(1), last_frame_id_(0), last_group_id_(0), has_last_receive_activity_(false),
-      last_receive_activity_(std::chrono::steady_clock::time_point{}), usr_queue_(std::make_unique<RecvQueueAsync>()),
-      send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
-      last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
-      last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
-      probe_timer_(io_context_), clock_sync_()
+      send_pool_("reliable_udp_send", 25), recv_pool_("reliable_udp_recv", 25), recv_packets_(0), rs_(nullptr),
+      target_uid_(0), has_active_conn_uuid_(false), active_conn_uuid_(0), destination_set_(false), frame_cycle_(1),
+      group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
+      has_last_receive_activity_(false), last_receive_activity_(std::chrono::steady_clock::time_point{}),
+      usr_queue_(std::make_unique<RecvQueueAsync>()), send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0),
+      send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
+      last_recv_rate_time_(std::chrono::steady_clock::now()), last_lost_rate_time_(std::chrono::steady_clock::now()),
+      last_send_rate_bytes_(0), last_recv_rate_bytes_(0), probe_timer_(io_context_), clock_sync_()
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);

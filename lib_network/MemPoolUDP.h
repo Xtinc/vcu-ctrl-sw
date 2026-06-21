@@ -25,7 +25,7 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
     static constexpr size_t MAX_MEMPOOL_SZ = 2 * 1024 * 1024 * 1024ULL; // 2GB
 
   public:
-    MemPool(size_t initial_blocks) : current_size(0)
+    MemPool(const char *name, size_t initial_blocks) : name_(name), current_size(0)
     {
         for (size_t i = CHUNK_MIN_ORD; i <= CHUNK_MAX_ORD; ++i)
         {
@@ -67,7 +67,8 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
             }
 
             expand_memory((static_cast<size_t>(1) << ord) + sizeof(size_t), 25, chunk_idx);
-            VIDEO_INFO_PRINT("Expanded memory chunk %.2f MB", static_cast<double>(current_size) / (1024.0 * 1024.0));
+            VIDEO_INFO_PRINT("Memory pool [%s] expanded to %.2f MB", name_,
+                             static_cast<double>(current_size) / (1024.0 * 1024.0));
         }
 
         uint8_t *block = chunks_[chunk_idx].front();
@@ -118,6 +119,7 @@ template <size_t CHUNK_MIN_ORD, size_t CHUNK_MAX_ORD> class MemPool
   private:
     std::array<ChunkList, CHUNK_MAX_ORD - CHUNK_MIN_ORD + 1> chunks_;
     std::vector<uint8_t *> memory_regions_;
+    const char *const name_;
     size_t current_size;
 };
 

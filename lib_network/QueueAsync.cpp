@@ -489,7 +489,8 @@ void RecvQueueAsync::BFController::note(const Tunables &tuning, double reorder_f
     adaptive_depth = clamp_value(static_cast<size_t>(std::ceil(decay_depth_frames)), target_depth, tuning.max_depth);
 }
 
-RecvQueueAsync::RecvQueueAsync() : frame_pool_(64), running_(false), primed_(false), expected_seq_(0)
+RecvQueueAsync::RecvQueueAsync()
+    : frame_pool_("recv_queue_frame", 64), running_(false), primed_(false), expected_seq_(0)
 {
     sanitize_tuning_locked();
 }
