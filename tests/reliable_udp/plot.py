@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import bisect
-import csv
 import glob
 import math
 import os
+import sys
 from array import array
 from collections import deque
 
@@ -16,6 +16,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+from lib_network import plot_queue_stats as queue_core
 
 SAVE_DPI = 300
 ROLLING_WINDOW = 100
@@ -33,23 +38,14 @@ OBSOLETE_OUTPUTS = {
     "queue_counters.png", "network_vs_controller.png", "latency_ideal_vs_actual.png",
     "parameter_influence.png",
 }
-ARRIVAL_COLUMNS = {"elapsed_s", "seq", "interval_ms", "latency_ms"}
-INPUT_COLUMNS = {"elapsed_s", "interval_ms"}
-QUEUE_COLUMNS = {
-    "elapsed_s", "q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_tail_jitter_ms",
-    "q_buffered_frames", "q_adaptive_depth", "q_depth_raw", "q_pressure_frames",
-    "q_skip_delta", "q_drop_delta", "q_late_delta", "q_reorder_delta",
-    "q_stale_delta", "q_ovf_delta",
-}
-STAGE_COLUMNS = {"stage", "start_s", "end_s", "netem_args"}
-
-
-def as_float(row, key, default=0.0):
-    try:
-        value = row.get(key, "")
-        return default if value == "" else float(value)
-    except (TypeError, ValueError):
-        return default
+CONTRACT_VERSION = "reliable_udp_test_v1"
+META_COLUMNS = ("contract_version", "test_kind")
+ARRIVAL_COLUMNS = ("elapsed_s", "seq", "interval_ms", "latency_ms", "size_bytes", "allow_immediate")
+INPUT_COLUMNS = ("elapsed_s", "interval_ms")
+STAGE_COLUMNS = ("stage", "start_s", "end_s", "netem_args")
+SENDER_COLUMNS = ("sent_count", "send_fail_count", "send_elapsed_s", "payload_rate_mbps",
+                  "interval_mean_ms", "interval_p50_ms", "interval_p95_ms", "interval_p99_ms",
+                  "interval_max_ms")
 
 
 def percentile(values, p):
@@ -109,41 +105,71 @@ class SampleStats:
         }
 
 
-def csv_paths(path, include_rotated=False):
-    paths = [path]
-    if include_rotated:
-        archives = []
-        index = 1
-        while os.path.exists("{}.{}".format(path, index)):
-            archives.append("{}.{}".format(path, index))
-            index += 1
-        paths = list(reversed(archives)) + paths
-    return paths
+def csv_rows(path, expected):
+    try:
+        for _, row in queue_core.strict_rows(path, expected):
+            yield row
+    except queue_core.CSVContractError as error:
+        raise SystemExit(str(error))
 
 
-def csv_rows(path, required, include_rotated=False):
-    paths = csv_paths(path, include_rotated)
+def finite_number(row, key, path, allow_empty=False):
+    value = row[key]
+    if allow_empty and value == "":
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        raise SystemExit("{} has invalid {}: {!r}".format(path, key, value))
+    if not math.isfinite(number):
+        raise SystemExit("{} has non-finite {}".format(path, key))
+    return number
 
-    for current_path in paths:
-        with open(current_path, newline="") as stream:
-            reader = csv.DictReader(stream)
-            fields = set(reader.fieldnames or ())
-            missing = sorted(required - fields)
-            if missing:
-                raise SystemExit("{} is missing required columns: {}".format(current_path, ", ".join(missing)))
-            for row in reader:
-                yield row
+
+def validate_capture(out_dir):
+    meta_path = os.path.join(out_dir, "capture_meta.csv")
+    required = [meta_path, os.path.join(out_dir, "input_intervals.csv"),
+                os.path.join(out_dir, "arrival_intervals.csv")]
+    missing = [path for path in required if not os.path.exists(path)]
+    if missing:
+        raise SystemExit("missing required test capture files: {}".format(", ".join(missing)))
+    meta_rows = list(csv_rows(meta_path, META_COLUMNS))
+    if len(meta_rows) != 1:
+        raise SystemExit("{} must contain exactly one data row".format(meta_path))
+    meta = meta_rows[0]
+    if meta["contract_version"] != CONTRACT_VERSION or meta["test_kind"] not in ("network", "tc"):
+        raise SystemExit("{} requires contract_version={} and test_kind network|tc".format(
+            meta_path, CONTRACT_VERSION))
+    input_path = os.path.join(out_dir, "input_intervals.csv")
+    input_rows = iter(csv_rows(input_path, INPUT_COLUMNS))
+    try:
+        first_input = next(input_rows)
+    except StopIteration:
+        raise SystemExit("{} contains no data rows".format(input_path))
+    first_input_elapsed = finite_number(first_input, "elapsed_s", input_path)
+    if first_input_elapsed < 0.0:
+        raise SystemExit("{} requires non-negative elapsed_s".format(input_path))
+    sender_path = os.path.join(out_dir, "sender_stats.csv")
+    stage_path = os.path.join(out_dir, "tc_stages.csv")
+    if meta["test_kind"] == "tc" and (not os.path.exists(sender_path) or not os.path.exists(stage_path)):
+        raise SystemExit("tc capture requires sender_stats.csv and tc_stages.csv")
+    return meta["test_kind"], first_input_elapsed
 
 
-def read_summary(path):
-    values = {}
+def read_sender(path):
     if not path or not os.path.exists(path):
-        return values
-    with open(path) as stream:
-        for line in stream:
-            key, separator, value = line.strip().partition("=")
-            if separator:
-                values[key] = value
+        return None
+    rows = list(csv_rows(path, SENDER_COLUMNS))
+    if len(rows) != 1:
+        raise SystemExit("{} must contain exactly one data row".format(path))
+    row = rows[0]
+    values = {key: finite_number(row, key, path) for key in SENDER_COLUMNS}
+    if any(value < 0.0 for value in values.values()):
+        raise SystemExit("{} values must be non-negative".format(path))
+    if not values["sent_count"].is_integer() or not values["send_fail_count"].is_integer():
+        raise SystemExit("{} sent_count and send_fail_count must be integers".format(path))
+    values.update({"sent": int(values["sent_count"]), "failed": int(values["send_fail_count"]),
+                   "rate": values["payload_rate_mbps"], "mean": values["interval_mean_ms"]})
     return values
 
 
@@ -188,13 +214,18 @@ def read_stages(out_dir):
     if not os.path.exists(path):
         return []
     stages = []
+    previous_end = None
     for row in csv_rows(path, STAGE_COLUMNS):
-        start = as_float(row, "start_s")
-        end = as_float(row, "end_s")
-        if end > start:
-            stage = {"stage": row.get("stage", ""), "start_s": start, "end_s": end}
-            stage.update(parse_netem_args(row.get("netem_args", "")))
-            stages.append(stage)
+        start = finite_number(row, "start_s", path)
+        end = finite_number(row, "end_s", path)
+        if not row["stage"] or start < 0.0 or end <= start or (previous_end is not None and start < previous_end):
+            raise SystemExit("{} requires named, ordered, non-overlapping stages".format(path))
+        stage = {"stage": row["stage"], "start_s": start, "end_s": end}
+        stage.update(parse_netem_args(row["netem_args"]))
+        stages.append(stage)
+        previous_end = end
+    if not stages:
+        raise SystemExit("{} contains no stage rows".format(path))
     return stages
 
 
@@ -269,14 +300,20 @@ def process_arrivals(path, input_path, stages, stage_metrics, window_seconds, em
     input_recent = deque()
     input_sorted = []
     input_sum = 0.0
+    previous_input_time = None
+    previous_arrival_time = None
 
     def consume_inputs(end_time, include_end=False):
-        nonlocal input_pending, input_row_count, input_sum
+        nonlocal input_pending, input_row_count, input_sum, previous_input_time
         while input_pending is not None:
-            timestamp = as_float(input_pending, "elapsed_s")
+            timestamp = finite_number(input_pending, "elapsed_s", input_path)
             if timestamp > end_time or (timestamp == end_time and not include_end):
                 break
-            interval = as_float(input_pending, "interval_ms")
+            interval = finite_number(input_pending, "interval_ms", input_path)
+            if timestamp < 0.0 or interval < 0.0 or (previous_input_time is not None and
+                                                      timestamp < previous_input_time):
+                raise SystemExit("{} requires non-negative, monotonic timing values".format(input_path))
+            previous_input_time = timestamp
             input_pending = next(input_rows, None)
             input_row_count += 1
             if interval <= 0.0:
@@ -307,7 +344,21 @@ def process_arrivals(path, input_path, stages, stage_metrics, window_seconds, em
 
     for row in csv_rows(path, ARRIVAL_COLUMNS):
         row_count += 1
-        timestamp = as_float(row, "elapsed_s")
+        timestamp = finite_number(row, "elapsed_s", path)
+        interval = finite_number(row, "interval_ms", path)
+        latency = finite_number(row, "latency_ms", path, allow_empty=True)
+        try:
+            sequence = int(row["seq"])
+            size = int(row["size_bytes"])
+            qse = int(row["allow_immediate"])
+        except ValueError:
+            raise SystemExit("{} has invalid seq, size_bytes, or allow_immediate".format(path))
+        if timestamp < 0.0 or interval < 0.0 or (previous_arrival_time is not None and
+                                                  timestamp < previous_arrival_time):
+            raise SystemExit("{} requires non-negative, monotonic timing values".format(path))
+        if sequence < 0 or size <= 0 or qse not in (0, 1) or (latency is not None and latency < 0.0):
+            raise SystemExit("{} has out-of-range arrival data".format(path))
+        previous_arrival_time = timestamp
         last_time = timestamp
         row_window_start = math.floor(timestamp / window_seconds) * window_seconds
         if window_start is None:
@@ -320,14 +371,12 @@ def process_arrivals(path, input_path, stages, stage_metrics, window_seconds, em
             if last_qse is not None:
                 plot["qse_t"].append(window_start)
                 plot["qse_v"].append(last_qse)
-        qse = 1 if as_float(row, "qs_immediate") > 0 else 0
         if qse != last_qse:
             plot["qse_t"].append(timestamp)
             plot["qse_v"].append(qse)
             last_qse = qse
 
-        latency = as_float(row, "latency_ms", -1.0)
-        if math.isfinite(latency) and latency >= 0.0:
+        if latency is not None:
             latency_stats.add(latency)
             recent_latencies.append(latency)
             bisect.insort(sorted_latencies, latency)
@@ -340,7 +389,6 @@ def process_arrivals(path, input_path, stages, stage_metrics, window_seconds, em
             if stage_index is not None:
                 stage_metrics[stage_index].latency.add(latency)
 
-        interval = as_float(row, "interval_ms")
         if interval <= 0.0:
             continue
         interval_stats.add(interval)
@@ -363,6 +411,8 @@ def process_arrivals(path, input_path, stages, stage_metrics, window_seconds, em
         plot["interval_p95"].append(percentile_sorted(sorted_intervals, 0.95))
         plot["latency_mean"].append(latency_sum / len(recent_latencies) if recent_latencies else float("nan"))
         plot["latency_p95"].append(percentile_sorted(sorted_latencies, 0.95) if recent_latencies else float("nan"))
+    if row_count == 0:
+        raise SystemExit("{} contains no data rows".format(path))
     if window_start is not None:
         flush_window(last_time, final=True)
     consume_inputs(float("inf"), include_end=True)
@@ -372,72 +422,32 @@ def process_arrivals(path, input_path, stages, stage_metrics, window_seconds, em
             "input_count": input_row_count}
 
 
-def process_queue(path, stages, stage_metrics):
-    keys = ("q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms", "q_buffered_frames", "q_adaptive_depth",
-            "q_skip_delta", "q_drop_delta", "q_reorder_delta", "q_tail_jitter_ms", "q_tail_jitter_frames",
-            "q_disorder_frames", "q_pressure_frames")
-    plot = {"t": array("d")}
-    for key in keys:
-        plot[key] = array("d")
-    input_stats = SampleStats()
-    short_input_stats = SampleStats()
-    output_stats = SampleStats()
-    buffered_stats = SampleStats()
-    target_stats = SampleStats()
-    events = {"skip": 0.0, "late": 0.0, "overflow": 0.0, "drop": 0.0, "stale": 0.0, "reorder": 0.0}
-    gaps = []
-    parts = {}
-    previous_segment = None
-    row_count = 0
-    for row in csv_rows(path, QUEUE_COLUMNS, include_rotated=True):
-        row_count += 1
-        timestamp = as_float(row, "elapsed_s")
-        part_id = int(as_float(row, "part_id", 0.0))
-        part = parts.setdefault(part_id, {"part_id": part_id, "start_s": timestamp, "end_s": timestamp, "rows": 0})
-        part["end_s"] = timestamp
-        part["rows"] += 1
-        segment = int(as_float(row, "segment_id", 1.0))
-        if previous_segment is not None and segment != previous_segment:
-            for key in keys:
-                plot[key].append(float("nan"))
-            plot["t"].append(timestamp)
-            gaps.append({"time": timestamp, "idle_s": as_float(row, "idle_gap_s"), "segment": segment})
-        previous_segment = segment
-        values = {key: as_float(row, key) for key in keys}
-        interval_ms = values["q_avg_fi_ms"]
-        values["q_tail_jitter_frames"] = (
-            as_float(row, "q_tail_jitter_ms") / interval_ms if interval_ms > 0.0 else 0.0
-        )
-        if values["q_avg_fi_ms"] > 0.0:
-            input_stats.add(values["q_avg_fi_ms"])
-            if values["q_short_fi_ms"] > 0.0:
-                short_input_stats.add(values["q_short_fi_ms"])
-            output_stats.add(values["q_out_fi_ms"])
-            buffered_stats.add(values["q_buffered_frames"])
-            target_stats.add(values["q_adaptive_depth"])
-        events["skip"] += values["q_skip_delta"]
-        events["drop"] += values["q_drop_delta"]
-        events["reorder"] += values["q_reorder_delta"]
-        events["late"] += as_float(row, "q_late_delta")
-        events["stale"] += as_float(row, "q_stale_delta")
-        events["overflow"] += as_float(row, "q_ovf_delta")
+def align_queue(queue, offset_s):
+    queue["plot"]["t"] = array("d", (value + offset_s for value in queue["plot"]["t"]))
+    for session in queue["sessions"]:
+        session["start_s"] += offset_s
+        session["end_s"] += offset_s
+    for gap in queue["gaps"]:
+        gap["time"] += offset_s
+
+
+def collect_queue_stage_metrics(queue, stages, metrics):
+    data = queue["plot"]
+    for index, timestamp in enumerate(data["t"]):
+        if not math.isfinite(data["q_adaptive_depth"][index]):
+            continue
         stage_index = stage_for_time(stages, timestamp)
-        if stage_index is not None:
-            metrics = stage_metrics[stage_index]
-            metrics.target.add(values["q_adaptive_depth"])
-            metrics.raw.add(as_float(row, "q_depth_raw"))
-            metrics.reorder_driver.add(as_float(row, "q_disorder_frames"))
-            metrics.jitter_driver.add(1.5 * values["q_tail_jitter_frames"])
-            metrics.pressure_driver.add(1.0 if values["q_pressure_frames"] > 0.0 else 0.0)
-            metrics.reorder_events += values["q_reorder_delta"]
-            metrics.bad_events += values["q_skip_delta"] + as_float(row, "q_late_delta") + as_float(row, "q_ovf_delta")
-        plot["t"].append(timestamp)
-        for key in keys:
-            plot[key].append(values[key])
-    return {"count": row_count, "plot": plot, "gaps": gaps, "parts": [parts[key] for key in sorted(parts)],
-            "input": input_stats.summary(), "short_input": short_input_stats.summary(),
-            "output": output_stats.summary(), "buffered": buffered_stats.summary(),
-            "target": target_stats.summary(), "events": events}
+        if stage_index is None:
+            continue
+        values = metrics[stage_index]
+        values.target.add(data["q_adaptive_depth"][index])
+        values.raw.add(data["q_depth_raw"][index])
+        values.reorder_driver.add(data["q_disorder_frames"][index])
+        values.jitter_driver.add(1.5 * data["q_tail_jitter_frames"][index])
+        values.pressure_driver.add(1.0 if data["q_pressure_frames"][index] > 0.0 else 0.0)
+        values.reorder_events += data["q_reorder_delta"][index]
+        values.bad_events += (data["q_skip_delta"][index] + data["q_late_delta"][index] +
+                              data["q_ovf_delta"][index])
 
 
 def set_robust_upper_ylim(axis, values, p=0.99, margin=1.2):
@@ -509,6 +519,7 @@ def plot_controller(out_dir, queue, arrivals, inputs, stages, filename, time_ran
     data = queue["plot"]
     output = arrivals["plot"]
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
+    queue_core.plot_controller_axes(axes, queue)
     axes[0].plot(inputs["raw_t"], inputs["raw_v"], color="tab:red", linewidth=0.45, alpha=0.20,
                  label="controller input interval (per frame)")
     axes[0].plot(inputs["smooth_t"], inputs["interval_mean"], color="tab:red", linewidth=1.2,
@@ -529,11 +540,11 @@ def plot_controller(out_dir, queue, arrivals, inputs, stages, filename, time_ran
     output_upper = max(output["interval_p95"], default=0.0)
     if output["raw_v"]:
         output_upper = max(output_upper, percentile(output["raw_v"], 0.99))
-    axes[0].set_ylim(bottom=0.0, top=max(1.0, input_upper, output_upper) * 1.08)
+    product_upper = max((value for key in ("q_short_fi_ms", "q_avg_fi_ms", "q_out_fi_ms")
+                         for value in data[key] if math.isfinite(value)), default=0.0)
+    axes[0].set_ylim(bottom=0.0, top=max(1.0, input_upper, output_upper, product_upper) * 1.08)
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="upper right")
-    axes[1].plot(data["t"], data["q_buffered_frames"], linewidth=1.1, label="actual depth")
-    axes[1].plot(data["t"], data["q_adaptive_depth"], linewidth=1.1, label="target depth")
     axes[1].set_xlabel("time (s)")
     axes[1].set_ylabel("frames")
     axes[1].set_title("Buffer Depth")
@@ -547,13 +558,12 @@ def plot_controller(out_dir, queue, arrivals, inputs, stages, filename, time_ran
 def plot_network(out_dir, queue, stages, filename, time_range):
     data = queue["plot"]
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
+    queue_core.plot_network_axes(axes, queue)
     event_lines = (("q_reorder_delta", "reorder events"), ("q_skip_delta", "skipped frames"),
                    ("q_drop_delta", "dropped frames"))
     plotted = False
-    for key, label in event_lines:
-        if any(value > 0.0 for value in data[key]):
-            axes[0].plot(data["t"], data[key], linewidth=1.0, label=label)
-            plotted = True
+    for key, _ in event_lines:
+        plotted = plotted or any(value > 0.0 for value in data[key])
     if stages:
         parameter_axis = axes[0].twinx()
         for key, label, color in (("reorder_pct", "configured reorder", "tab:purple"),
@@ -577,10 +587,6 @@ def plot_network(out_dir, queue, stages, filename, time_range):
     axes[0].set_title("Observed Queue and Network Events")
     axes[0].grid(True, alpha=0.25)
 
-    jitter_driver = [1.5 * value for value in data["q_tail_jitter_frames"]]
-    axes[1].plot(data["t"], jitter_driver, linewidth=1.1, label="tail jitter driver")
-    if any(value > 0.0 for value in data["q_disorder_frames"]):
-        axes[1].plot(data["t"], data["q_disorder_frames"], linewidth=0.9, label="reorder driver")
     pressure = [1.0 if value > 0.0 else 0.0 for value in data["q_pressure_frames"]]
     if any(pressure):
         axes[1].plot(data["t"], pressure, linewidth=0.9, label="pressure driver")
@@ -618,13 +624,6 @@ def stage_rows(stages, metrics):
     return rows
 
 
-def queue_plot_window(queue, start_s, end_s):
-    data = queue["plot"]
-    first = bisect.bisect_left(data["t"], start_s)
-    last = bisect.bisect_right(data["t"], end_s)
-    return {key: values[first:last] for key, values in data.items()}
-
-
 def write_assessment(out_dir, arrivals, queue, sender, stages):
     interval = arrivals["interval"]
     input_interval = arrivals["input"]
@@ -646,16 +645,21 @@ def write_assessment(out_dir, arrivals, queue, sender, stages):
         input_count = arrivals["input_count"]
         stream.write("- samples: stats={}, inputs={}, outputs={}\n\n".format(
             queue["count"], input_count, arrivals["count"]))
-        stream.write("CSV parts\npart_id,start_s,end_s,rows\n")
-        for part in queue["parts"]:
-            stream.write("{part_id},{start_s:.3f},{end_s:.3f},{rows}\n".format(**part))
+        stream.write("Queue sessions\nsession_id,start_utc,start_s,end_s,rows\n")
+        for session in queue["sessions"]:
+            stream.write("{session_id},{start_utc},{start_s:.3f},{end_s:.3f},{rows}\n".format(**session))
         stream.write("\n")
         if sender:
             received = arrivals["count"]
             loss = 100.0 * max(0, sender["sent"] - received) / sender["sent"] if sender["sent"] else 0.0
             stream.write("End-to-end\n- sent: {}\n- received: {}\n- send_fail: {}\n- loss_pct: {:.3f}\n"
-                         "- payload_rate_mbps: {:.3f}\n\n".format(sender["sent"], received, sender["failed"],
-                                                                      loss, sender["rate"]))
+                         "- sender_elapsed_s: {:.3f}\n"
+                         "- payload_rate_mbps: {:.3f}\n- sender_interval_p50_ms: {:.3f}\n"
+                         "- sender_interval_p95_ms: {:.3f}\n- sender_interval_p99_ms: {:.3f}\n"
+                         "- sender_interval_max_ms: {:.3f}\n\n".format(
+                             sender["sent"], received, sender["failed"], loss, sender["send_elapsed_s"], sender["rate"],
+                             sender["interval_p50_ms"], sender["interval_p95_ms"],
+                             sender["interval_p99_ms"], sender["interval_max_ms"]))
         stream.write("Input/output jitter comparison\n")
         for label, values in (("input", input_interval), ("output", interval)):
             stream.write("- {}_mean_ms: {:.3f}\n".format(label, values["mean"]))
@@ -718,7 +722,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate bounded-memory ReliableUDP controller plots.")
     parser.add_argument(
         "out_dir", help="test output containing input_intervals.csv, arrival_intervals.csv, and queue_stats.csv")
-    parser.add_argument("--sender-summary", help="optional sender_summary.txt")
+    parser.add_argument("--sender-stats", help="optional sender_stats.csv from a separate sender")
     parser.add_argument("--plot-window-seconds", type=float, default=DEFAULT_PLOT_WINDOW_SECONDS,
                         help="seconds shown in each full-resolution plot set (default: %(default)s)")
     args = parser.parse_args()
@@ -730,16 +734,20 @@ def main():
     if not os.path.exists(arrival_path) or not os.path.exists(input_path) or not os.path.exists(queue_path):
         raise SystemExit("missing arrival_intervals.csv, input_intervals.csv, or queue_stats.csv in {}".format(
             args.out_dir))
+    test_kind, first_input_elapsed = validate_capture(args.out_dir)
     stages = read_stages(args.out_dir)
     stage_metrics = [StageMetrics() for _ in stages]
-    summary = read_summary(args.sender_summary)
-    sender = None
-    if "send_interval_mean_ms" in summary:
-        sender = {"mean": float(summary.get("send_interval_mean_ms", 0)),
-                  "sent": int(summary.get("sent_count", 0)), "failed": int(summary.get("send_fail_count", 0)),
-                  "rate": float(summary.get("payload_rate_mbps", 0))}
+    sender_path = args.sender_stats or os.path.join(args.out_dir, "sender_stats.csv")
+    sender = read_sender(sender_path)
+    if test_kind == "tc" and sender is None:
+        raise SystemExit("tc capture requires sender_stats.csv")
     remove_old_outputs(args.out_dir)
-    queue = process_queue(queue_path, stages, stage_metrics)
+    try:
+        queue = queue_core.process_queue(queue_path)
+    except queue_core.CSVContractError as error:
+        raise SystemExit(str(error))
+    align_queue(queue, first_input_elapsed)
+    collect_queue_stage_metrics(queue, stages, stage_metrics)
     page = 0
 
     def emit_window(start_s, end_s, arrival_plot, input_plot):
@@ -751,7 +759,7 @@ def main():
                          if stage["end_s"] > start_s and stage["start_s"] < end_s]
         window_arrivals = {"plot": arrival_plot}
         window_queue = dict(queue)
-        window_queue["plot"] = queue_plot_window(queue, start_s, end_s)
+        window_queue["plot"] = queue_core.queue_plot_window(queue, start_s, end_s)
         plot_output(args.out_dir, window_arrivals, sender, window_stages,
                     "output_smoothness" + suffix, time_range)
         plot_controller(args.out_dir, window_queue, window_arrivals, input_plot, window_stages,

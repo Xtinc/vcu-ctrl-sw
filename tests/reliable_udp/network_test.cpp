@@ -42,9 +42,13 @@ using SystemClock = std::chrono::system_clock;
 constexpr uint32_t TEST_MAGIC = 0x524a4e54u; // RJNT
 constexpr size_t SEND_INTERVAL_RESERVOIR_SIZE = 65536;
 constexpr size_t RECENT_SEQUENCE_WINDOW_SIZE = 4096;
+constexpr const char *CSV_CONTRACT_VERSION = "reliable_udp_test_v1";
 constexpr const char *ARRIVAL_HEADER =
-    "elapsed_s,seq,interval_ms,latency_ms,qs_immediate";
+    "elapsed_s,seq,interval_ms,latency_ms,size_bytes,allow_immediate";
 constexpr const char *INPUT_HEADER = "elapsed_s,interval_ms";
+constexpr const char *SENDER_HEADER =
+    "sent_count,send_fail_count,send_elapsed_s,payload_rate_mbps,interval_mean_ms,interval_p50_ms,"
+    "interval_p95_ms,interval_p99_ms,interval_max_ms";
 
 struct NetworkHeader
 {
@@ -410,9 +414,6 @@ void run_sender(const Config &cfg)
     }
     const double send_elapsed_sec = std::chrono::duration<double>(SteadyClock::now() - state.start).count();
     std::this_thread::sleep_for(std::chrono::seconds(1));
-    const bool synced = udp->is_time_synced();
-    const auto rtt = udp->rtt_ms();
-    const auto offset = udp->offset_ms();
     udp->stop();
 
     const auto sorted_intervals = state.intervals.sorted_sample();
@@ -422,21 +423,11 @@ void run_sender(const Config &cfg)
                                                send_elapsed_sec / 1e6
                                          : 0.0;
 
-    std::ofstream summary(path_join(cfg.out_dir, "sender_summary.txt"));
-    write_common_summary(summary, cfg);
-    summary << std::fixed << std::setprecision(3)
-            << "clock_synced=" << (synced ? 1 : 0) << '\n' << "rtt_ms=" << rtt << '\n'
-            << "offset_ms=" << offset << '\n' << "sent_count=" << state.sent << '\n'
-            << "send_fail_count=" << state.send_fail << '\n'
-            << "send_elapsed_sec=" << send_elapsed_sec << '\n'
-            << "payload_rate_mbps=" << payload_rate_mbps << '\n'
-            << "send_interval_count=" << state.intervals.count << '\n'
-            << "send_interval_sample_count=" << sorted_intervals.size() << '\n'
-            << "send_interval_mean_ms=" << interval_mean << '\n'
-            << "send_interval_p50_ms=" << percentile(sorted_intervals, 0.50) << '\n'
-            << "send_interval_p95_ms=" << percentile(sorted_intervals, 0.95) << '\n'
-            << "send_interval_p99_ms=" << percentile(sorted_intervals, 0.99) << '\n'
-            << "send_interval_max_ms=" << state.intervals.maximum << '\n';
+    std::ofstream sender_stats(path_join(cfg.out_dir, "sender_stats.csv"));
+    sender_stats << SENDER_HEADER << '\n' << state.sent << ',' << state.send_fail << ',' << std::fixed
+                 << std::setprecision(6) << send_elapsed_sec << ',' << payload_rate_mbps << ',' << interval_mean << ','
+                 << percentile(sorted_intervals, 0.50) << ',' << percentile(sorted_intervals, 0.95) << ','
+                 << percentile(sorted_intervals, 0.99) << ',' << state.intervals.maximum << '\n';
     std::cout << "Sender complete: sent=" << state.sent << " failed=" << state.send_fail << '\n';
 }
 
@@ -447,6 +438,9 @@ void run_receiver(const Config &cfg)
     const auto output_dir = absolute_path(cfg.out_dir);
     if (!change_directory(output_dir))
         throw std::runtime_error("cannot enter output directory " + output_dir);
+    std::ofstream capture_meta("capture_meta.csv");
+    capture_meta << "contract_version,test_kind\n" << CSV_CONTRACT_VERSION << ",network\n";
+    capture_meta.close();
     ReceiverState state(SteadyClock::now(), "arrival_intervals.csv", "input_intervals.csv");
 
     std::shared_ptr<ReliableUDP> udp;
@@ -479,10 +473,12 @@ void run_receiver(const Config &cfg)
             const double interval = state.has_last_arrival ? elapsed_ms(state.last_arrival, steady_now) : 0.0;
             const double latency = synced ? (static_cast<double>(wall_time_us()) -
                                              static_cast<double>(header.send_wall_us) +
-                                             static_cast<double>(udp->offset_ms()) * 1000.0) / 1000.0 : -1.0;
+                                             static_cast<double>(udp->offset_ms()) * 1000.0) / 1000.0 : 0.0;
             state.arrivals << std::fixed << std::setprecision(3) << elapsed_s(state.start, steady_now) << ','
-                           << header.seq << ',' << interval << ',' << latency << ',' << (allow_immediate ? 1 : 0)
-                           << '\n';
+                           << header.seq << ',' << interval << ',';
+            if (synced && latency >= 0.0)
+                state.arrivals << latency;
+            state.arrivals << ',' << frame.size << ',' << (allow_immediate ? 1 : 0) << '\n';
             state.last_arrival = steady_now;
             state.has_last_arrival = true;
             state.first_frame = true;

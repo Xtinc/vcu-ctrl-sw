@@ -26,9 +26,12 @@ class NetCSVWriter
     void write_row(Clock::time_point now, double idle_gap_s, const QueueStatsSnapshot &stats);
     bool open();
     bool rotate();
-    void clear_files();
+    bool active_file_exists() const;
     void close();
     std::string archive_path(size_t index) const;
+    std::string timestamp_utc(Clock::time_point now) const;
+
+    using WallClock = std::chrono::system_clock;
 
     const std::string path_;
     const size_t max_file_bytes_;
@@ -41,9 +44,10 @@ class NetCSVWriter
     bool has_last_frame_ = false;
     bool has_last_write_ = false;
     bool write_pending_ = false;
-    uint64_t part_id_ = 0;
+    int64_t session_id_ = 0;
     uint64_t segment_id_ = 0;
     Clock::time_point start_time_{};
+    WallClock::time_point wall_start_time_{};
     Clock::time_point last_frame_time_{};
     Clock::time_point last_write_time_{};
     Clock::time_point pending_time_{};

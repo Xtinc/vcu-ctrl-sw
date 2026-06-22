@@ -1912,14 +1912,14 @@ static bool test_queue_stats_csv_writer_rotation()
     }
 
     bool ok = true;
-    std::array<uint64_t, 3> part_ids{};
+    std::array<uint64_t, 3> session_ids{};
     for (size_t index = 0; index <= 2; ++index)
     {
         const auto candidate = index == 0 ? path : path + "." + std::to_string(index);
         std::ifstream input(candidate);
         std::string header;
         ok = ok && static_cast<bool>(std::getline(input, header));
-        ok = ok && header.find("elapsed_s,part_id,segment_id,idle_gap_s") == 0;
+        ok = ok && header.find("timestamp_utc,session_id,segment_id,idle_gap_s") == 0;
         ok = ok && header.find("q_tail_jitter_ms") != std::string::npos;
         ok = ok && header.find("q_fb_fi_ms") == std::string::npos;
         ok = ok && header.find("q_tail_jitter_frames") == std::string::npos;
@@ -1932,8 +1932,12 @@ static bool test_queue_stats_csv_writer_rotation()
             const auto second_comma = row.find(',', first_comma + 1);
             ok = ok && first_comma != std::string::npos && second_comma != std::string::npos;
             if (first_comma != std::string::npos && second_comma != std::string::npos)
-                part_ids[index] = static_cast<uint64_t>(std::stoull(row.substr(first_comma + 1,
-                                                                               second_comma - first_comma - 1)));
+            {
+                ok = ok && row.size() > 27 && row[4] == '-' && row[7] == '-' && row[10] == 'T' &&
+                     row[19] == '.' && row[26] == 'Z';
+                session_ids[index] = static_cast<uint64_t>(std::stoull(row.substr(first_comma + 1,
+                                                                                  second_comma - first_comma - 1)));
+            }
         }
         else
         {
@@ -1941,10 +1945,56 @@ static bool test_queue_stats_csv_writer_rotation()
         }
         std::remove(candidate.c_str());
     }
-    ok = ok && part_ids[2] < part_ids[1] && part_ids[1] < part_ids[0];
+    ok = ok && session_ids[0] != 0 && session_ids[0] == session_ids[1] && session_ids[1] == session_ids[2];
     std::ifstream excess(path + ".3");
     ok = ok && !excess.good();
     std::remove((path + ".3").c_str());
+    return ok;
+}
+
+static bool test_queue_stats_start_preserves_previous_session()
+{
+    const std::string path = "queue_stats_writer_restart_test.csv";
+    for (size_t index = 0; index <= 3; ++index)
+        std::remove((index == 0 ? path : path + "." + std::to_string(index)).c_str());
+
+    const auto start = std::chrono::steady_clock::now();
+    QueueStatsSnapshot snapshot;
+    {
+        NetCSVWriter writer(path, 0, 3);
+        writer.start(start);
+        snapshot.recv = 1;
+        if (writer.on_frame(start))
+            writer.write(snapshot);
+        writer.stop(start + std::chrono::milliseconds(1), snapshot);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    {
+        NetCSVWriter writer(path, 0, 3);
+        writer.start(start + std::chrono::seconds(1));
+        snapshot.recv = 2;
+        if (writer.on_frame(start + std::chrono::seconds(1)))
+            writer.write(snapshot);
+        writer.stop(start + std::chrono::seconds(1) + std::chrono::milliseconds(1), snapshot);
+    }
+
+    auto read_session = [](const std::string &candidate) {
+        std::ifstream input(candidate);
+        std::string header;
+        std::string row;
+        if (!std::getline(input, header) || !std::getline(input, row))
+            return uint64_t{0};
+        const auto first = row.find(',');
+        const auto second = row.find(',', first == std::string::npos ? first : first + 1);
+        if (first == std::string::npos || second == std::string::npos)
+            return uint64_t{0};
+        return static_cast<uint64_t>(std::stoull(row.substr(first + 1, second - first - 1)));
+    };
+    const auto current_session = read_session(path);
+    const auto previous_session = read_session(path + ".1");
+    const bool ok = current_session != 0 && previous_session != 0 && current_session != previous_session;
+    for (size_t index = 0; index <= 3; ++index)
+        std::remove((index == 0 ? path : path + "." + std::to_string(index)).c_str());
     return ok;
 }
 
@@ -2032,6 +2082,7 @@ static int run_jitter_tests()
         {"QS delivery jitter revokes          ", test_qs_estimator_delivery_jitter_revokes_immediate},
         {"QS two-frame interval allowed       ", test_qs_estimator_two_frame_interval_allowed},
         {"queue stats CSV rotation            ", test_queue_stats_csv_writer_rotation},
+        {"queue stats preserve prior session ", test_queue_stats_start_preserves_previous_session},
         {"queue stats stop keeps segment      ", test_queue_stats_stop_keeps_segment},
         {"send queue fill API                 ", test_send_queue_fill},
     };

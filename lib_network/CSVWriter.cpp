@@ -2,8 +2,10 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <ctime>
 #include <cstring>
 #include <iomanip>
+#include <sstream>
 #include <utility>
 
 extern "C"
@@ -16,7 +18,7 @@ namespace
 constexpr auto RECORD_PERIOD = std::chrono::milliseconds(100);
 constexpr auto IDLE_GAP = std::chrono::seconds(5);
 constexpr const char *CSV_HEADER =
-    "elapsed_s,part_id,segment_id,idle_gap_s,q_short_fi_ms,q_avg_fi_ms,q_out_fi_ms,q_jitter_ms,"
+    "timestamp_utc,session_id,segment_id,idle_gap_s,q_short_fi_ms,q_avg_fi_ms,q_out_fi_ms,q_jitter_ms,"
     "q_disorder_frames,q_max_disorder_depth,q_tail_jitter_ms,q_buffered_frames,q_adaptive_depth,q_depth_raw,"
     "q_pressure_frames,q_recv_delta,"
     "q_dlv_delta,q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta";
@@ -41,17 +43,20 @@ NetCSVWriter::~NetCSVWriter()
 void NetCSVWriter::start(Clock::time_point now)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    close();
     bytes_written_ = 0;
     enabled_ = true;
     file_failed_ = false;
     has_last_frame_ = false;
     has_last_write_ = false;
     write_pending_ = false;
-    part_id_ = 0;
     segment_id_ = 0;
     start_time_ = now;
+    wall_start_time_ = WallClock::now();
+    session_id_ = std::chrono::duration_cast<std::chrono::microseconds>(wall_start_time_.time_since_epoch()).count();
     baseline_ = QueueStatsSnapshot{};
-    clear_files();
+    if (active_file_exists())
+        rotate();
 }
 
 bool NetCSVWriter::on_frame(Clock::time_point now)
@@ -122,7 +127,6 @@ void NetCSVWriter::write_row(Clock::time_point now, double idle_gap_s, const Que
     {
         if (!rotate())
             return;
-        ++part_id_;
         if (!open())
             return;
     }
@@ -132,10 +136,9 @@ void NetCSVWriter::write_row(Clock::time_point now, double idle_gap_s, const Que
     }
 
     const QueueStatsSnapshot previous = baseline_;
-    const double elapsed_s = std::chrono::duration<double>(now - start_time_).count();
-
-    file_ << std::fixed << std::setprecision(3) << elapsed_s << ',' << part_id_ << ',' << segment_id_ << ','
-          << idle_gap_s << ',' << std::setprecision(2) << stats.fi_short_ms << ',' << stats.fi_avg_ms << ','
+    file_ << timestamp_utc(now) << ',' << session_id_ << ',' << segment_id_ << ',' << std::fixed
+          << std::setprecision(3) << idle_gap_s << ',' << std::setprecision(2) << stats.fi_short_ms << ','
+          << stats.fi_avg_ms << ','
           << stats.fi_out_ms << ',' << stats.jitter_ms << ',' << stats.disorder_fr << ',' << stats.disorder_max_fr
           << ',' << stats.jitter_tail_ms << ',' << stats.buf_fr << ',' << stats.depth_target_fr << ','
           << stats.depth_raw_fr << ',' << stats.pressure_fr << ',' << delta(stats.recv, previous.recv) << ','
@@ -179,12 +182,10 @@ bool NetCSVWriter::open()
     return true;
 }
 
-void NetCSVWriter::clear_files()
+bool NetCSVWriter::active_file_exists() const
 {
-    close();
-    std::remove(path_.c_str());
-    for (size_t index = 1; index <= archive_count_; ++index)
-        std::remove(archive_path(index).c_str());
+    std::ifstream input(path_);
+    return input.good();
 }
 
 bool NetCSVWriter::rotate()
@@ -242,4 +243,21 @@ void NetCSVWriter::close()
 std::string NetCSVWriter::archive_path(size_t index) const
 {
     return path_ + "." + std::to_string(index);
+}
+
+std::string NetCSVWriter::timestamp_utc(Clock::time_point now) const
+{
+    const auto wall_time = wall_start_time_ + (now - start_time_);
+    const auto epoch_us = std::chrono::duration_cast<std::chrono::microseconds>(wall_time.time_since_epoch()).count();
+    const std::time_t seconds = static_cast<std::time_t>(epoch_us / 1000000);
+    const auto micros = static_cast<unsigned long long>(epoch_us % 1000000);
+    std::tm utc{};
+#if defined(_WIN32)
+    gmtime_s(&utc, &seconds);
+#else
+    gmtime_r(&seconds, &utc);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&utc, "%Y-%m-%dT%H:%M:%S") << '.' << std::setfill('0') << std::setw(6) << micros << 'Z';
+    return out.str();
 }

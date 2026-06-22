@@ -46,27 +46,34 @@ are marked invalid and excluded by the analyzer.
 
 Receiver-side `ReliableUDP` writes `queue_stats.csv` in the process working
 directory. A row is emitted on the receive path roughly every 100 ms without a
-timer or an additional thread. Gaps longer than five seconds start a new
-`segment_id`; `idle_gap_s` records the observed gap so plots do not connect
-unrelated traffic segments. The active file rotates at 64 MiB into
-`queue_stats.csv.1` through `queue_stats.csv.3`, bounding retained queue
-statistics to approximately 256 MiB. The `part_id` column increases on every
-rotation; the first and last `elapsed_s` values for each part identify its
-data range independently of the archive filename.
+timer or an additional thread. `timestamp_utc` is derived from one system/steady
+clock anchor captured at startup, and `session_id` separates process runs. Gaps
+longer than five seconds start a new `segment_id`; `idle_gap_s` records the gap.
+The active file rotates at 64 MiB into `queue_stats.csv.1` through
+`queue_stats.csv.3`, bounding retained data to approximately 256 MiB. Starting
+a new process archives the previous active file instead of deleting history.
 
 The test receiver also enables the optional controller-input observer and
 writes `input_intervals.csv`. Production users do not enable this observer;
 their normal runtime output remains only `queue_stats.csv`.
 
-Copy `sender_out/sender_summary.txt` to the analysis host, then run:
+The product analyzer needs only queue statistics:
 
 ```sh
-python3 tests/reliable_udp/plot.py receiver_out --sender-summary sender_summary.txt
+python3 lib_network/plot_queue_stats.py receiver_out
 ```
 
-Without `--sender-summary`, controller plots and receiver-side metrics are
+Test captures additionally have a strict `reliable_udp_test_v1` contract in
+`capture_meta.csv`, plus `input_intervals.csv` and `arrival_intervals.csv`.
+Copy `sender_out/sender_stats.csv` to the analysis host, then run:
+
+```sh
+python3 tests/reliable_udp/plot.py receiver_out --sender-stats sender_stats.csv
+```
+
+Without `--sender-stats`, controller plots and receiver-side metrics are
 still generated, but end-to-end message loss cannot be calculated.
-The sender summary also contains accepted-send interval mean/p50/p95/p99/max
+The sender stats file also contains accepted-send interval mean/p50/p95/p99/max
 and achieved payload rate. When supplied, the report and smoothness plot
 compare these sender intervals with receiver delivery intervals.
 
