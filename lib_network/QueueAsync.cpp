@@ -283,7 +283,7 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
         if (elapsed_ms > 0.0)
         {
             const double sample_interval =
-                std::max(MIN_FRAME_INTERVAL_MS, elapsed_ms / static_cast<double>(window_samples - 1));
+                (std::max)(MIN_FRAME_INTERVAL_MS, elapsed_ms / static_cast<double>(window_samples - 1));
             interval_short_avg = sample_interval;
             const double gain = has_interval ? ema_gain(FAST_ESTIMATE_WINDOW_FRAMES) : 1.0;
             interval_avg += gain * (sample_interval - interval_avg);
@@ -319,15 +319,15 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
 
     if (sample_valid && has_interval)
     {
-        const double late_sample_ms = std::max(0.0, sample_interval - interval_avg);
+        const double late_sample_ms = (std::max)(0.0, sample_interval - interval_avg);
         const double deviation = std::abs(sample_interval - interval_avg);
         jitter_hist.add(late_sample_ms);
         jitter_avg += ema_gain(FAST_ESTIMATE_WINDOW_FRAMES) * (deviation - jitter_avg);
 
         const double q95_ms = jitter_hist.quantile(JITTER_TAIL_QUANTILE);
-        const double tail_sample_ms = std::isfinite(q95_ms) ? std::max(q95_ms, late_sample_ms) : late_sample_ms;
+        const double tail_sample_ms = std::isfinite(q95_ms) ? (std::max)(q95_ms, late_sample_ms) : late_sample_ms;
         if (tail_sample_ms >= jitter_tail)
-            jitter_tail += std::min(tail_sample_ms - jitter_tail, JITTER_TAIL_SINGLE_FACTOR * interval_avg);
+            jitter_tail += (std::min)(tail_sample_ms - jitter_tail, JITTER_TAIL_SINGLE_FACTOR * interval_avg);
         else
             jitter_tail += ema_gain(SLOW_ESTIMATE_WINDOW_FRAMES) * (tail_sample_ms - jitter_tail);
     }
@@ -370,7 +370,7 @@ void ROEstimator::note(uint32_t abs_seq, size_t max_seq_delta)
         highest_seq = abs_seq;
         depth_frames *= ema_decay(SLOW_ESTIMATE_WINDOW_FRAMES);
         guard_depth_frames *= ema_decay(SLOW_ESTIMATE_WINDOW_FRAMES);
-        guard_depth_frames = std::max(guard_depth_frames, forward_gap);
+        guard_depth_frames = (std::max)(guard_depth_frames, forward_gap);
         return;
     }
 
@@ -383,9 +383,9 @@ void ROEstimator::note(uint32_t abs_seq, size_t max_seq_delta)
 
     const double sample = static_cast<double>(disorder_depth);
     ++reorder_cnt;
-    max_disorder_depth = std::max(max_disorder_depth, disorder_depth);
+    max_disorder_depth = (std::max)(max_disorder_depth, disorder_depth);
     depth_frames += ema_gain(FAST_ESTIMATE_WINDOW_FRAMES) * (sample - depth_frames);
-    guard_depth_frames = std::max(guard_depth_frames, sample);
+    guard_depth_frames = (std::max)(guard_depth_frames, sample);
 }
 
 void QSEstimator::reset()
@@ -398,7 +398,7 @@ void QSEstimator::reset()
 
 bool QSEstimator::note_delivery(ClockTP now, double expected_interval_ms, bool continuity_broken)
 {
-    expected_interval_ms = std::max(MIN_FRAME_INTERVAL_MS, expected_interval_ms);
+    expected_interval_ms = (std::max)(MIN_FRAME_INTERVAL_MS, expected_interval_ms);
 
     if (continuity_broken)
     {
@@ -449,12 +449,12 @@ void RecvQueueAsync::BFController::sanitize(const Tunables &tuning)
         decay_depth_frames = static_cast<double>(adaptive_depth);
     decay_depth_frames =
         clamp_value(decay_depth_frames, static_cast<double>(tuning.min_depth), static_cast<double>(tuning.max_depth));
-    raw_depth_frames = std::max(raw_depth_frames, static_cast<double>(tuning.min_depth));
+    raw_depth_frames = (std::max)(raw_depth_frames, static_cast<double>(tuning.min_depth));
 }
 
 void RecvQueueAsync::BFController::trigger_pressure(const Tunables &tuning)
 {
-    pressure_frames_remaining = std::max(pressure_frames_remaining, tuning.pressure_bonus_frames);
+    pressure_frames_remaining = (std::max)(pressure_frames_remaining, tuning.pressure_bonus_frames);
 }
 
 void RecvQueueAsync::BFController::consume_pressure()
@@ -503,20 +503,20 @@ RecvQueueAsync::~RecvQueueAsync()
 void RecvQueueAsync::sanitize_tuning_locked()
 {
     tuning_.min_depth = std::max<size_t>(1, tuning_.min_depth);
-    tuning_.max_depth = std::max<size_t>(2, std::max(tuning_.max_depth, tuning_.min_depth));
-    tuning_.min_depth = std::min(tuning_.min_depth, tuning_.max_depth);
+    tuning_.max_depth = std::max<size_t>(2, (std::max)(tuning_.max_depth, tuning_.min_depth));
+    tuning_.min_depth = (std::min)(tuning_.min_depth, tuning_.max_depth);
     tuning_.initial_depth = clamp_value(tuning_.initial_depth, tuning_.min_depth, tuning_.max_depth);
 
-    tuning_.stale_timeout_ms = std::max(tuning_.stale_timeout_ms, MIN_FRAME_INTERVAL_MS);
-    tuning_.gap_wait_frames = std::max(tuning_.gap_wait_frames, 1.0);
-    tuning_.default_frame_interval_ms = std::max(tuning_.default_frame_interval_ms, MIN_FRAME_INTERVAL_MS);
+    tuning_.stale_timeout_ms = (std::max)(tuning_.stale_timeout_ms, MIN_FRAME_INTERVAL_MS);
+    tuning_.gap_wait_frames = (std::max)(tuning_.gap_wait_frames, 1.0);
+    tuning_.default_frame_interval_ms = (std::max)(tuning_.default_frame_interval_ms, MIN_FRAME_INTERVAL_MS);
     tuning_.depth_feedback_gain = clamp_value(tuning_.depth_feedback_gain, 0.0, 0.5);
     tuning_.min_pacing_factor = clamp_value(tuning_.min_pacing_factor, 0.1, 1.0);
-    tuning_.max_pacing_factor = std::max(tuning_.max_pacing_factor, 1.0);
+    tuning_.max_pacing_factor = (std::max)(tuning_.max_pacing_factor, 1.0);
     if (tuning_.max_pacing_factor < tuning_.min_pacing_factor)
         tuning_.max_pacing_factor = tuning_.min_pacing_factor;
-    tuning_.depth_margin_frames = std::max(0.0, tuning_.depth_margin_frames);
-    tuning_.jitter_weight = std::max(0.0, tuning_.jitter_weight);
+    tuning_.depth_margin_frames = (std::max)(0.0, tuning_.depth_margin_frames);
+    tuning_.jitter_weight = (std::max)(0.0, tuning_.jitter_weight);
 
     buffer_ctl_.sanitize(tuning_);
 }
@@ -599,7 +599,7 @@ void RecvQueueAsync::reset()
 
 void RecvQueueAsync::update_adaptive_depth_locked()
 {
-    buffer_ctl_.note(tuning_, std::max(reorder_est_.depth_frames, reorder_est_.guard_depth_frames),
+    buffer_ctl_.note(tuning_, (std::max)(reorder_est_.depth_frames, reorder_est_.guard_depth_frames),
                      arrival_est_.jitter_tail / estimated_interval_ms_locked());
 }
 
@@ -630,7 +630,7 @@ double RecvQueueAsync::compute_delivery_interval_locked() const
     const double pacing_factor =
         feedback_scale <= 0.0 ? tuning_.max_pacing_factor
                               : clamp_value(1.0 / feedback_scale, tuning_.min_pacing_factor, tuning_.max_pacing_factor);
-    return std::max(MIN_FRAME_INTERVAL_MS, base_interval_ms * pacing_factor);
+    return (std::max)(MIN_FRAME_INTERVAL_MS, base_interval_ms * pacing_factor);
 }
 
 void RecvQueueAsync::drop_frame_locked(std::list<BufferedFrame>::iterator it)
@@ -664,7 +664,7 @@ void RecvQueueAsync::purge_stale_locked(ClockTP now)
     {
         const auto &frame = buffered_frames_.front();
         last_stale_seq = frame.seq;
-        max_age_ms = std::max(max_age_ms, std::chrono::duration<double, std::milli>(now - frame.arrival).count());
+        max_age_ms = (std::max)(max_age_ms, std::chrono::duration<double, std::milli>(now - frame.arrival).count());
         drop_frame_locked(buffered_frames_.begin());
         ++stale_count;
     }
@@ -750,7 +750,7 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
 QueueStatsSnapshot RecvQueueAsync::stats_snapshot_locked() const
 {
     const double interval_ms = estimated_interval_ms_locked();
-    const double effective_disorder_frames = std::max(reorder_est_.depth_frames, reorder_est_.guard_depth_frames);
+    const double effective_disorder_frames = (std::max)(reorder_est_.depth_frames, reorder_est_.guard_depth_frames);
     const double output_interval_ms = compute_delivery_interval_locked();
 
     QueueStatsSnapshot out;
@@ -791,7 +791,7 @@ void RecvQueueAsync::handle_gap_locked(std::unique_lock<std::mutex> &lock, Clock
     if (gap_start_time_ == ClockTP{})
     {
         gap_start_time_ = now;
-        const double base_interval_ms = std::max(tuning_.default_frame_interval_ms, estimated_interval_ms_locked());
+        const double base_interval_ms = (std::max)(tuning_.default_frame_interval_ms, estimated_interval_ms_locked());
         gap_deadline_ =
             now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                       std::chrono::duration<double, std::milli>(base_interval_ms * tuning_.gap_wait_frames));
