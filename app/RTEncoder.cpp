@@ -377,17 +377,15 @@ bool RTEncoderBase::set_bitrate(uint32_t uTargetBitRate, uint32_t uMaxBitRate)
     }
 
     const uint32_t effectiveMax = (uMaxBitRate > 0) ? uMaxBitRate : uTargetBitRate;
-    const int targetKbps = static_cast<int>((uTargetBitRate + 999U) / 1000U);
-    const int maxKbps = static_cast<int>((effectiveMax + 999U) / 1000U);
 
     bool ok = false;
     if (effectiveMax != uTargetBitRate)
     {
-        ok = AL_Encoder_SetMaxBitRate(m_hEnc, targetKbps, maxKbps);
+        ok = AL_Encoder_SetMaxBitRate(m_hEnc, uTargetBitRate, effectiveMax);
     }
     else
     {
-        ok = AL_Encoder_SetBitRate(m_hEnc, targetKbps);
+        ok = AL_Encoder_SetBitRate(m_hEnc, uTargetBitRate);
     }
 
     if (!ok)
