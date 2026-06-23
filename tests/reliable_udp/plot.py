@@ -559,8 +559,10 @@ def plot_network(out_dir, queue, stages, filename, time_range):
     data = queue["plot"]
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
     queue_core.plot_network_axes(axes, queue)
-    event_lines = (("q_reorder_delta", "reorder events"), ("q_skip_delta", "skipped frames"),
-                   ("q_drop_delta", "dropped frames"))
+    event_lines = (("q_skip_delta", "skipped frames"), ("q_drop_delta", "dropped frames"),
+                   ("q_dup_delta", "duplicates"), ("q_late_delta", "late frames"),
+                   ("q_reorder_delta", "reorder events"), ("q_stale_delta", "stale frames"),
+                   ("q_ovf_delta", "overflows"))
     plotted = False
     for key, _ in event_lines:
         plotted = plotted or any(value > 0.0 for value in data[key])
@@ -580,16 +582,10 @@ def plot_network(out_dir, queue, stages, filename, time_range):
             axes[0].legend(lines + extra, labels + extra_labels, loc="upper right")
     elif plotted:
         axes[0].legend(loc="upper right")
-    if not plotted and not stages:
-        axes[0].text(0.5, 0.5, "No queue/network events", transform=axes[0].transAxes,
-                     ha="center", va="center", color="tab:green")
     axes[0].set_ylabel("count / stats period")
     axes[0].set_title("Observed Queue and Network Events")
     axes[0].grid(True, alpha=0.25)
 
-    pressure = [1.0 if value > 0.0 else 0.0 for value in data["q_pressure_frames"]]
-    if any(pressure):
-        axes[1].plot(data["t"], pressure, linewidth=0.9, label="pressure driver")
     axes[1].set_xlabel("time (s)")
     axes[1].set_ylabel("frames")
     axes[1].set_title("Active Controller Drivers")

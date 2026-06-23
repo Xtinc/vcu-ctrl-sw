@@ -63,6 +63,11 @@ The product analyzer needs only queue statistics:
 python3 lib_network/plot_queue_stats.py receiver_out
 ```
 
+The product analyzer writes paged queue timing, estimated jitter-buffer delay,
+and queue/network event plots plus `queue_report.txt`. Delay is estimated from
+buffer depth and the commanded output interval; it is not measured end-to-end
+latency. Use `--plot-window-seconds` to change the default 600-second page size.
+
 Test captures additionally have a strict `reliable_udp_test_v1` contract in
 `capture_meta.csv`, plus `input_intervals.csv` and `arrival_intervals.csv`.
 Copy `sender_out/sender_stats.csv` to the analysis host, then run:
