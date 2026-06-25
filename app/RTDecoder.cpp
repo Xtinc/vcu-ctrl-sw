@@ -20,6 +20,20 @@ extern "C"
 
 static constexpr int kMaxWidth = 3840;
 static constexpr int kMaxHeight = 2160;
+static constexpr int kMaxLevel = 51;
+
+static void set_max_stream_settings(AL_TDecSettings &settings)
+{
+    auto &stream = settings.tStream;
+    stream.tDim = {kMaxWidth, kMaxHeight};
+    stream.eChroma = AL_CHROMA_4_2_0;
+    stream.iBitDepth = 8;
+    stream.iLevel = kMaxLevel;
+    stream.eProfile = (settings.eCodec == AL_CODEC_AVC) ? AL_PROFILE_AVC_MAIN : AL_PROFILE_HEVC_MAIN;
+    stream.eSequenceMode = AL_SM_PROGRESSIVE;
+    stream.bDecodeIntraOnly = false;
+    stream.iMaxRef = 0;
+}
 
 using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
 using AL_MetaDataGuard = std::unique_ptr<AL_TMetaData, decltype(&AL_MetaData_Destroy)>;
@@ -57,6 +71,7 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
 
         AL_DecSettings_SetDefaults(&m_dec_settings);
         m_dec_settings.eCodec = m_cfg.codec;
+        set_max_stream_settings(m_dec_settings);
 
         // LLP1 baseline: always enabled for RTDecoder (split-input slice-latency mode).
         m_dec_settings.bLowLat = true;
@@ -95,6 +110,11 @@ RTDecoder::RTDecoder(const DecoderConfig &cfg, DecodedFrameCallback cb)
         if (AL_IS_ERROR_CODE(err) || !m_hDec)
         {
             throw std::runtime_error(std::string("AL_Decoder_Create failed: ") + AL_Codec_ErrorToString(err));
+        }
+
+        if (!AL_Decoder_PreallocateBuffers(m_hDec))
+        {
+            throw std::runtime_error("AL_Decoder_PreallocateBuffers failed");
         }
 
         m_src_buf_pool = std::make_unique<GenericBufPool>();
