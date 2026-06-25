@@ -129,7 +129,7 @@ class RecvQueueAsync
     struct Tunables
     {
         size_t min_depth = 1;
-        size_t initial_depth = 8;
+        size_t initial_depth = 4;
         size_t max_depth = 512;
         double stale_timeout_ms = 1000.0;
         double gap_wait_frames = 3.0;
@@ -138,7 +138,7 @@ class RecvQueueAsync
         double min_pacing_factor = 0.70;
         double max_pacing_factor = 1.50;
         double depth_margin_frames = 0.5;
-        double jitter_weight = 1.5;
+        double jitter_weight = 1.0;
         uint32_t pressure_bonus_frames = 30;
     };
 
