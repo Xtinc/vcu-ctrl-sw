@@ -1921,6 +1921,7 @@ static bool test_queue_stats_csv_writer_rotation()
         ok = ok && static_cast<bool>(std::getline(input, header));
         ok = ok && header.find("timestamp_utc,session_id,segment_id,idle_gap_s") == 0;
         ok = ok && header.find("q_tail_jitter_ms") != std::string::npos;
+        ok = ok && header.find("allow_immediate") != std::string::npos;
         ok = ok && header.find("q_fb_fi_ms") == std::string::npos;
         ok = ok && header.find("q_tail_jitter_frames") == std::string::npos;
         ok = ok && header.find("q_depth_error_frames") == std::string::npos;
@@ -2028,6 +2029,7 @@ static bool test_queue_stats_stop_keeps_segment()
             writer.write(snapshot);
         throttled = !writer.on_frame(start + std::chrono::milliseconds(50));
         snapshot.recv = 2;
+        snapshot.allow_immediate = true;
         writer.stop(start + std::chrono::seconds(6), snapshot);
     }
 
@@ -2038,7 +2040,7 @@ static bool test_queue_stats_stop_keeps_segment()
     const bool rows_ok = static_cast<bool>(std::getline(input, header)) && static_cast<bool>(std::getline(input, first)) &&
                          static_cast<bool>(std::getline(input, final));
     const bool ok = throttled && rows_ok && csv_field(first, 2) == "1" && csv_field(final, 2) == "1" &&
-                    csv_field(final, 3) == "0.000";
+                    csv_field(final, 3) == "0.000" && csv_field(final, 24) == "1";
     input.close();
     std::remove(path.c_str());
     return ok;

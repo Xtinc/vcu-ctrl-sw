@@ -21,7 +21,8 @@ constexpr const char *CSV_HEADER =
     "timestamp_utc,session_id,segment_id,idle_gap_s,q_short_fi_ms,q_avg_fi_ms,q_out_fi_ms,q_jitter_ms,"
     "q_disorder_frames,q_max_disorder_depth,q_tail_jitter_ms,q_buffered_frames,q_adaptive_depth,q_depth_raw,"
     "q_pressure_frames,q_recv_delta,"
-    "q_dlv_delta,q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta";
+    "q_dlv_delta,q_skip_delta,q_drop_delta,q_dup_delta,q_late_delta,q_reorder_delta,q_stale_delta,q_ovf_delta,"
+    "allow_immediate";
 
 uint64_t delta(uint64_t current, uint64_t previous)
 {
@@ -145,7 +146,8 @@ void NetCSVWriter::write_row(Clock::time_point now, double idle_gap_s, const Que
           << delta(stats.dlv, previous.dlv) << ',' << delta(stats.skip, previous.skip) << ','
           << delta(stats.drop, previous.drop) << ',' << delta(stats.dup, previous.dup) << ','
           << delta(stats.late, previous.late) << ',' << delta(stats.reorder, previous.reorder) << ','
-          << delta(stats.stale, previous.stale) << ',' << delta(stats.ovf, previous.ovf) << '\n';
+          << delta(stats.stale, previous.stale) << ',' << delta(stats.ovf, previous.ovf) << ','
+          << (stats.allow_immediate ? 1 : 0) << '\n';
     if (!file_)
     {
         file_failed_ = true;

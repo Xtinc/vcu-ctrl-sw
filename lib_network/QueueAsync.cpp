@@ -774,6 +774,7 @@ QueueStatsSnapshot RecvQueueAsync::stats_snapshot_locked() const
     out.reorder = reorder_est_.reorder_cnt;
     out.stale = stale_count_;
     out.ovf = overflow_count_;
+    out.allow_immediate = qs_est_.allow_immediate;
     return out;
 }
 

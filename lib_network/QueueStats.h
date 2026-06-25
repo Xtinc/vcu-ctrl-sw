@@ -25,6 +25,7 @@ struct QueueStatsSnapshot
     uint64_t reorder = 0;
     uint64_t stale = 0;
     uint64_t ovf = 0;
+    bool allow_immediate = false;
 };
 
 #endif // QUEUE_STATS_H

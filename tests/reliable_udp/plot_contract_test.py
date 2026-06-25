@@ -45,7 +45,8 @@ class PlotContractTest(unittest.TestCase):
                            q_pressure_frames=0, q_recv_delta=10, q_dlv_delta=8, q_skip_delta=1),
             self.queue_row("2026-06-22T00:00:05.000000Z", q_out_fi_ms=5.0, q_buffered_frames=4,
                            q_adaptive_depth=5, q_depth_raw=4.5, q_jitter_ms=2.0, q_tail_jitter_ms=6.0,
-                           q_pressure_frames=2, q_recv_delta=20, q_dlv_delta=19, q_dup_delta=2),
+                           q_pressure_frames=2, q_recv_delta=20, q_dlv_delta=19, q_dup_delta=2,
+                           allow_immediate=1),
             self.queue_row("2026-06-22T00:00:12.000000Z", segment=2, idle_gap_s=7.0, q_avg_fi_ms=0.0,
                            q_short_fi_ms=0.0, q_out_fi_ms=0.0, q_drop_delta=1, q_ovf_delta=1),
         ]
@@ -109,26 +110,30 @@ class PlotContractTest(unittest.TestCase):
             self.assertEqual(queue["counters"]["dlv"], 27)
             self.assertEqual(queue["counters"]["dup"], 2)
             self.assertEqual(queue["counters"]["overflow"], 1)
+            self.assertAlmostEqual(queue["qse_immediate_ratio"], 1.0 / 3.0)
+            self.assertEqual(queue["qse_transitions"], 2)
             self.assertTrue(all(math.isfinite(value) for value in queue["plot"]["q_tail_jitter_frames"]
                                 if not math.isnan(value)))
 
     def test_product_paging_and_report_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             queue = queue_core.process_queue(self.make_product_capture(directory))
-            self.assertEqual([(0.0, 10.0), (10.0, 20.0)], queue_core.window_ranges(queue, 10.0))
+            self.assertEqual([(0.0, 10.0), (10.0, 12.0)], queue_core.window_ranges(queue, 10.0))
             windows = [queue_core.queue_plot_window(queue, start, end)
                        for start, end in queue_core.window_ranges(queue, 10.0)]
             self.assertEqual(3, sum(sum(value == value for value in window["q_avg_fi_ms"])
                                     for window in windows))
             queue_core.render_product_outputs(queue, directory, 10.0)
-            self.assertEqual(2, len(glob.glob(os.path.join(directory, "queue_timing_*.png"))))
-            self.assertEqual(2, len(glob.glob(os.path.join(directory, "queue_latency_*.png"))))
-            self.assertEqual(2, len(glob.glob(os.path.join(directory, "queue_network_*.png"))))
-            with open(os.path.join(directory, "queue_report.txt")) as stream:
-                report = stream.read()
-            self.assertIn("Estimated jitter-buffer delay", report)
-            self.assertIn("not end-to-end latency", report)
-            self.assertIn("Unavailable from product queue stats", report)
+            self.assertEqual(2, len(glob.glob(os.path.join(directory, "output_smoothness_*.png"))))
+            self.assertEqual(2, len(glob.glob(os.path.join(directory, "controller_terms_*.png"))))
+            self.assertEqual(2, len(glob.glob(os.path.join(directory, "network_effects_*.png"))))
+            self.assertEqual([], glob.glob(os.path.join(directory, "queue_*.png")))
+            self.assertFalse(os.path.exists(os.path.join(directory, "queue_report.txt")))
+            with open(os.path.join(directory, "controller_assessment.txt")) as stream:
+                assessment = stream.read()
+            self.assertIn("product-side output smoothness assessment", assessment)
+            self.assertIn("QSE mode", assessment)
+            self.assertNotIn("QSE mode transitions from arrival captures", assessment)
 
 
 if __name__ == "__main__":
