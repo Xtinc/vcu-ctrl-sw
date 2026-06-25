@@ -2,8 +2,8 @@
 
 #include <cerrno>
 #include <cstdio>
-#include <ctime>
 #include <cstring>
+#include <ctime>
 #include <iomanip>
 #include <sstream>
 #include <utility>
@@ -137,9 +137,8 @@ void NetCSVWriter::write_row(Clock::time_point now, double idle_gap_s, const Que
     }
 
     const QueueStatsSnapshot previous = baseline_;
-    file_ << timestamp_utc(now) << ',' << session_id_ << ',' << segment_id_ << ',' << std::fixed
-          << std::setprecision(3) << idle_gap_s << ',' << std::setprecision(2) << stats.fi_short_ms << ','
-          << stats.fi_avg_ms << ','
+    file_ << timestamp_utc(now) << ',' << session_id_ << ',' << segment_id_ << ',' << std::fixed << std::setprecision(3)
+          << idle_gap_s << ',' << std::setprecision(2) << stats.fi_short_ms << ',' << stats.fi_avg_ms << ','
           << stats.fi_out_ms << ',' << stats.jitter_ms << ',' << stats.disorder_fr << ',' << stats.disorder_max_fr
           << ',' << stats.jitter_tail_ms << ',' << stats.buf_fr << ',' << stats.depth_target_fr << ','
           << stats.depth_raw_fr << ',' << stats.pressure_fr << ',' << delta(stats.recv, previous.recv) << ','
