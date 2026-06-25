@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 SAVE_DPI = 300
 ROLLING_WINDOW = 100
 DEFAULT_PLOT_WINDOW_SECONDS = 600.0
+MAX_DELIVERED_ESTIMATE_GAP_MS = 500.0
+MAX_DELIVERED_ESTIMATE_EXPECTED_MULTIPLIER = 4.0
 OUTPUTS = {
     "output_smoothness.png",
     "controller_terms.png",
@@ -219,6 +221,8 @@ def process_queue(path):
     previous_sample_timestamp = None
     current_session = None
     row_count = 0
+    excluded_delivered_estimates = 0
+    max_excluded_delivered_estimate_ms = 0.0
     for row in iter_queue_rows(path):
         if origin is None:
             origin = row["timestamp"]
@@ -248,9 +252,20 @@ def process_queue(path):
         elapsed_ms = ((row["timestamp"] - previous_sample_timestamp) * 1000.0
                       if previous_sample_timestamp is not None and same_session_as_previous and
                       row["idle_gap_s"] <= 0.0 else 0.0)
-        values["estimated_delivered_interval_ms"] = (elapsed_ms / row["q_dlv_delta"]
-                                                     if elapsed_ms > 0.0 and row["q_dlv_delta"] > 0.0
-                                                     else float("nan"))
+        values["estimated_delivered_interval_ms"] = float("nan")
+        if elapsed_ms > 0.0 and row["q_dlv_delta"] > 0.0:
+            expected_interval_ms = max(row["q_out_fi_ms"], row["q_avg_fi_ms"], row["q_short_fi_ms"])
+            max_elapsed_ms = MAX_DELIVERED_ESTIMATE_GAP_MS
+            if expected_interval_ms > 0.0:
+                max_elapsed_ms = max(
+                    max_elapsed_ms,
+                    expected_interval_ms * row["q_dlv_delta"] * MAX_DELIVERED_ESTIMATE_EXPECTED_MULTIPLIER,
+                )
+            if elapsed_ms <= max_elapsed_ms:
+                values["estimated_delivered_interval_ms"] = elapsed_ms / row["q_dlv_delta"]
+            else:
+                excluded_delivered_estimates += 1
+                max_excluded_delivered_estimate_ms = max(max_excluded_delivered_estimate_ms, elapsed_ms)
         for event, column in (("recv", "q_recv_delta"), ("dlv", "q_dlv_delta"),
                               ("skip", "q_skip_delta"), ("drop", "q_drop_delta"),
                               ("dup", "q_dup_delta"), ("late", "q_late_delta"),
@@ -293,6 +308,8 @@ def process_queue(path):
                 "raw": summarize(plot["estimated_raw_delay_ms"], active),
             },
             "estimated_delivered_output": summarize(plot["estimated_delivered_interval_ms"]),
+            "excluded_delivered_estimates": excluded_delivered_estimates,
+            "max_excluded_delivered_estimate_ms": max_excluded_delivered_estimate_ms,
             "qse_immediate_ratio": qse_immediate_ratio, "qse_transitions": qse_transitions,
             "pressure_ratio": pressure_ratio, "events": events, "counters": events}
 
@@ -394,13 +411,13 @@ def plot_product_output_axes(axes, queue):
     data = queue["plot"]
     delivered_roll = rolling_summary_series(data["t"], data["estimated_delivered_interval_ms"])
     axes[0].plot(data["t"], data["estimated_delivered_interval_ms"], linewidth=0.45, alpha=0.25,
-                 label="output interval samples")
+                 label="filtered output interval estimate")
     axes[0].plot(delivered_roll["t"], delivered_roll["mean"], linewidth=1.2,
-                 label="rolling mean")
+                 label="filtered rolling mean")
     axes[0].plot(delivered_roll["t"], delivered_roll["p95"], linewidth=1.1,
-                 label="rolling p95")
+                 label="filtered rolling p95")
     axes[0].set_ylabel("ms")
-    axes[0].set_title("User-Visible Output Interval and QSE Mode")
+    axes[0].set_title("Estimated User-Visible Output Interval and QSE Mode")
     set_robust_upper_ylim(axes[0], list(data["estimated_delivered_interval_ms"]) + delivered_roll["p95"])
     qse_axis = axes[0].twinx()
     qse_axis.step(data["t"], data["allow_immediate"], where="post", color="tab:purple", alpha=0.55,
@@ -433,13 +450,13 @@ def plot_product_controller_axes(axes, queue):
     axes[0].plot(input_roll["t"], input_roll["p95"], linewidth=1.0,
                  label="controller input rolling p95")
     axes[0].plot(data["t"], data["estimated_delivered_interval_ms"], linewidth=0.45, alpha=0.25,
-                 label="controlled output interval (per frame)")
+                 label="filtered controlled output estimate")
     axes[0].plot(delivered_roll["t"], delivered_roll["mean"], linewidth=1.2,
-                 label="controlled output rolling mean")
+                 label="filtered controlled output rolling mean")
     axes[0].plot(delivered_roll["t"], delivered_roll["p95"], linewidth=1.0,
-                 label="controlled output rolling p95")
+                 label="filtered controlled output rolling p95")
     axes[0].set_ylabel("ms")
-    axes[0].set_title("Network-Affected Input vs Controlled Output")
+    axes[0].set_title("Estimated Network-Affected Input vs Controlled Output")
     set_robust_upper_ylim(axes[0], list(data["q_short_fi_ms"]) +
                           list(data["estimated_delivered_interval_ms"]) +
                           input_roll["p95"] + delivered_roll["p95"])
@@ -552,7 +569,8 @@ def write_product_assessment(queue, path):
     visible_failures = events["skip"] + events["late"] + events["overflow"] + events["drop"]
     expected = events["dlv"] + events["skip"] + events["drop"] + events["late"] + events["overflow"]
     visible_failure_rate = visible_failures / expected if expected > 0.0 else 0.0
-    input_cv = queue["input"]["cv"]
+    input_stats = queue["short_input"] if queue["short_input"]["count"] > 0 else queue["input"]
+    input_cv = input_stats["cv"]
     output_stats = (queue["estimated_delivered_output"] if queue["estimated_delivered_output"]["count"] > 0
                     else queue["output"])
     output_cv = output_stats["cv"]
@@ -577,12 +595,14 @@ def write_product_assessment(queue, path):
             stream.write("{session_id},{start_utc},{start_s:.3f},{end_s:.3f},{rows}\n".format(**session))
 
         stream.write("\nEstimated input/output jitter comparison\n")
-        for label_text, values in (("input", queue["input"]), ("output", queue["output"])):
+        stream.write("- basis: input uses short controller input estimate; output uses filtered delivered estimate when available\n")
+        for label_text, values in (("input", input_stats), ("output", queue["output"])):
             stream.write("- {}_mean_ms: {:.3f}\n".format(label_text, values["mean"]))
             stream.write("- {}_cv: {:.6f}\n".format(label_text, values["cv"]))
             stream.write("- {}_p95_ms: {:.3f}\n".format(label_text, values["p95"]))
             stream.write("- {}_p99_ms: {:.3f}\n".format(label_text, values["p99"]))
             stream.write("- {}_max_ms: {:.3f}\n".format(label_text, values["max"]))
+        stream.write("- smoothed_input_cv: {:.6f}\n".format(queue["input"]["cv"]))
         if queue["estimated_delivered_output"]["count"] > 0:
             stream.write("- delivered_output_estimate_mean_ms: {:.3f}\n".format(
                 queue["estimated_delivered_output"]["mean"]))
@@ -592,16 +612,22 @@ def write_product_assessment(queue, path):
                 queue["estimated_delivered_output"]["p95"]))
             stream.write("- delivered_output_estimate_p99_ms: {:.3f}\n".format(
                 queue["estimated_delivered_output"]["p99"]))
+        if queue["excluded_delivered_estimates"] > 0:
+            stream.write("- delivered_output_estimate_excluded: {}\n".format(
+                queue["excluded_delivered_estimates"]))
+            stream.write("- delivered_output_estimate_max_excluded_gap_ms: {:.3f}\n".format(
+                queue["max_excluded_delivered_estimate_ms"]))
         if input_cv > 0.0:
-            stream.write("- cv_reduction_pct: {:.2f}\n".format((1.0 - output_cv / input_cv) * 100.0))
+            stream.write("- estimated_cv_reduction_pct: {:.2f}\n".format((1.0 - output_cv / input_cv) * 100.0))
         else:
-            stream.write("- cv_reduction_pct: unavailable\n")
+            stream.write("- estimated_cv_reduction_pct: unavailable\n")
+        stream.write("- note: product-side estimate is not equivalent to receiver test per-frame captures\n")
         stream.write("- see: controller_terms_*.png\n\n")
 
         stream.write("Estimated delivered output interval (ms)\n")
         for key in ("mean", "p50", "p90", "p95", "p99", "max"):
             stream.write("- {}: {:.2f}\n".format(key, output_stats[key]))
-        stream.write("- source: sample elapsed time divided by q_dlv_delta when available\n")
+        stream.write("- source: filtered sample elapsed time divided by q_dlv_delta when available\n")
         stream.write("- see: output_smoothness_*.png\n\n")
 
         stream.write("Commanded output interval (ms)\n")

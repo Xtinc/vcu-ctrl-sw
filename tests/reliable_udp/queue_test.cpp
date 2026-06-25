@@ -1878,6 +1878,63 @@ static bool test_qs_estimator_delivery_jitter_revokes_immediate()
            !qs.allow_immediate;
 }
 
+static bool test_qs_estimator_soft_timeout_does_not_reset()
+{
+    QSEstimator qs;
+    const auto base = std::chrono::steady_clock::now();
+    for (int i = 0; i <= 31; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false);
+
+    return qs.note_delivery(base + std::chrono::milliseconds(32500), 1000.0, false) && qs.allow_immediate;
+}
+
+static bool test_qs_estimator_soft_window_revokes_immediate()
+{
+    QSEstimator qs;
+    const auto base = std::chrono::steady_clock::now();
+    for (int i = 0; i <= 31; ++i)
+        qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false);
+
+    if (!qs.note_delivery(base + std::chrono::milliseconds(32500), 1000.0, false))
+        return false;
+    if (!qs.note_delivery(base + std::chrono::milliseconds(34000), 1000.0, false))
+        return false;
+
+    return !qs.note_delivery(base + std::chrono::milliseconds(35500), 1000.0, false) &&
+           !qs.allow_immediate;
+}
+
+static bool test_qs_estimator_soft_window_recovers()
+{
+    QSEstimator qs;
+    auto now = std::chrono::steady_clock::now();
+    const auto base = now;
+    for (int i = 0; i <= 31; ++i)
+    {
+        now = base + std::chrono::seconds(i);
+        qs.note_delivery(now, 1000.0, false);
+    }
+
+    now += std::chrono::milliseconds(1500);
+    qs.note_delivery(now, 1000.0, false);
+    now += std::chrono::milliseconds(1500);
+    qs.note_delivery(now, 1000.0, false);
+    now += std::chrono::milliseconds(1500);
+    if (qs.note_delivery(now, 1000.0, false))
+        return false;
+
+    bool recovered = false;
+    for (int i = 0; i < 70; ++i)
+    {
+        now += std::chrono::seconds(1);
+        recovered = qs.note_delivery(now, 1000.0, false);
+        if (recovered)
+            break;
+    }
+
+    return recovered && qs.allow_immediate;
+}
+
 static bool test_qs_estimator_two_frame_interval_allowed()
 {
     QSEstimator qs;
@@ -2082,6 +2139,9 @@ static int run_jitter_tests()
         {"QS stable allows immediate          ", test_qs_estimator_stable_allows_immediate},
         {"QS continuity break revokes         ", test_qs_estimator_continuity_break_revokes_immediate},
         {"QS delivery jitter revokes          ", test_qs_estimator_delivery_jitter_revokes_immediate},
+        {"QS soft timeout is tolerated        ", test_qs_estimator_soft_timeout_does_not_reset},
+        {"QS soft window revokes              ", test_qs_estimator_soft_window_revokes_immediate},
+        {"QS soft window recovers             ", test_qs_estimator_soft_window_recovers},
         {"QS two-frame interval allowed       ", test_qs_estimator_two_frame_interval_allowed},
         {"queue stats CSV rotation            ", test_queue_stats_csv_writer_rotation},
         {"queue stats preserve prior session ", test_queue_stats_start_preserves_previous_session},

@@ -115,6 +115,21 @@ class PlotContractTest(unittest.TestCase):
             self.assertTrue(all(math.isfinite(value) for value in queue["plot"]["q_tail_jitter_frames"]
                                 if not math.isnan(value)))
 
+    def test_product_filters_stale_delivered_interval_estimates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [
+                self.queue_row("2026-06-22T00:00:00.000000Z", q_dlv_delta=0),
+                self.queue_row("2026-06-22T00:00:00.100000Z", q_dlv_delta=50),
+                self.queue_row("2026-06-22T00:00:03.200000Z", q_dlv_delta=50),
+            ]
+            path = self.write_csv(directory, "queue_stats.csv", queue_core.QUEUE_HEADER, rows)
+            queue = queue_core.process_queue(path)
+
+            self.assertEqual(1, queue["estimated_delivered_output"]["count"])
+            self.assertAlmostEqual(2.0, queue["estimated_delivered_output"]["mean"], places=5)
+            self.assertEqual(1, queue["excluded_delivered_estimates"])
+            self.assertAlmostEqual(3100.0, queue["max_excluded_delivered_estimate_ms"], places=3)
+
     def test_product_paging_and_report_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             queue = queue_core.process_queue(self.make_product_capture(directory))

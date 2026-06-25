@@ -4,6 +4,7 @@
 #include "ClockWait.h"
 #include "MemPoolUDP.h"
 #include "QueueStats.h"
+#include <array>
 #include <functional>
 #include <thread>
 
@@ -104,6 +105,7 @@ class QSEstimator
 {
   public:
     using ClockTP = std::chrono::steady_clock::time_point;
+    static constexpr size_t SOFT_WINDOW_CAPACITY = 64;
 
     void reset();
     bool note_delivery(ClockTP now, double expected_interval_ms, bool continuity_broken);
@@ -114,6 +116,10 @@ class QSEstimator
     bool has_last_delivery_ = false;
     ClockTP last_delivery_time_{};
     ClockTP stable_since_{};
+    std::array<bool, SOFT_WINDOW_CAPACITY> soft_timeout_window_{};
+    size_t soft_window_pos_ = 0;
+    size_t soft_window_count_ = 0;
+    size_t soft_timeout_count_ = 0;
 };
 
 class RecvQueueAsync

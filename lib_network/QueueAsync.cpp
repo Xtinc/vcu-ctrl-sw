@@ -33,7 +33,14 @@ constexpr double JITTER_TAIL_SINGLE_FACTOR = 4.0;
 
 constexpr double DEPTH_SETTLE_EPSILON_FRAMES = 0.25;
 constexpr double QS_STABLE_WINDOW_SECONDS = 30.0;
-constexpr double QS_MAX_DELIVERY_INTERVAL_FRAMES = 2.0;
+constexpr double QS_NORMAL_INTERVAL_FACTOR = 1.2;
+constexpr double QS_HARD_TIMEOUT_INTERVAL_FACTOR = 1.6;
+constexpr size_t QS_SOFT_WINDOW_SAMPLES = 64;
+constexpr size_t QS_MIN_WINDOW_SAMPLES = 16;
+constexpr size_t QS_MAX_SOFT_TIMEOUTS = 2;
+constexpr double QS_MAX_ABSOLUTE_INTERVAL_MS = 10000.0;
+static_assert(QSEstimator::SOFT_WINDOW_CAPACITY == QS_SOFT_WINDOW_SAMPLES,
+              "QSEstimator soft window capacity must match QS_SOFT_WINDOW_SAMPLES");
 
 constexpr double ema_gain(double window_frames)
 {
@@ -394,6 +401,10 @@ void QSEstimator::reset()
     has_last_delivery_ = false;
     last_delivery_time_ = ClockTP{};
     stable_since_ = ClockTP{};
+    soft_timeout_window_.fill(false);
+    soft_window_pos_ = 0;
+    soft_window_count_ = 0;
+    soft_timeout_count_ = 0;
 }
 
 bool QSEstimator::note_delivery(ClockTP now, double expected_interval_ms, bool continuity_broken)
@@ -406,29 +417,45 @@ bool QSEstimator::note_delivery(ClockTP now, double expected_interval_ms, bool c
         return allow_immediate;
     }
 
-    bool stable_sample = true;
-    if (has_last_delivery_)
+    if (!has_last_delivery_)
     {
-        const double actual_interval_ms = std::chrono::duration<double, std::milli>(now - last_delivery_time_).count();
-        stable_sample = stable_sample && actual_interval_ms >= 0.0 && actual_interval_ms < 10000.0 &&
-                        actual_interval_ms <= QS_MAX_DELIVERY_INTERVAL_FRAMES * expected_interval_ms;
+        has_last_delivery_ = true;
+        last_delivery_time_ = now;
+        stable_since_ = now;
+        allow_immediate = false;
+        return allow_immediate;
     }
 
-    if (!stable_sample)
+    const double actual_interval_ms = std::chrono::duration<double, std::milli>(now - last_delivery_time_).count();
+    if (!std::isfinite(actual_interval_ms) || actual_interval_ms < 0.0 ||
+        actual_interval_ms > QS_MAX_ABSOLUTE_INTERVAL_MS ||
+        actual_interval_ms > QS_HARD_TIMEOUT_INTERVAL_FACTOR * expected_interval_ms)
     {
         reset();
         return allow_immediate;
     }
 
-    has_last_delivery_ = true;
     last_delivery_time_ = now;
 
-    if (stable_since_ == ClockTP{} || now < stable_since_)
-        stable_since_ = now;
+    const bool soft_timeout = actual_interval_ms > QS_NORMAL_INTERVAL_FACTOR * expected_interval_ms;
+    if (soft_window_count_ == QS_SOFT_WINDOW_SAMPLES)
+    {
+        if (soft_timeout_window_[soft_window_pos_])
+            --soft_timeout_count_;
+    }
+    else
+    {
+        ++soft_window_count_;
+    }
+
+    soft_timeout_window_[soft_window_pos_] = soft_timeout;
+    if (soft_timeout)
+        ++soft_timeout_count_;
+    soft_window_pos_ = (soft_window_pos_ + 1) % QS_SOFT_WINDOW_SAMPLES;
 
     const double stable_seconds = std::chrono::duration<double>(now - stable_since_).count();
-    if (stable_seconds >= QS_STABLE_WINDOW_SECONDS)
-        allow_immediate = true;
+    allow_immediate = stable_seconds >= QS_STABLE_WINDOW_SECONDS && soft_window_count_ >= QS_MIN_WINDOW_SAMPLES &&
+                      soft_timeout_count_ <= QS_MAX_SOFT_TIMEOUTS;
 
     return allow_immediate;
 }
