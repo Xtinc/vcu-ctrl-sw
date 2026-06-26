@@ -126,6 +126,7 @@ class RecvQueueAsync
 {
     using ClockTP = std::chrono::steady_clock::time_point;
 
+  public:
     struct Tunables
     {
         size_t min_depth = 1;
@@ -142,6 +143,7 @@ class RecvQueueAsync
         uint32_t pressure_bonus_frames = 30;
     };
 
+  private:
     struct BufferedFrame
     {
         uint32_t seq;
@@ -178,6 +180,7 @@ class RecvQueueAsync
     void worker_thread();
     void handle_gap_locked(std::unique_lock<std::mutex> &lock, ClockTP now);
     void sanitize_tuning_locked();
+    const Tunables &active_tuning_locked() const;
     void reset_state_locked();
     void clear_buffered_frames_locked();
     void clear_delivered_frames_locked();
@@ -206,8 +209,6 @@ class RecvQueueAsync
     ClockTP next_delivery_time_;
     ClockTP gap_start_time_;
     ClockTP gap_deadline_;
-    Tunables tuning_;
-
     RJEstimator arrival_est_;
     ROEstimator reorder_est_;
     BFController buffer_ctl_;

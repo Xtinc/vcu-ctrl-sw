@@ -42,6 +42,9 @@ constexpr double QS_MAX_ABSOLUTE_INTERVAL_MS = 10000.0;
 static_assert(QSEstimator::SOFT_WINDOW_CAPACITY == QS_SOFT_WINDOW_SAMPLES,
               "QSEstimator soft window capacity must match QS_SOFT_WINDOW_SAMPLES");
 
+static constexpr RecvQueueAsync::Tunables FRCOMPLETE_TUNING{1, 2, 512, 1000.0, 2.0, 2.0, 0.08, 0.70, 1.50, 0.5, 0.5, 8};
+static constexpr RecvQueueAsync::Tunables IMMEDIATE_TUNING{1, 4, 512, 1000.0, 3.0, 2.0, 0.08, 0.70, 1.50, 0.5, 1.0, 30};
+
 constexpr double ema_gain(double window_frames)
 {
     return 1.0 / window_frames;
@@ -529,23 +532,12 @@ RecvQueueAsync::~RecvQueueAsync()
 
 void RecvQueueAsync::sanitize_tuning_locked()
 {
-    tuning_.min_depth = std::max<size_t>(1, tuning_.min_depth);
-    tuning_.max_depth = std::max<size_t>(2, (std::max)(tuning_.max_depth, tuning_.min_depth));
-    tuning_.min_depth = (std::min)(tuning_.min_depth, tuning_.max_depth);
-    tuning_.initial_depth = clamp_value(tuning_.initial_depth, tuning_.min_depth, tuning_.max_depth);
+    buffer_ctl_.sanitize(active_tuning_locked());
+}
 
-    tuning_.stale_timeout_ms = (std::max)(tuning_.stale_timeout_ms, MIN_FRAME_INTERVAL_MS);
-    tuning_.gap_wait_frames = (std::max)(tuning_.gap_wait_frames, 1.0);
-    tuning_.default_frame_interval_ms = (std::max)(tuning_.default_frame_interval_ms, MIN_FRAME_INTERVAL_MS);
-    tuning_.depth_feedback_gain = clamp_value(tuning_.depth_feedback_gain, 0.0, 0.5);
-    tuning_.min_pacing_factor = clamp_value(tuning_.min_pacing_factor, 0.1, 1.0);
-    tuning_.max_pacing_factor = (std::max)(tuning_.max_pacing_factor, 1.0);
-    if (tuning_.max_pacing_factor < tuning_.min_pacing_factor)
-        tuning_.max_pacing_factor = tuning_.min_pacing_factor;
-    tuning_.depth_margin_frames = (std::max)(0.0, tuning_.depth_margin_frames);
-    tuning_.jitter_weight = (std::max)(0.0, tuning_.jitter_weight);
-
-    buffer_ctl_.sanitize(tuning_);
+const RecvQueueAsync::Tunables &RecvQueueAsync::active_tuning_locked() const
+{
+    return qs_est_.allow_immediate ? IMMEDIATE_TUNING : FRCOMPLETE_TUNING;
 }
 
 void RecvQueueAsync::reset_state_locked()
@@ -560,8 +552,8 @@ void RecvQueueAsync::reset_state_locked()
 
     arrival_est_.reset();
     reorder_est_.reset();
-    buffer_ctl_.reset(tuning_.initial_depth);
     qs_est_.reset();
+    buffer_ctl_.reset(active_tuning_locked().initial_depth);
     qs_continuity_broken_ = false;
     recv_count_ = 0;
     deliver_count_ = 0;
@@ -626,7 +618,8 @@ void RecvQueueAsync::reset()
 
 void RecvQueueAsync::update_adaptive_depth_locked()
 {
-    buffer_ctl_.note(tuning_, (std::max)(reorder_est_.depth_frames, reorder_est_.guard_depth_frames),
+    const auto &tuning = active_tuning_locked();
+    buffer_ctl_.note(tuning, (std::max)(reorder_est_.depth_frames, reorder_est_.guard_depth_frames),
                      arrival_est_.jitter_tail / estimated_interval_ms_locked());
 }
 
@@ -645,18 +638,19 @@ double RecvQueueAsync::estimated_interval_ms_locked() const
             return span_ms;
     }
 
-    return tuning_.default_frame_interval_ms;
+    return active_tuning_locked().default_frame_interval_ms;
 }
 
 double RecvQueueAsync::compute_delivery_interval_locked() const
 {
+    const auto &tuning = active_tuning_locked();
     const double base_interval_ms = estimated_interval_ms_locked();
     const double depth_error =
         static_cast<double>(buffered_frames_.size()) - static_cast<double>(buffer_ctl_.adaptive_depth);
-    const double feedback_scale = 1.0 + tuning_.depth_feedback_gain * depth_error;
+    const double feedback_scale = 1.0 + tuning.depth_feedback_gain * depth_error;
     const double pacing_factor =
-        feedback_scale <= 0.0 ? tuning_.max_pacing_factor
-                              : clamp_value(1.0 / feedback_scale, tuning_.min_pacing_factor, tuning_.max_pacing_factor);
+        feedback_scale <= 0.0 ? tuning.max_pacing_factor
+                              : clamp_value(1.0 / feedback_scale, tuning.min_pacing_factor, tuning.max_pacing_factor);
     return (std::max)(MIN_FRAME_INTERVAL_MS, base_interval_ms * pacing_factor);
 }
 
@@ -673,7 +667,7 @@ void RecvQueueAsync::purge_stale_locked(ClockTP now)
         return;
 
     const auto cutoff = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                  std::chrono::duration<double, std::milli>(tuning_.stale_timeout_ms));
+                                  std::chrono::duration<double, std::milli>(active_tuning_locked().stale_timeout_ms));
     if (buffered_frames_.front().arrival >= cutoff)
         return;
 
@@ -733,7 +727,7 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
     {
         ++late_count_;
         qs_continuity_broken_ = true;
-        buffer_ctl_.trigger_pressure(tuning_);
+        buffer_ctl_.trigger_pressure(active_tuning_locked());
         update_adaptive_depth_locked();
         return false;
     }
@@ -753,20 +747,21 @@ bool RecvQueueAsync::enqueue(uint8_t *data, size_t size, uint32_t abs_seq)
 
     std::memcpy(queued_data, data, size);
     buffered_frames_.insert(it, {abs_seq, queued_data, size, arrival});
-    arrival_est_.note(abs_seq, arrival, tuning_.max_depth);
-    reorder_est_.note(abs_seq, tuning_.max_depth);
+    const auto &tuning = active_tuning_locked();
+    arrival_est_.note(abs_seq, arrival, tuning.max_depth);
+    reorder_est_.note(abs_seq, tuning.max_depth);
     update_adaptive_depth_locked();
 
-    while (buffered_frames_.size() > tuning_.max_depth)
+    while (buffered_frames_.size() > active_tuning_locked().max_depth)
     {
         // VIDEO_DEBUG_PRINT("[JitterBuf] buffered frames overflow: size=%zu max=%zu", buffered_frames_.size(),
-        //                   tuning_.max_depth);
+        //                   active_tuning_locked().max_depth);
         auto tail = std::prev(buffered_frames_.end());
         ++drop_count_;
         ++overflow_count_;
         qs_continuity_broken_ = true;
         drop_frame_locked(tail);
-        buffer_ctl_.trigger_pressure(tuning_);
+        buffer_ctl_.trigger_pressure(active_tuning_locked());
         update_adaptive_depth_locked();
     }
 
@@ -819,10 +814,10 @@ void RecvQueueAsync::handle_gap_locked(std::unique_lock<std::mutex> &lock, Clock
     if (gap_start_time_ == ClockTP{})
     {
         gap_start_time_ = now;
-        const double base_interval_ms = (std::max)(tuning_.default_frame_interval_ms, estimated_interval_ms_locked());
-        gap_deadline_ =
-            now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                      std::chrono::duration<double, std::milli>(base_interval_ms * tuning_.gap_wait_frames));
+        const auto &tuning = active_tuning_locked();
+        const double base_interval_ms = (std::max)(tuning.default_frame_interval_ms, estimated_interval_ms_locked());
+        gap_deadline_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                  std::chrono::duration<double, std::milli>(base_interval_ms * tuning.gap_wait_frames));
     }
 
     const bool depth_pressure = buffered_frames_.size() >= buffer_ctl_.adaptive_depth;
@@ -959,7 +954,7 @@ void RecvQueueAsync::skip_gap_locked(uint32_t next_available_seq)
 
     skip_count_ += missing;
     qs_continuity_broken_ = true;
-    buffer_ctl_.trigger_pressure(tuning_);
+    buffer_ctl_.trigger_pressure(active_tuning_locked());
     update_adaptive_depth_locked();
 
     expected_seq_ = next_available_seq;

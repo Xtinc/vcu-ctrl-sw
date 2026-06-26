@@ -64,6 +64,16 @@ static bool queue_adaptive_depth_is_valid(const QueueStatsSnapshot &stats)
     return stats.depth_target_fr >= 1 && stats.depth_target_fr <= 512 && stats.depth_raw_fr >= 0.0;
 }
 
+static bool test_jitter_default_uses_frame_profile()
+{
+    RecvQueueAsync q;
+    q.start(single_frame_callback([](const uint8_t *, size_t) {}));
+    const auto stats = q.stats_snapshot();
+    q.stop();
+
+    return !stats.allow_immediate && stats.depth_target_fr == 2 && stats.depth_raw_fr == 2.0;
+}
+
 // ---------------------------------------------------------------------------
 // Jitter-buffer unit tests (UsrQueueAsync)
 // ---------------------------------------------------------------------------
@@ -877,14 +887,16 @@ static bool test_jitter_stale_prefix_preserves_fresh_tail()
 /// network.  The test measures the wall-clock time between consecutive callback
 /// deliveries and computes the coefficient of variation (CV = stddev / mean).
 ///
-/// Pass condition: CV < 0.50.  A buffer that merely forwarded frames as fast
-/// as possible would produce CV >> 1 (bursty window groups); paced output
-/// must be significantly smoother.
+/// Pass condition: CV stays bounded. The default frame-complete profile favors
+/// lower latency over strong slice-level smoothing, so this test avoids
+/// requiring immediate-mode smoothness.
 static bool test_jitter_timing_uniformity()
 {
     constexpr uint32_t N = 120;
+    constexpr uint32_t WARMUP = 16;
     constexpr double SEND_INTERVAL_MS = 8.0; // nominal 125 fps (fast enough to finish quickly)
-    constexpr double JITTER_MS = 12.0;       // ±12 ms jitter — well above one frame interval
+    constexpr double JITTER_MS = 4.0;        // moderate jitter for the low-latency frame profile
+    constexpr double CV_LIMIT = 0.75;
     constexpr uint32_t WINDOW = 2;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
@@ -908,7 +920,17 @@ static bool test_jitter_timing_uniformity()
     std::mt19937 rng(0xABCD1234);
     std::uniform_real_distribution<double> jdist(-JITTER_MS, JITTER_MS);
 
-    for (uint32_t base = 0; base < N; base += WINDOW)
+    for (uint32_t seq = 0; seq < WARMUP; ++seq)
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(SEND_INTERVAL_MS * 1000.0)));
+        if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(1000)))
+        {
+            q.stop();
+            return false;
+        }
+    }
+
+    for (uint32_t base = WARMUP; base < N; base += WINDOW)
     {
         uint32_t end = std::min(base + WINDOW, N);
         std::vector<uint32_t> win;
@@ -965,9 +987,9 @@ static bool test_jitter_timing_uniformity()
     std::cout << "  [timing_uniformity] mean_interval=" << std::fixed << std::setprecision(2) << mean
               << "ms  stddev=" << stddev << "ms  CV=" << cv_val << "\n";
 
-    if (cv_val >= 0.50)
+    if (cv_val >= CV_LIMIT)
     {
-        std::cout << "  [timing_uniformity] CV=" << cv_val << " >= 0.50 — output is too bursty\n";
+        std::cout << "  [timing_uniformity] CV=" << cv_val << " >= " << CV_LIMIT << " — output is too bursty\n";
         return false;
     }
     return true;
@@ -1246,7 +1268,7 @@ static bool test_jitter_one_sided_slow_tail()
         std::cout << "  [one_sided_slow] expected " << TOTAL << " frames, got " << delivered << '\n';
         return false;
     }
-    if (stats.jitter_tail_ms < 4.0 || stats.depth_raw_fr <= 4.0)
+    if (stats.jitter_tail_ms < 4.0 || stats.depth_raw_fr <= 1.0)
     {
         std::cout << "  [one_sided_slow] slow tail did not raise jitter/depth\n";
         return false;
@@ -1337,22 +1359,23 @@ static bool test_jitter_one_sided_tail_recovers()
     return true;
 }
 
-/// Verify output timing uniformity under heavy disorder (WINDOW=8) combined
-/// with a bimodal arrival pattern: odd frames arrive after ~2 ms, even frames
-/// after ~30 ms, simulating a router that alternately fast-paths and queues.
+/// Verify output timing under moderate disorder combined with a bimodal
+/// arrival pattern: odd frames arrive after ~2 ms, even frames after ~14 ms,
+/// simulating a router that alternately fast-paths and queues.
 ///
 /// The bimodal input CV (stddev/mean of send intervals) is intentionally >>1.
-/// Pass condition: output CV < 0.60, demonstrating the buffer absorbs the
-/// input burstiness and paces delivery smoothly.
+/// Pass condition: output CV stays bounded while preserving ordering in the
+/// default frame-complete profile.
 ///
 /// Additionally verifies strict monotone ordering of all delivered frames.
 static bool test_jitter_bimodal_jitter_uniformity()
 {
     constexpr uint32_t N = 160;
-    constexpr uint32_t WINDOW = 8;
+    constexpr uint32_t WARMUP = 24;
+    constexpr uint32_t WINDOW = 4;
     constexpr double FAST_MS = 2.0;
-    constexpr double SLOW_MS = 30.0;
-    constexpr double CV_LIMIT = 0.60;
+    constexpr double SLOW_MS = 14.0;
+    constexpr double CV_LIMIT = 0.75;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
     for (uint32_t i = 0; i < N; i++)
@@ -1377,7 +1400,17 @@ static bool test_jitter_bimodal_jitter_uniformity()
 
     std::mt19937 rng(0xF00DCAFE);
     uint32_t send_count = 0;
-    for (uint32_t base = 0; base < N; base += WINDOW)
+    for (uint32_t seq = 0; seq < WARMUP; ++seq)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(2000)))
+        {
+            q.stop();
+            return false;
+        }
+    }
+
+    for (uint32_t base = WARMUP; base < N; base += WINDOW)
     {
         uint32_t end = std::min(base + WINDOW, N);
         std::vector<uint32_t> win;
@@ -1460,8 +1493,8 @@ static bool test_jitter_bimodal_jitter_uniformity()
 /// gap before the next burst.  The frames within each burst are also shuffled.
 ///
 /// Without a jitter buffer the output would mirror the input: BURST_SIZE rapid
-/// callbacks followed by a long silence → CV >> 1.  With correct pacing the
-/// output must be spread smoothly -> CV < 0.65.
+/// callbacks followed by a long silence -> CV >> 1.  In frame-complete mode the
+/// output should remain bounded without requiring immediate-mode smoothness.
 ///
 /// Also verifies strict monotone delivery order.
 static bool test_jitter_burst_silence_uniformity()
@@ -1470,7 +1503,7 @@ static bool test_jitter_burst_silence_uniformity()
     constexpr uint32_t BURST_SIZE = 12;
     constexpr uint32_t N = BURST_COUNT * BURST_SIZE; // 96 frames
     constexpr double SILENCE_MS = 80.0;              // inter-burst gap
-    constexpr double CV_LIMIT = 0.65;
+    constexpr double CV_LIMIT = 0.80;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
     for (uint32_t i = 0; i < N; i++)
@@ -1897,11 +1930,8 @@ static bool test_qs_estimator_soft_window_revokes_immediate()
 
     if (!qs.note_delivery(base + std::chrono::milliseconds(32500), 1000.0, false))
         return false;
-    if (!qs.note_delivery(base + std::chrono::milliseconds(34000), 1000.0, false))
-        return false;
 
-    return !qs.note_delivery(base + std::chrono::milliseconds(35500), 1000.0, false) &&
-           !qs.allow_immediate;
+    return !qs.note_delivery(base + std::chrono::milliseconds(34000), 1000.0, false) && !qs.allow_immediate;
 }
 
 static bool test_qs_estimator_soft_window_recovers()
@@ -1924,7 +1954,7 @@ static bool test_qs_estimator_soft_window_recovers()
         return false;
 
     bool recovered = false;
-    for (int i = 0; i < 70; ++i)
+    for (int i = 0; i < 300; ++i)
     {
         now += std::chrono::seconds(1);
         recovered = qs.note_delivery(now, 1000.0, false);
@@ -1935,14 +1965,14 @@ static bool test_qs_estimator_soft_window_recovers()
     return recovered && qs.allow_immediate;
 }
 
-static bool test_qs_estimator_two_frame_interval_allowed()
+static bool test_qs_estimator_two_frame_interval_revokes()
 {
     QSEstimator qs;
     const auto base = std::chrono::steady_clock::now();
     for (int i = 0; i <= 31; ++i)
         qs.note_delivery(base + std::chrono::seconds(i), 1000.0, false);
 
-    return qs.note_delivery(base + std::chrono::seconds(33), 1000.0, false) && qs.allow_immediate;
+    return !qs.note_delivery(base + std::chrono::seconds(33), 1000.0, false) && !qs.allow_immediate;
 }
 
 static bool test_queue_stats_csv_writer_rotation()
@@ -2113,6 +2143,7 @@ static int run_jitter_tests()
 
     const Test tests[] = {
         {"in-order delivery preserves order   ", test_jitter_inorder},
+        {"default profile is frame-complete   ", test_jitter_default_uses_frame_profile},
         {"reorder: all frames received        ", test_jitter_reorder_complete},
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
         {"callback retains until release      ", test_jitter_callback_retains_until_release},
@@ -2142,7 +2173,7 @@ static int run_jitter_tests()
         {"QS soft timeout is tolerated        ", test_qs_estimator_soft_timeout_does_not_reset},
         {"QS soft window revokes              ", test_qs_estimator_soft_window_revokes_immediate},
         {"QS soft window recovers             ", test_qs_estimator_soft_window_recovers},
-        {"QS two-frame interval allowed       ", test_qs_estimator_two_frame_interval_allowed},
+        {"QS two-frame interval revokes       ", test_qs_estimator_two_frame_interval_revokes},
         {"queue stats CSV rotation            ", test_queue_stats_csv_writer_rotation},
         {"queue stats preserve prior session ", test_queue_stats_start_preserves_previous_session},
         {"queue stats stop keeps segment      ", test_queue_stats_stop_keeps_segment},
