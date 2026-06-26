@@ -105,7 +105,7 @@ class QSEstimator
 {
   public:
     using ClockTP = std::chrono::steady_clock::time_point;
-    static constexpr size_t SOFT_WINDOW_CAPACITY = 64;
+    static constexpr size_t SOFT_WINDOW_CAPACITY = 256;
 
     void reset();
     bool note_delivery(ClockTP now, double expected_interval_ms, bool continuity_broken);
