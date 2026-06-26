@@ -35,9 +35,9 @@ constexpr double DEPTH_SETTLE_EPSILON_FRAMES = 0.25;
 constexpr double QS_STABLE_WINDOW_SECONDS = 30.0;
 constexpr double QS_NORMAL_INTERVAL_FACTOR = 1.2;
 constexpr double QS_HARD_TIMEOUT_INTERVAL_FACTOR = 1.6;
-constexpr size_t QS_SOFT_WINDOW_SAMPLES = 64;
+constexpr size_t QS_SOFT_WINDOW_SAMPLES = 256;
 constexpr size_t QS_MIN_WINDOW_SAMPLES = 16;
-constexpr size_t QS_MAX_SOFT_TIMEOUTS = 2;
+constexpr size_t QS_MAX_SOFT_TIMEOUTS = 1;
 constexpr double QS_MAX_ABSOLUTE_INTERVAL_MS = 10000.0;
 static_assert(QSEstimator::SOFT_WINDOW_CAPACITY == QS_SOFT_WINDOW_SAMPLES,
               "QSEstimator soft window capacity must match QS_SOFT_WINDOW_SAMPLES");
