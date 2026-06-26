@@ -25,13 +25,12 @@ class BackgroundService
 
 constexpr uint8_t MAGIC_TRX_PROBE_NUMBER = 0xA5;
 constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
-constexpr size_t MAX_TRX_UDP_SIZE = 65535;
+constexpr size_t MAX_TRX_UDP_SIZE = 128 * 1024;
 constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;
 constexpr size_t TRX_RS_FEC_REDUNDANCY = 2;
 constexpr size_t MAX_XOR_PACKET_NUM_PER_GROUP = 2;
 constexpr size_t TRX_XOR_FEC_REDUNDANCY = 1;
 constexpr size_t MAX_TRX_RECEIVE_FRAMES = 20;
-constexpr size_t MAX_GROUP_NUM_PER_FRAME = MAX_TRX_UDP_SIZE / (MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_UNIT_SIZE);
 static_assert(MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
 static_assert(MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
 static_assert(SEND_QUEUE_MAX_PACKET_SIZE == MAX_TRX_UDP_SIZE,
@@ -198,16 +197,20 @@ struct TRXFrame
 
 constexpr size_t TRX_HEADER_SIZE = sizeof(TRXUnit::Header);
 constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
+constexpr size_t MAX_TRX_GROUP_DATA_SIZE = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
+constexpr size_t MAX_GROUP_NUM_PER_FRAME = (MAX_TRX_UDP_SIZE + MAX_TRX_GROUP_DATA_SIZE - 1) / MAX_TRX_GROUP_DATA_SIZE;
+static_assert(MAX_GROUP_NUM_PER_FRAME <= 0xffu, "group_num exceeds 8 bits");
 
 /**
  * @brief UDP-based reliable transport layer with integrated FEC error correction
  *        and NTP-style clock synchronisation.
  *
  * ### Framing and FEC rules
- * Each send() call corresponds to one frame. If the payload fits in one TRX data
- * packet (`MAX_TRX_DATA_SIZE` bytes), the frame uses XOR redundancy; otherwise it
- * uses Reed-Solomon for every group in the frame. Large payloads are split into one
- * or more groups of at most `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes.
+ * Each send() call corresponds to one frame of up to `MAX_TRX_UDP_SIZE`
+ * bytes. If the payload fits in one TRX data packet (`MAX_TRX_DATA_SIZE`
+ * bytes), the frame uses XOR redundancy; otherwise it uses Reed-Solomon for
+ * every group in the frame. Large payloads are split into one or more groups of
+ * at most `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes.
  *
  * | Frame payload size            | Mode | Data pkts | Redundancy pkts | Recoverable losses |
  * |-------------------------------|------|-----------|-----------------|--------------------|
@@ -290,7 +293,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     asio::ip::udp::endpoint remote_endpoint_;
     uint8_t *receive_buffer_;
     MemPool<6, 16> send_pool_;
-    MemPool<6, 16> recv_pool_;
+    MemPool<6, 17> recv_pool_;
     std::atomic<uint64_t> recv_packets_;
 
     reed_solomon *rs_;

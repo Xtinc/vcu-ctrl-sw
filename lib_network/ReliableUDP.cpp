@@ -6,6 +6,7 @@ using asio::ip::udp;
 constexpr static auto TRX_RS_FEC_GROUP_UNIT_NUMS = MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY;
 constexpr static auto TRX_XOR_FEC_GROUP_UNIT_NUMS = MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY;
 constexpr static auto RECEIVE_EPOCH_IDLE_TIMEOUT = std::chrono::milliseconds(1000);
+constexpr static auto MAX_UDP_DATAGRAM_SIZE = 65535;
 
 static inline uint32_t get_time_ms()
 {
@@ -145,15 +146,16 @@ static std::once_flag fec_init_flag;
 
 // ReliableUDP implementation
 ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port)
-    : running_(false), io_context_(io_context), strand_(io_context), receive_buffer_(new uint8_t[MAX_TRX_UDP_SIZE]),
-      send_pool_("reliable_udp_send", 25), recv_pool_("reliable_udp_recv", 25), recv_packets_(0), rs_(nullptr),
-      target_uid_(0), has_active_conn_uuid_(false), active_conn_uuid_(0), destination_set_(false), frame_cycle_(1),
-      group_cycle_(1), next_group_id_(1), next_frame_id_(1), last_frame_id_(0), last_group_id_(0),
-      has_last_receive_activity_(false), last_receive_activity_(std::chrono::steady_clock::time_point{}),
-      usr_queue_(std::make_unique<RecvQueueAsync>()), send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0),
-      send_bytes_(0), recv_bytes_(0), last_send_rate_time_(std::chrono::steady_clock::now()),
-      last_recv_rate_time_(std::chrono::steady_clock::now()), last_lost_rate_time_(std::chrono::steady_clock::now()),
-      last_send_rate_bytes_(0), last_recv_rate_bytes_(0), probe_timer_(io_context_), clock_sync_()
+    : running_(false), io_context_(io_context), strand_(io_context),
+      receive_buffer_(new uint8_t[MAX_UDP_DATAGRAM_SIZE]), send_pool_("reliable_udp_send", 25),
+      recv_pool_("reliable_udp_recv", 25), recv_packets_(0), rs_(nullptr), target_uid_(0), has_active_conn_uuid_(false),
+      active_conn_uuid_(0), destination_set_(false), frame_cycle_(1), group_cycle_(1), next_group_id_(1),
+      next_frame_id_(1), last_frame_id_(0), last_group_id_(0), has_last_receive_activity_(false),
+      last_receive_activity_(std::chrono::steady_clock::time_point{}), usr_queue_(std::make_unique<RecvQueueAsync>()),
+      send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
+      last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
+      last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
+      probe_timer_(io_context_), clock_sync_()
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -359,7 +361,7 @@ double ReliableUDP::recv_rate()
 void ReliableUDP::start_receive()
 {
     recv_socket_->async_receive_from(
-        asio::buffer(receive_buffer_, MAX_TRX_UDP_SIZE), remote_endpoint_,
+        asio::buffer(receive_buffer_, MAX_UDP_DATAGRAM_SIZE), remote_endpoint_,
         strand_.wrap([self = shared_from_this()](const asio::error_code &error, size_t bytes_transferred) {
             self->handle_receive(error, bytes_transferred);
         }));
@@ -570,8 +572,7 @@ void ReliableUDP::create_small_rtx_group(std::vector<TRXUnit> &all_units, const 
 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
 {
-    constexpr auto max_group_data_size = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
-    const size_t total_groups = (size + max_group_data_size - 1) / max_group_data_size;
+    const size_t total_groups = (size + MAX_TRX_GROUP_DATA_SIZE - 1) / MAX_TRX_GROUP_DATA_SIZE;
 
     std::vector<TRXUnit> all_units;
     size_t offset = 0;
@@ -581,7 +582,7 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
     for (size_t group_idx = 0; group_idx < total_groups; ++group_idx)
     {
         size_t remaining_size = size - offset;
-        size_t current_group_size = std::min(remaining_size, max_group_data_size);
+        size_t current_group_size = std::min(remaining_size, MAX_TRX_GROUP_DATA_SIZE);
 
         if (current_group_size > MAX_TRX_DATA_SIZE)
         {

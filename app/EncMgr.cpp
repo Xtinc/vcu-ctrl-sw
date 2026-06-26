@@ -21,7 +21,7 @@ static EncodedFrameCallback make_enc_output_callback(std::weak_ptr<ReliableUDP> 
         if (size + slice_header_size > MAX_TRX_UDP_SIZE)
         {
             VIDEO_ERROR_PRINT(
-                "Encoded frame size %zu plus slice header %zu exceeds max UDP payload %zu, dropping frame", size,
+                "Encoded frame size %zu plus slice header %zu exceeds max ReliableUDP frame %zu, dropping frame", size,
                 slice_header_size, MAX_TRX_UDP_SIZE);
             return;
         }

@@ -45,6 +45,8 @@
 #include <thread>
 #include <vector>
 
+constexpr size_t TEST_UDP_DATAGRAM_SIZE = 65535;
+
 static void print_divider()
 {
     std::cout << std::string(62, '-') << '\n';
@@ -222,7 +224,7 @@ class LossyProxy
                double loss_rate_max)
         : socket_(ioc, asio::ip::udp::endpoint(asio::ip::udp::v4(), listen_port)),
           dst_(asio::ip::make_address("127.0.0.1"), dst_port), rng_(std::random_device{}()),
-          rate_dist_(loss_rate_min, loss_rate_max), drop_dist_(0.0, 1.0), buf_(new uint8_t[MAX_TRX_UDP_SIZE]),
+          rate_dist_(loss_rate_min, loss_rate_max), drop_dist_(0.0, 1.0), buf_(new uint8_t[TEST_UDP_DATAGRAM_SIZE]),
           dropped_(0), forwarded_(0)
     {
         do_receive();
@@ -250,7 +252,7 @@ class LossyProxy
   private:
     void do_receive()
     {
-        socket_.async_receive_from(asio::buffer(buf_, MAX_TRX_UDP_SIZE), sender_ep_,
+        socket_.async_receive_from(asio::buffer(buf_, TEST_UDP_DATAGRAM_SIZE), sender_ep_,
                                    [this](const asio::error_code &ec, size_t n) {
                                        if (ec == asio::error::operation_aborted)
                                        {
@@ -298,7 +300,7 @@ class SmallUnitDropProxy
   public:
     SmallUnitDropProxy(asio::io_context &ioc, uint16_t listen_port, uint16_t dst_port, uint8_t drop_idx)
         : socket_(ioc, asio::ip::udp::endpoint(asio::ip::udp::v4(), listen_port)),
-          dst_(asio::ip::make_address("127.0.0.1"), dst_port), buf_(new uint8_t[MAX_TRX_UDP_SIZE]), drop_idx_(drop_idx),
+          dst_(asio::ip::make_address("127.0.0.1"), dst_port), buf_(new uint8_t[TEST_UDP_DATAGRAM_SIZE]), drop_idx_(drop_idx),
           dropped_(0), forwarded_(0)
     {
         do_receive();
@@ -328,7 +330,7 @@ class SmallUnitDropProxy
     void do_receive()
     {
         socket_.async_receive_from(
-            asio::buffer(buf_, MAX_TRX_UDP_SIZE), sender_ep_, [this](const asio::error_code &ec, size_t n) {
+            asio::buffer(buf_, TEST_UDP_DATAGRAM_SIZE), sender_ep_, [this](const asio::error_code &ec, size_t n) {
                 if (ec == asio::error::operation_aborted)
                 {
                     return;

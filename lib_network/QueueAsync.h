@@ -20,7 +20,7 @@ using FillCallback = std::function<void(uint8_t *data, size_t size)>;
 using ObsvCallback = std::function<void(std::chrono::steady_clock::time_point)>;
 
 constexpr size_t SEND_QUEUE_DEPTH = 128;
-constexpr size_t SEND_QUEUE_MAX_PACKET_SIZE = 65535;
+constexpr size_t SEND_QUEUE_MAX_PACKET_SIZE = 128 * 1024;
 
 class SendQueueAsync
 {
@@ -191,7 +191,7 @@ class RecvQueueAsync
     void skip_gap_locked(uint32_t next_available_seq);
     QueueStatsSnapshot stats_snapshot_locked() const;
 
-    MemPool<6, 16> frame_pool_;
+    MemPool<6, 17> frame_pool_;
     RecvCallBack receive_callback_;
 
     std::thread thread_;
