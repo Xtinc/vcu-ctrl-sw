@@ -159,10 +159,10 @@ class EncMgr
     void request_IDR();
 
     /**
-     * @brief Return the latest EMA throughput statistics.
+     * @brief Return the latest cached throughput statistics.
      *
      * Returns {0.0, 0.0} while the pipeline is stopped.
-     * @return {fps, bitrate_bps}. Values are 0.0 until at least 100 frames have been encoded.
+     * @return {fps, bitrate_bps}.
      */
     std::pair<double, double> fps() const;
 

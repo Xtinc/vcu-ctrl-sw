@@ -6,7 +6,10 @@ using asio::ip::udp;
 constexpr static auto TRX_RS_FEC_GROUP_UNIT_NUMS = MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY;
 constexpr static auto TRX_XOR_FEC_GROUP_UNIT_NUMS = MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY;
 constexpr static auto RECEIVE_EPOCH_IDLE_TIMEOUT = std::chrono::milliseconds(1000);
+constexpr static auto STATS_SAMPLE_INTERVAL = std::chrono::seconds(1);
 constexpr static auto MAX_UDP_DATAGRAM_SIZE = 65535;
+constexpr static double STATS_EMA_OLD_WEIGHT = 0.2;
+constexpr static double STATS_EMA_NEW_WEIGHT = 0.8;
 
 static inline uint32_t get_time_ms()
 {
@@ -14,25 +17,9 @@ static inline uint32_t get_time_ms()
     return static_cast<uint32_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
-static double calc_rate_bps(std::atomic<uint64_t> &total_bytes, std::mutex &rate_mutex,
-                            std::chrono::steady_clock::time_point &last_time, uint64_t &last_bytes)
+static double smooth_stat(double cached, double sample)
 {
-    const auto now = std::chrono::steady_clock::now();
-
-    std::lock_guard<std::mutex> lock(rate_mutex);
-    const auto elapsed_seconds = std::chrono::duration<double>(now - last_time).count();
-    if (elapsed_seconds <= 0.0)
-    {
-        return 0.0;
-    }
-
-    const auto current_bytes = total_bytes.load(std::memory_order_relaxed);
-    const auto delta_bytes = current_bytes - last_bytes;
-
-    last_time = now;
-    last_bytes = current_bytes;
-
-    return static_cast<double>(delta_bytes) * 8.0 / elapsed_seconds;
+    return cached <= 0.0 ? sample : STATS_EMA_OLD_WEIGHT * cached + STATS_EMA_NEW_WEIGHT * sample;
 }
 
 ClockSync::ClockSync()
@@ -153,9 +140,9 @@ ReliableUDP::ReliableUDP(asio::io_context &io_context, unsigned short local_port
       next_frame_id_(1), last_frame_id_(0), last_group_id_(0), has_last_receive_activity_(false),
       last_receive_activity_(std::chrono::steady_clock::time_point{}), usr_queue_(std::make_unique<RecvQueueAsync>()),
       send_queue_(std::make_unique<SendQueueAsync>()), lost_packets_(0), send_bytes_(0), recv_bytes_(0),
-      last_send_rate_time_(std::chrono::steady_clock::now()), last_recv_rate_time_(std::chrono::steady_clock::now()),
-      last_lost_rate_time_(std::chrono::steady_clock::now()), last_send_rate_bytes_(0), last_recv_rate_bytes_(0),
-      probe_timer_(io_context_), clock_sync_()
+      last_stats_time_(std::chrono::steady_clock::now()), last_stats_send_bytes_(0), last_stats_recv_bytes_(0),
+      last_stats_recv_packets_(0), last_stats_lost_packets_(0), cached_send_bps_(0.0), cached_recv_bps_(0.0),
+      cached_lost_rate_(0.0), probe_timer_(io_context_), stats_timer_(io_context_), clock_sync_()
 {
     // Create receive socket and bind to specific port
     recv_socket_ = std::make_unique<udp::socket>(io_context_);
@@ -226,6 +213,7 @@ void ReliableUDP::start()
 
     send_queue_->start([this](const uint8_t *data, size_t size) { send_queued_frame(data, size); });
     start_receive();
+    start_stats_timer();
 }
 
 void ReliableUDP::set_receive_callback(RecvCallBack callback)
@@ -301,6 +289,7 @@ void ReliableUDP::stop()
     }
 
     probe_timer_.cancel();
+    stats_timer_.cancel();
     send_queue_->stop();
     usr_queue_->stop();
     stats_writer_.stop(std::chrono::steady_clock::now(), usr_queue_->stats_snapshot());
@@ -308,29 +297,7 @@ void ReliableUDP::stop()
 
 double ReliableUDP::lost_rate()
 {
-    auto curr_time = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(rate_mutex_);
-    auto recv_packets = recv_packets_.exchange(0, std::memory_order_relaxed);
-    auto lost_packets = lost_packets_.exchange(0, std::memory_order_relaxed);
-
-    auto real_lost_rate = 0.0;
-    if (recv_packets > 0)
-    {
-        real_lost_rate = static_cast<double>(lost_packets) / static_cast<double>(recv_packets);
-    }
-
-    if (curr_time - last_lost_rate_time_ >= std::chrono::seconds(10))
-    {
-        if (real_lost_rate > 0.0)
-        {
-            VIDEO_INFO_PRINT("Current lost rate: %.2f%% (lost: %" PRIu64 ", recv: %" PRIu64 ")", real_lost_rate * 100.0,
-                             lost_packets, recv_packets);
-        }
-
-        last_lost_rate_time_ = curr_time;
-    }
-
-    return real_lost_rate;
+    return cached_lost_rate_.load(std::memory_order_relaxed);
 }
 
 int64_t ReliableUDP::rtt_ms() const
@@ -350,12 +317,80 @@ bool ReliableUDP::is_time_synced() const
 
 double ReliableUDP::send_rate()
 {
-    return calc_rate_bps(send_bytes_, rate_mutex_, last_send_rate_time_, last_send_rate_bytes_);
+    return cached_send_bps_.load(std::memory_order_relaxed);
 }
 
 double ReliableUDP::recv_rate()
 {
-    return calc_rate_bps(recv_bytes_, rate_mutex_, last_recv_rate_time_, last_recv_rate_bytes_);
+    return cached_recv_bps_.load(std::memory_order_relaxed);
+}
+
+void ReliableUDP::start_stats_timer()
+{
+    asio::post(strand_, [self = shared_from_this()]() {
+        const auto now = std::chrono::steady_clock::now();
+        self->last_stats_time_ = now;
+        self->last_stats_send_bytes_ = self->send_bytes_.load(std::memory_order_relaxed);
+        self->last_stats_recv_bytes_ = self->recv_bytes_.load(std::memory_order_relaxed);
+        self->last_stats_recv_packets_ = self->recv_packets_.load(std::memory_order_relaxed);
+        self->last_stats_lost_packets_ = self->lost_packets_.load(std::memory_order_relaxed);
+        self->cached_send_bps_.store(0.0, std::memory_order_relaxed);
+        self->cached_recv_bps_.store(0.0, std::memory_order_relaxed);
+        self->cached_lost_rate_.store(0.0, std::memory_order_relaxed);
+        self->schedule_stats_timer();
+    });
+}
+
+void ReliableUDP::schedule_stats_timer()
+{
+    if (!running_.load(std::memory_order_relaxed))
+        return;
+
+    stats_timer_.expires_after(STATS_SAMPLE_INTERVAL);
+    stats_timer_.async_wait(strand_.wrap([self = shared_from_this()](const asio::error_code &ec) {
+        if (ec || !self->running_.load(std::memory_order_relaxed))
+            return;
+
+        self->update_rate_stats();
+        self->schedule_stats_timer();
+    }));
+}
+
+void ReliableUDP::update_rate_stats()
+{
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_seconds = std::chrono::duration<double>(now - last_stats_time_).count();
+    if (elapsed_seconds <= 0.0)
+        return;
+
+    const uint64_t send_bytes = send_bytes_.load(std::memory_order_relaxed);
+    const uint64_t recv_bytes = recv_bytes_.load(std::memory_order_relaxed);
+    const uint64_t recv_packets = recv_packets_.load(std::memory_order_relaxed);
+    const uint64_t lost_packets = lost_packets_.load(std::memory_order_relaxed);
+
+    const uint64_t delta_send_bytes = send_bytes - last_stats_send_bytes_;
+    const uint64_t delta_recv_bytes = recv_bytes - last_stats_recv_bytes_;
+    const uint64_t delta_recv_packets = recv_packets - last_stats_recv_packets_;
+    const uint64_t delta_lost_packets = lost_packets - last_stats_lost_packets_;
+
+    const double sample_send_bps = static_cast<double>(delta_send_bytes) * 8.0 / elapsed_seconds;
+    const double sample_recv_bps = static_cast<double>(delta_recv_bytes) * 8.0 / elapsed_seconds;
+    const double sample_lost_rate =
+        delta_recv_packets > 0 ? static_cast<double>(delta_lost_packets) / static_cast<double>(delta_recv_packets)
+                               : 0.0;
+
+    cached_send_bps_.store(smooth_stat(cached_send_bps_.load(std::memory_order_relaxed), sample_send_bps),
+                           std::memory_order_relaxed);
+    cached_recv_bps_.store(smooth_stat(cached_recv_bps_.load(std::memory_order_relaxed), sample_recv_bps),
+                           std::memory_order_relaxed);
+    cached_lost_rate_.store(smooth_stat(cached_lost_rate_.load(std::memory_order_relaxed), sample_lost_rate),
+                            std::memory_order_relaxed);
+
+    last_stats_time_ = now;
+    last_stats_send_bytes_ = send_bytes;
+    last_stats_recv_bytes_ = recv_bytes;
+    last_stats_recv_packets_ = recv_packets;
+    last_stats_lost_packets_ = lost_packets;
 }
 
 void ReliableUDP::start_receive()
@@ -650,7 +685,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         new_group.timestamp = now;
         receive_groups_.push_front(new_group);
         it = receive_groups_.begin();
-        recv_packets_ += unit.head.units_num;
+        recv_packets_.fetch_add(static_cast<uint64_t>(unit.head.units_num), std::memory_order_relaxed);
     }
 
     auto units_num = it->units.empty() ? static_cast<uint8_t>(unit.head.units_num)
@@ -725,7 +760,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         auto oldest_layout_num =
             oldest_units_num == TRX_RS_FEC_GROUP_UNIT_NUMS ? TRX_RS_FEC_GROUP_UNIT_NUMS : TRX_XOR_FEC_GROUP_UNIT_NUMS;
 
-        lost_packets_ += static_cast<uint64_t>(oldest_layout_num - recv_cnt);
+        lost_packets_.fetch_add(static_cast<uint64_t>(oldest_layout_num - recv_cnt), std::memory_order_relaxed);
 
         for (auto &u : oldest_group.units)
         {

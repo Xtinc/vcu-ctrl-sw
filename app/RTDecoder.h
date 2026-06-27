@@ -29,8 +29,9 @@ struct DecoderConfig
     uint32_t input_buffer_size = 512 * 1024;           ///< Size in bytes of each input stream buffer.
     uint32_t input_buffer_num = 4;                     ///< Number of input stream buffers in the pool.
     std::string dec_dev_path = "/dev/allegroDecodeIP"; ///< Device file path of the VCU decode IP.
-    bool low_delay_mode = false;                       ///< Upgrade to LLP2: adds bUseEarlyCallback on top of LLP1 (requires HW Sync IP + DRMDisplayConfig::llp2_mode).
-    uint32_t flush_timeout_ms = 5000;                  ///< Timeout in milliseconds while waiting for decoder EOS.
+    bool low_delay_mode = false;      ///< Upgrade to LLP2: adds bUseEarlyCallback on top of LLP1 (requires HW Sync IP +
+                                      ///< DRMDisplayConfig::llp2_mode).
+    uint32_t flush_timeout_ms = 5000; ///< Timeout in milliseconds while waiting for decoder EOS.
 };
 
 /**
@@ -181,12 +182,12 @@ class RTDecoder
     void return_display_frame(AL_TBuffer *pFrame);
 
     /**
-     * @brief Return the latest exponential-moving-average decode frame rate.
+     * @brief Return the latest cached decode frame rate.
      *
-     * Updated every 100 output frames (main/postproc output only).
-     * Returns 0.0 until 100 frames have been decoded.
+     * Updated from output-frame callbacks on a fixed minimum time window
+     * (main/postproc output only).
      *
-     * @return Decode fps (EMA, α=0.9). Thread-safe.
+     * @return Decode fps. Thread-safe.
      */
     double fps() const;
 
@@ -229,7 +230,8 @@ class RTDecoder
 
     mutable std::mutex m_fps_mutex;
     double m_fps;
-    uint32_t m_frame_count;
+    uint64_t m_frame_count;
+    uint64_t m_last_frame_count;
     std::chrono::steady_clock::time_point m_fps_last_time;
 
     enum class State : uint8_t

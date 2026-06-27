@@ -21,6 +21,9 @@ static constexpr int kStreamSmoothingCount = 2;
 static constexpr int kHeightAlign = 8;
 static constexpr uint32_t kMaxWidth = 3840;
 static constexpr uint32_t kMaxHeight = 2160;
+static constexpr auto kStatsSampleInterval = std::chrono::seconds(1);
+static constexpr double kStatsEmaOldWeight = 0.2;
+static constexpr double kStatsEmaNewWeight = 0.8;
 
 using AL_BufferGuard = std::unique_ptr<AL_TBuffer, decltype(&AL_Buffer_Unref)>;
 
@@ -158,9 +161,10 @@ static uint32_t reconstruct_stream(DMAProxy &mem_ctl, AL_TBuffer *stream, int fi
 
 RTEncoderBase::RTEncoderBase(const EncoderConfig &cfg, EncodedFrameCallback cb)
 
-    : m_fps(0.0), m_bitrate(0), m_frame_count(0), m_bytes_count(0), m_fps_last_time(std::chrono::steady_clock::now()),
-      m_cfg(cfg), m_callback(std::move(cb)), m_dma_proxy(cfg.dma_dev_path.c_str()), m_pAllocator(nullptr),
-      m_pScheduler(nullptr), m_hEnc(nullptr), m_pic_format{}, m_src_fourcc{}, m_lib_initialized(false)
+    : m_fps(0.0), m_bitrate(0), m_frame_count(0), m_last_frame_count(0), m_bytes_count(0), m_last_bytes_count(0),
+      m_fps_last_time(std::chrono::steady_clock::now()), m_cfg(cfg), m_callback(std::move(cb)),
+      m_dma_proxy(cfg.dma_dev_path.c_str()), m_pAllocator(nullptr), m_pScheduler(nullptr), m_hEnc(nullptr),
+      m_pic_format{}, m_src_fourcc{}, m_lib_initialized(false)
 {
     try
     {
@@ -559,28 +563,32 @@ void RTEncoderBase::on_encoded_frame(AL_TBuffer *pStream, AL_TBuffer const *pSrc
 
 void RTEncoderBase::update_frame_rate()
 {
-    if (++m_frame_count % 100 != 0)
-    {
-        return;
-    }
+    ++m_frame_count;
 
     auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_fps_last_time).count();
-    if (elapsed <= 0)
+    if (now - m_fps_last_time < kStatsSampleInterval)
     {
         return;
     }
 
-    double fps = (m_frame_count * 1000.0) / static_cast<double>(elapsed);
-    double bitrate = (m_bytes_count * 8000.0) / static_cast<double>(elapsed);
+    const auto elapsed = std::chrono::duration<double>(now - m_fps_last_time).count();
+    if (elapsed <= 0.0)
+    {
+        return;
+    }
+
+    const uint32_t delta_frames = m_frame_count - m_last_frame_count;
+    const uint64_t delta_bytes = m_bytes_count - m_last_bytes_count;
+    const double fps = static_cast<double>(delta_frames) / elapsed;
+    const double bitrate = static_cast<double>(delta_bytes) * 8.0 / elapsed;
     {
         std::lock_guard<std::mutex> lock(m_fps_mutex);
-        m_fps = 0.1 * m_fps + 0.9 * fps; // EMA with alpha=0.9
-        m_bitrate = 0.1 * m_bitrate + 0.9 * bitrate;
+        m_fps = (m_fps <= 0.0) ? fps : kStatsEmaOldWeight * m_fps + kStatsEmaNewWeight * fps;
+        m_bitrate = (m_bitrate <= 0.0) ? bitrate : kStatsEmaOldWeight * m_bitrate + kStatsEmaNewWeight * bitrate;
     }
     m_fps_last_time = now;
-    m_frame_count = 0;
-    m_bytes_count = 0;
+    m_last_frame_count = m_frame_count;
+    m_last_bytes_count = m_bytes_count;
 }
 
 void RTEncoderBase::signal_done()

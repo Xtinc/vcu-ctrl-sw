@@ -162,8 +162,12 @@ class RTEncoderBase
     AL_TDimension src_resolution() const;
 
     /**
-     * @brief Return the latest exponential-moving-average throughput statistics.
-     * @return {fps, bitrate_bps} pair. Values are 0.0 until at least 100 frames have been encoded.
+     * @brief Return the latest cached throughput statistics.
+     *
+     * Updated from encoded-frame callbacks on a fixed minimum time window.
+     * Querying this value has no side effects.
+     *
+     * @return {fps, bitrate_bps} pair.
      */
     std::pair<double, double> fps() const;
 
@@ -193,7 +197,9 @@ class RTEncoderBase
     double m_fps;
     double m_bitrate;
     uint32_t m_frame_count;
-    uint32_t m_bytes_count;
+    uint32_t m_last_frame_count;
+    uint64_t m_bytes_count;
+    uint64_t m_last_bytes_count;
     std::chrono::steady_clock::time_point m_fps_last_time;
 
     EncoderConfig m_cfg;

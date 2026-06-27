@@ -5,6 +5,7 @@
 #include "QueueAsync.h"
 #include "ReedSoloman.h"
 #include "asio.hpp"
+#include <atomic>
 
 class BackgroundService
 {
@@ -283,6 +284,9 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     bool send_probe_packet(const TRXProbe &pkt, const char *label);
     void send_queued_frame(const uint8_t *data, size_t size);
     void handle_probe_packet(const TRXProbe &pkt);
+    void start_stats_timer();
+    void schedule_stats_timer();
+    void update_rate_stats();
 
   private:
     std::atomic<bool> running_;
@@ -322,15 +326,18 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     std::atomic<uint64_t> lost_packets_;
     std::atomic<uint64_t> send_bytes_;
     std::atomic<uint64_t> recv_bytes_;
-    std::mutex rate_mutex_;
     std::mutex send_socket_mutex_;
-    std::chrono::steady_clock::time_point last_send_rate_time_;
-    std::chrono::steady_clock::time_point last_recv_rate_time_;
-    std::chrono::steady_clock::time_point last_lost_rate_time_;
-    uint64_t last_send_rate_bytes_;
-    uint64_t last_recv_rate_bytes_;
+    std::chrono::steady_clock::time_point last_stats_time_;
+    uint64_t last_stats_send_bytes_;
+    uint64_t last_stats_recv_bytes_;
+    uint64_t last_stats_recv_packets_;
+    uint64_t last_stats_lost_packets_;
+    std::atomic<double> cached_send_bps_;
+    std::atomic<double> cached_recv_bps_;
+    std::atomic<double> cached_lost_rate_;
 
     asio::steady_timer probe_timer_;
+    asio::steady_timer stats_timer_;
     ClockSync clock_sync_;
     NetCSVWriter stats_writer_;
 };
