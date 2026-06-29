@@ -4,6 +4,7 @@ add_library(
     OBJECT
     ClockWait.cpp
     CSVWriter.cpp
+    NetworkCfg.cpp
     ReliableUDP.cpp
     ReedSoloman.c
     QueueAsync.cpp)

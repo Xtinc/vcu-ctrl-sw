@@ -5,6 +5,7 @@
 #include "MemPoolUDP.h"
 #include "QueueStats.h"
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <thread>
 
@@ -21,6 +22,55 @@ using ObsvCallback = std::function<void(std::chrono::steady_clock::time_point)>;
 
 constexpr size_t SEND_QUEUE_DEPTH = 128;
 constexpr size_t SEND_QUEUE_MAX_PACKET_SIZE = 128 * 1024;
+
+struct Tunables
+{
+    struct UsrMode
+    {
+        size_t min_depth = 1;
+        size_t initial_depth = 4;
+        size_t max_depth = 512;
+        double stale_timeout_ms = 1000.0;
+        double gap_wait_frames = 3.0;
+        double default_frame_interval_ms = 2.0;
+        double depth_feedback_gain = 0.08;
+        double min_pacing_factor = 0.70;
+        double max_pacing_factor = 1.50;
+        double depth_margin_frames = 0.5;
+        double jitter_weight = 1.0;
+        uint32_t pressure_bonus_frames = 30;
+    };
+
+    struct Estimator
+    {
+        double min_frame_interval_ms = 1.0;
+        double fast_window_frames = 10.0;
+        double slow_window_frames = 50.0;
+        double tail_histogram_window_frames = 1000.0;
+        double jitter_tail_quantile = 0.95;
+        size_t feedforward_interval_window_frames = 16;
+        double jitter_tail_single_factor = 4.0;
+        double depth_settle_epsilon_frames = 0.25;
+    };
+
+    struct Switching
+    {
+        double stable_window_seconds = 30.0;
+        double normal_interval_factor = 1.2;
+        double hard_timeout_interval_factor = 1.6;
+        size_t soft_window_samples = 256;
+        size_t min_window_samples = 16;
+        size_t max_soft_timeouts = 1;
+        double max_absolute_interval_ms = 10000.0;
+    };
+
+    UsrMode frame_complete = {1, 2, 512, 1000.0, 2.0, 2.0, 0.08, 0.70, 1.50, 0.5, 0.5, 8};
+    UsrMode immediate = {1, 4, 512, 1000.0, 3.0, 2.0, 0.08, 0.70, 1.50, 0.5, 1.0, 30};
+    Estimator estimator;
+    Switching switching;
+
+    static Tunables defaults();
+};
 
 class SendQueueAsync
 {
@@ -64,6 +114,7 @@ class RJEstimator
     RJEstimator();
     ~RJEstimator();
 
+    void configure(const Tunables::Estimator &tuning);
     void reset();
     void note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max_seq_delta);
 
@@ -79,6 +130,7 @@ class RJEstimator
     ClockTP last_time;
     size_t window_samples;
     ClockTP window_start;
+    Tunables::Estimator estimator_tuning;
     Histogram<20> jitter_hist;
 };
 
@@ -88,6 +140,7 @@ class ROEstimator
     ROEstimator();
     ~ROEstimator();
 
+    void configure(const Tunables::Estimator &tuning);
     void reset();
     void note(uint32_t abs_seq, size_t max_seq_delta);
 
@@ -99,6 +152,7 @@ class ROEstimator
   private:
     bool has_reference;
     uint32_t highest_seq;
+    Tunables::Estimator estimator_tuning;
 };
 
 class QSEstimator
@@ -107,6 +161,7 @@ class QSEstimator
     using ClockTP = std::chrono::steady_clock::time_point;
     static constexpr size_t SOFT_WINDOW_CAPACITY = 256;
 
+    void configure(const Tunables &config);
     void reset();
     bool note_delivery(ClockTP now, double expected_interval_ms, bool continuity_broken);
 
@@ -120,6 +175,8 @@ class QSEstimator
     size_t soft_window_pos_ = 0;
     size_t soft_window_count_ = 0;
     size_t soft_timeout_count_ = 0;
+    Tunables::Estimator estimator_tuning_;
+    Tunables::Switching switching_tuning_;
 };
 
 class RecvQueueAsync
@@ -127,21 +184,7 @@ class RecvQueueAsync
     using ClockTP = std::chrono::steady_clock::time_point;
 
   public:
-    struct Tunables
-    {
-        size_t min_depth = 1;
-        size_t initial_depth = 4;
-        size_t max_depth = 512;
-        double stale_timeout_ms = 1000.0;
-        double gap_wait_frames = 3.0;
-        double default_frame_interval_ms = 2.0;
-        double depth_feedback_gain = 0.08;
-        double min_pacing_factor = 0.70;
-        double max_pacing_factor = 1.50;
-        double depth_margin_frames = 0.5;
-        double jitter_weight = 1.0;
-        uint32_t pressure_bonus_frames = 30;
-    };
+    using UsrMode = ::Tunables::UsrMode;
 
   private:
     struct BufferedFrame
@@ -160,10 +203,11 @@ class RecvQueueAsync
         uint32_t pressure_frames_remaining = 0;
 
         void reset(size_t initial_depth);
-        void sanitize(const Tunables &tuning);
-        void trigger_pressure(const Tunables &tuning);
+        void sanitize(const UsrMode &tuning);
+        void trigger_pressure(const UsrMode &tuning);
         void consume_pressure();
-        void note(const Tunables &tuning, double reorder_frames, double jitter_frames);
+        void note(const UsrMode &tuning, const Tunables::Estimator &estimator_tuning, double reorder_frames,
+                  double jitter_frames);
     };
 
   public:
@@ -179,8 +223,10 @@ class RecvQueueAsync
   private:
     void worker_thread();
     void handle_gap_locked(std::unique_lock<std::mutex> &lock, ClockTP now);
+    void load_config_locked();
     void sanitize_tuning_locked();
-    const Tunables &active_tuning_locked() const;
+    void apply_estimator_tuning_locked();
+    const UsrMode &active_tuning_locked() const;
     void reset_state_locked();
     void clear_buffered_frames_locked();
     void clear_delivered_frames_locked();
@@ -194,6 +240,7 @@ class RecvQueueAsync
     void skip_gap_locked(uint32_t next_available_seq);
     QueueStatsSnapshot stats_snapshot_locked() const;
 
+    ::Tunables config_;
     MemPool<6, 17> frame_pool_;
     RecvCallBack receive_callback_;
 
