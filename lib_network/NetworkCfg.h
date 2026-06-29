@@ -57,7 +57,13 @@ class INIReader
         return {data_, key};
     }
 
-    bool ensure_default(const std::string &key, const std::string &value);
+    template <typename T> bool ensure_default(const std::string &key, const T &value)
+    {
+        if (data_.find(key) != data_.end())
+            return false;
+        (*this)[key] = value;
+        return true;
+    }
     bool save() const;
 
   private:

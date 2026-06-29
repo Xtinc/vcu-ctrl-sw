@@ -68,8 +68,6 @@ struct Tunables
     UsrMode immediate = {1, 4, 512, 1000.0, 3.0, 2.0, 0.08, 0.70, 1.50, 0.5, 1.0, 30};
     Estimator estimator;
     Switching switching;
-
-    static Tunables defaults();
 };
 
 class SendQueueAsync

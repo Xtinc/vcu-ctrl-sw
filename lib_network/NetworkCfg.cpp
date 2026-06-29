@@ -16,14 +16,6 @@ INIReader::Proxy &INIReader::Proxy::operator=(double v)
     return *this;
 }
 
-bool INIReader::ensure_default(const std::string &key, const std::string &value)
-{
-    if (data_.find(key) != data_.end())
-        return false;
-    data_[key] = value;
-    return true;
-}
-
 bool INIReader::save() const
 {
     std::ofstream file(filename_);

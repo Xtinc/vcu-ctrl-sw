@@ -28,8 +28,6 @@ constexpr const char *RECV_QUEUE_CONFIG_FILE = "config.ini";
 
 double ema_gain(double window_frames)
 {
-    if (!std::isfinite(window_frames) || window_frames < 1.0)
-        window_frames = 1.0;
     return 1.0 / window_frames;
 }
 
@@ -75,13 +73,12 @@ void sanitize_mode_tuning(Tunables::UsrMode &tuning, const Tunables::UsrMode &de
     tuning.depth_margin_frames =
         std::isfinite(tuning.depth_margin_frames) ? tuning.depth_margin_frames : defaults.depth_margin_frames;
     tuning.jitter_weight = std::isfinite(tuning.jitter_weight) ? tuning.jitter_weight : defaults.jitter_weight;
-    tuning.pressure_bonus_frames =
-        positive_or_default(tuning.pressure_bonus_frames, defaults.pressure_bonus_frames);
+    tuning.pressure_bonus_frames = positive_or_default(tuning.pressure_bonus_frames, defaults.pressure_bonus_frames);
 }
 
 void sanitize_recv_queue_config(Tunables &config)
 {
-    const Tunables defaults = Tunables::defaults();
+    const Tunables defaults{};
 
     sanitize_mode_tuning(config.frame_complete, defaults.frame_complete);
     sanitize_mode_tuning(config.immediate, defaults.immediate);
@@ -93,12 +90,11 @@ void sanitize_recv_queue_config(Tunables &config)
         positive_or_default(estimator.fast_window_frames, defaults.estimator.fast_window_frames);
     estimator.slow_window_frames =
         positive_or_default(estimator.slow_window_frames, defaults.estimator.slow_window_frames);
-    estimator.tail_histogram_window_frames = positive_or_default(
-        estimator.tail_histogram_window_frames, defaults.estimator.tail_histogram_window_frames);
-    estimator.jitter_tail_quantile =
-        std::isfinite(estimator.jitter_tail_quantile)
-            ? clamp_value(estimator.jitter_tail_quantile, 0.0, 1.0)
-            : defaults.estimator.jitter_tail_quantile;
+    estimator.tail_histogram_window_frames =
+        positive_or_default(estimator.tail_histogram_window_frames, defaults.estimator.tail_histogram_window_frames);
+    estimator.jitter_tail_quantile = std::isfinite(estimator.jitter_tail_quantile)
+                                         ? clamp_value(estimator.jitter_tail_quantile, 0.0, 1.0)
+                                         : defaults.estimator.jitter_tail_quantile;
     estimator.feedforward_interval_window_frames = positive_or_default(
         estimator.feedforward_interval_window_frames, defaults.estimator.feedforward_interval_window_frames);
     estimator.jitter_tail_single_factor =
@@ -111,8 +107,8 @@ void sanitize_recv_queue_config(Tunables &config)
         positive_or_default(switching.stable_window_seconds, defaults.switching.stable_window_seconds);
     switching.normal_interval_factor =
         positive_or_default(switching.normal_interval_factor, defaults.switching.normal_interval_factor);
-    switching.hard_timeout_interval_factor = positive_or_default(
-        switching.hard_timeout_interval_factor, defaults.switching.hard_timeout_interval_factor);
+    switching.hard_timeout_interval_factor =
+        positive_or_default(switching.hard_timeout_interval_factor, defaults.switching.hard_timeout_interval_factor);
     switching.soft_window_samples =
         clamp_value(positive_or_default(switching.soft_window_samples, defaults.switching.soft_window_samples),
                     static_cast<size_t>(1), QSEstimator::SOFT_WINDOW_CAPACITY);
@@ -125,61 +121,61 @@ void sanitize_recv_queue_config(Tunables &config)
         positive_or_default(switching.max_absolute_interval_ms, defaults.switching.max_absolute_interval_ms);
 }
 
-bool ensure_recv_queue_defaults(INIReader &ini)
+bool ensure_mode_defaults(INIReader &ini, const std::string &section, const Tunables::UsrMode &defaults)
 {
     bool dirty = false;
-    auto ensure = [&ini, &dirty](const char *key, const char *value) {
-        dirty = ini.ensure_default(key, value) || dirty;
+    auto ensure = [&ini, &dirty, &section](const char *key, const auto &value) {
+        dirty = ini.ensure_default(section + "." + key, value) || dirty;
     };
 
-    ensure("FrameComplete.MinDepth", "1");
-    ensure("FrameComplete.InitialDepth", "2");
-    ensure("FrameComplete.MaxDepth", "512");
-    ensure("FrameComplete.StaleTimeoutMs", "1000.0");
-    ensure("FrameComplete.GapWaitFrames", "2.0");
-    ensure("FrameComplete.DefaultFrameIntervalMs", "2.0");
-    ensure("FrameComplete.DepthFeedbackGain", "0.08");
-    ensure("FrameComplete.MinPacingFactor", "0.70");
-    ensure("FrameComplete.MaxPacingFactor", "1.50");
-    ensure("FrameComplete.DepthMarginFrames", "0.5");
-    ensure("FrameComplete.JitterWeight", "0.5");
-    ensure("FrameComplete.PressureBonusFrames", "8");
-
-    ensure("Immediate.MinDepth", "1");
-    ensure("Immediate.InitialDepth", "4");
-    ensure("Immediate.MaxDepth", "512");
-    ensure("Immediate.StaleTimeoutMs", "1000.0");
-    ensure("Immediate.GapWaitFrames", "3.0");
-    ensure("Immediate.DefaultFrameIntervalMs", "2.0");
-    ensure("Immediate.DepthFeedbackGain", "0.08");
-    ensure("Immediate.MinPacingFactor", "0.70");
-    ensure("Immediate.MaxPacingFactor", "1.50");
-    ensure("Immediate.DepthMarginFrames", "0.5");
-    ensure("Immediate.JitterWeight", "1.0");
-    ensure("Immediate.PressureBonusFrames", "30");
-
-    ensure("Estimator.MinFrameIntervalMs", "1.0");
-    ensure("Estimator.FastWindowFrames", "10.0");
-    ensure("Estimator.SlowWindowFrames", "50.0");
-    ensure("Estimator.TailHistogramWindowFrames", "1000.0");
-    ensure("Estimator.JitterTailQuantile", "0.95");
-    ensure("Estimator.FeedforwardIntervalWindowFrames", "16");
-    ensure("Estimator.JitterTailSingleFactor", "4.0");
-    ensure("Estimator.DepthSettleEpsilonFrames", "0.25");
-
-    ensure("Switch.StableWindowSeconds", "30.0");
-    ensure("Switch.NormalIntervalFactor", "1.2");
-    ensure("Switch.HardTimeoutIntervalFactor", "1.6");
-    ensure("Switch.SoftWindowSamples", "256");
-    ensure("Switch.MinWindowSamples", "16");
-    ensure("Switch.MaxSoftTimeouts", "1");
-    ensure("Switch.MaxAbsoluteIntervalMs", "10000.0");
+    ensure("MinDepth", defaults.min_depth);
+    ensure("InitialDepth", defaults.initial_depth);
+    ensure("MaxDepth", defaults.max_depth);
+    ensure("StaleTimeoutMs", defaults.stale_timeout_ms);
+    ensure("GapWaitFrames", defaults.gap_wait_frames);
+    ensure("DefaultFrameIntervalMs", defaults.default_frame_interval_ms);
+    ensure("DepthFeedbackGain", defaults.depth_feedback_gain);
+    ensure("MinPacingFactor", defaults.min_pacing_factor);
+    ensure("MaxPacingFactor", defaults.max_pacing_factor);
+    ensure("DepthMarginFrames", defaults.depth_margin_frames);
+    ensure("JitterWeight", defaults.jitter_weight);
+    ensure("PressureBonusFrames", defaults.pressure_bonus_frames);
 
     return dirty;
 }
 
-Tunables::UsrMode read_mode_tuning(INIReader &ini, const std::string &section,
-                                   const Tunables::UsrMode &defaults)
+bool ensure_recv_queue_defaults(INIReader &ini)
+{
+    const Tunables defaults{};
+    bool dirty = false;
+    auto ensure = [&ini, &dirty](const char *key, const auto &value) {
+        dirty = ini.ensure_default(key, value) || dirty;
+    };
+
+    dirty = ensure_mode_defaults(ini, "FrameComplete", defaults.frame_complete) || dirty;
+    dirty = ensure_mode_defaults(ini, "Immediate", defaults.immediate) || dirty;
+
+    ensure("Estimator.MinFrameIntervalMs", defaults.estimator.min_frame_interval_ms);
+    ensure("Estimator.FastWindowFrames", defaults.estimator.fast_window_frames);
+    ensure("Estimator.SlowWindowFrames", defaults.estimator.slow_window_frames);
+    ensure("Estimator.TailHistogramWindowFrames", defaults.estimator.tail_histogram_window_frames);
+    ensure("Estimator.JitterTailQuantile", defaults.estimator.jitter_tail_quantile);
+    ensure("Estimator.FeedforwardIntervalWindowFrames", defaults.estimator.feedforward_interval_window_frames);
+    ensure("Estimator.JitterTailSingleFactor", defaults.estimator.jitter_tail_single_factor);
+    ensure("Estimator.DepthSettleEpsilonFrames", defaults.estimator.depth_settle_epsilon_frames);
+
+    ensure("Switch.StableWindowSeconds", defaults.switching.stable_window_seconds);
+    ensure("Switch.NormalIntervalFactor", defaults.switching.normal_interval_factor);
+    ensure("Switch.HardTimeoutIntervalFactor", defaults.switching.hard_timeout_interval_factor);
+    ensure("Switch.SoftWindowSamples", defaults.switching.soft_window_samples);
+    ensure("Switch.MinWindowSamples", defaults.switching.min_window_samples);
+    ensure("Switch.MaxSoftTimeouts", defaults.switching.max_soft_timeouts);
+    ensure("Switch.MaxAbsoluteIntervalMs", defaults.switching.max_absolute_interval_ms);
+
+    return dirty;
+}
+
+Tunables::UsrMode read_mode_tuning(INIReader &ini, const std::string &section, const Tunables::UsrMode &defaults)
 {
     const std::string prefix = section + ".";
     Tunables::UsrMode tuning;
@@ -195,14 +191,13 @@ Tunables::UsrMode read_mode_tuning(INIReader &ini, const std::string &section,
     tuning.max_pacing_factor = ini[prefix + "MaxPacingFactor"].cast<double>(defaults.max_pacing_factor);
     tuning.depth_margin_frames = ini[prefix + "DepthMarginFrames"].cast<double>(defaults.depth_margin_frames);
     tuning.jitter_weight = ini[prefix + "JitterWeight"].cast<double>(defaults.jitter_weight);
-    tuning.pressure_bonus_frames =
-        ini[prefix + "PressureBonusFrames"].cast<uint32_t>(defaults.pressure_bonus_frames);
+    tuning.pressure_bonus_frames = ini[prefix + "PressureBonusFrames"].cast<uint32_t>(defaults.pressure_bonus_frames);
     return tuning;
 }
 
 Tunables load_recv_queue_config(INIReader &ini)
 {
-    const Tunables defaults = Tunables::defaults();
+    const Tunables defaults{};
     Tunables config = defaults;
 
     config.frame_complete = read_mode_tuning(ini, "FrameComplete", defaults.frame_complete);
@@ -257,12 +252,6 @@ void set_current_thread_scheduler_policy()
     auto thread = GetCurrentThread();
     SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
-}
-
-Tunables Tunables::defaults()
-{
-    Tunables config;
-    return config;
 }
 
 SendQueueAsync::SendQueueAsync()
@@ -452,8 +441,7 @@ void SendQueueAsync::worker_thread()
 RJEstimator::RJEstimator()
     : interval_avg(0.0), interval_short_avg(0.0), jitter_avg(0.0), jitter_tail(0.0), has_reference(false),
       has_interval(false), last_seq(0), last_time(ClockTP{}), window_samples(0), window_start(ClockTP{}),
-      estimator_tuning(Tunables::defaults().estimator),
-      jitter_hist(ema_decay(estimator_tuning.tail_histogram_window_frames))
+      estimator_tuning(Tunables{}.estimator), jitter_hist(ema_decay(estimator_tuning.tail_histogram_window_frames))
 {
 }
 
@@ -490,9 +478,8 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
         const double elapsed_ms = std::chrono::duration<double, std::milli>(arrival - window_start).count();
         if (elapsed_ms > 0.0)
         {
-            const double sample_interval =
-                (std::max)(estimator_tuning.min_frame_interval_ms,
-                           elapsed_ms / static_cast<double>(window_samples - 1));
+            const double sample_interval = (std::max)(estimator_tuning.min_frame_interval_ms,
+                                                      elapsed_ms / static_cast<double>(window_samples - 1));
             interval_short_avg = sample_interval;
             const double gain = has_interval ? ema_gain(estimator_tuning.fast_window_frames) : 1.0;
             interval_avg += gain * (sample_interval - interval_avg);
@@ -536,8 +523,8 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
         const double q95_ms = jitter_hist.quantile(estimator_tuning.jitter_tail_quantile);
         const double tail_sample_ms = std::isfinite(q95_ms) ? (std::max)(q95_ms, late_sample_ms) : late_sample_ms;
         if (tail_sample_ms >= jitter_tail)
-            jitter_tail += (std::min)(tail_sample_ms - jitter_tail,
-                                      estimator_tuning.jitter_tail_single_factor * interval_avg);
+            jitter_tail +=
+                (std::min)(tail_sample_ms - jitter_tail, estimator_tuning.jitter_tail_single_factor * interval_avg);
         else
             jitter_tail += ema_gain(estimator_tuning.slow_window_frames) * (tail_sample_ms - jitter_tail);
     }
@@ -548,7 +535,7 @@ void RJEstimator::note(uint32_t abs_seq, ClockEntry::ClockTP arrival, size_t max
 
 ROEstimator::ROEstimator()
     : reorder_cnt(0), max_disorder_depth(0), depth_frames(0.0), guard_depth_frames(0.0), has_reference(false),
-      highest_seq(0), estimator_tuning(Tunables::defaults().estimator)
+      highest_seq(0), estimator_tuning(Tunables{}.estimator)
 {
 }
 
@@ -708,8 +695,8 @@ void RecvQueueAsync::BFController::consume_pressure()
 }
 
 void RecvQueueAsync::BFController::note(const RecvQueueAsync::UsrMode &tuning,
-                                        const Tunables::Estimator &estimator_tuning,
-                                        double reorder_frames, double jitter_frames)
+                                        const Tunables::Estimator &estimator_tuning, double reorder_frames,
+                                        double jitter_frames)
 {
     const double pressure_frames = pressure_frames_remaining > 0 ? 1.0 : 0.0;
     raw_depth_frames =
@@ -736,8 +723,7 @@ void RecvQueueAsync::BFController::note(const RecvQueueAsync::UsrMode &tuning,
 }
 
 RecvQueueAsync::RecvQueueAsync()
-    : config_(Tunables::defaults()), frame_pool_("recv_queue_frame", 64), running_(false), primed_(false),
-      expected_seq_(0)
+    : frame_pool_("recv_queue_frame", 64), running_(false), primed_(false), expected_seq_(0)
 {
     apply_estimator_tuning_locked();
     sanitize_tuning_locked();
