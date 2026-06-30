@@ -31,7 +31,6 @@ struct Tunables
         size_t initial_depth = 4;
         size_t max_depth = 512;
         double stale_timeout_ms = 1000.0;
-        double gap_wait_frames = 3.0;
         double default_frame_interval_ms = 2.0;
         double depth_feedback_gain = 0.08;
         double min_pacing_factor = 0.70;
@@ -64,8 +63,8 @@ struct Tunables
         double max_absolute_interval_ms = 10000.0;
     };
 
-    UsrMode frame_complete = {1, 2, 512, 1000.0, 2.0, 2.0, 0.08, 0.70, 1.50, 0.5, 0.5, 8};
-    UsrMode immediate = {1, 4, 512, 1000.0, 3.0, 2.0, 0.08, 0.70, 1.50, 0.5, 1.0, 30};
+    UsrMode frame_complete = {1, 2, 512, 1000.0, 2.0, 0.08, 0.70, 1.50, 0.5, 0.5, 8};
+    UsrMode immediate = {1, 4, 512, 1000.0, 2.0, 0.08, 0.70, 1.50, 0.5, 1.0, 30};
     Estimator estimator;
     Switching switching;
 };
@@ -220,7 +219,7 @@ class RecvQueueAsync
 
   private:
     void worker_thread();
-    void handle_gap_locked(std::unique_lock<std::mutex> &lock, ClockTP now);
+    void handle_gap_locked();
     void load_config_locked();
     void sanitize_tuning_locked();
     void apply_estimator_tuning_locked();
@@ -252,8 +251,6 @@ class RecvQueueAsync
     bool primed_;
     uint32_t expected_seq_;
     ClockTP next_delivery_time_;
-    ClockTP gap_start_time_;
-    ClockTP gap_deadline_;
     RJEstimator arrival_est_;
     ROEstimator reorder_est_;
     BFController buffer_ctl_;

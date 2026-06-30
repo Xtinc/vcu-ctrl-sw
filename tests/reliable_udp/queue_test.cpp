@@ -74,6 +74,44 @@ static bool test_jitter_default_uses_frame_profile()
     return !stats.allow_immediate && stats.depth_target_fr == 2 && stats.depth_raw_fr == 2.0;
 }
 
+static bool test_reorder_forward_gap_is_discounted_depth()
+{
+    ROEstimator estimator;
+
+    estimator.note(0, 1024);
+    estimator.note(100, 1024);
+
+    const double forward_gap = 99.0;
+    const double expected_guard = std::sqrt(forward_gap);
+    if (estimator.depth_frames != 0.0 || std::abs(estimator.guard_depth_frames - expected_guard) > 0.001 ||
+        estimator.guard_depth_frames >= forward_gap || estimator.reorder_cnt != 0 || estimator.max_disorder_depth != 0)
+    {
+        std::cout << "  [forward_gap_depth] unexpected forward gap state: depth=" << estimator.depth_frames
+                  << " guard=" << estimator.guard_depth_frames << " reorder=" << estimator.reorder_cnt
+                  << " max=" << estimator.max_disorder_depth << '\n';
+        return false;
+    }
+    return true;
+}
+
+static bool test_reorder_confirmed_late_arrival_sets_depth()
+{
+    ROEstimator estimator;
+
+    estimator.note(100, 1024);
+    estimator.note(98, 1024);
+
+    if (estimator.depth_frames <= 0.0 || estimator.guard_depth_frames != 2.0 || estimator.reorder_cnt != 1 ||
+        estimator.max_disorder_depth != 2)
+    {
+        std::cout << "  [confirmed_reorder_depth] bad reorder state: depth=" << estimator.depth_frames
+                  << " guard=" << estimator.guard_depth_frames << " reorder=" << estimator.reorder_cnt
+                  << " max=" << estimator.max_disorder_depth << '\n';
+        return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Jitter-buffer unit tests (UsrQueueAsync)
 // ---------------------------------------------------------------------------
@@ -692,8 +730,8 @@ static bool test_jitter_adapt_up_down()
 }
 
 /// A permanently missing frame (SKIP) must not stall delivery of all subsequent
-/// frames.  The jitter buffer must skip the gap via depth pressure or the
-/// adaptive gap wait and deliver every other frame exactly once.
+/// frames. The jitter buffer must skip the gap as soon as the playback cursor
+/// reaches it and deliver every other frame exactly once.
 static bool test_jitter_permanent_gap()
 {
     constexpr uint32_t N = 20;
@@ -723,7 +761,7 @@ static bool test_jitter_permanent_gap()
             q.enqueue(bufs[i].data(), 4, i);
         }
 
-    // The gap must recover within three estimated frame intervals, with ample
+    // The gap should recover promptly once the playback cursor reaches it, with
     // scheduling margin for a loaded test host.
     const size_t expected = N - 1;
     {
@@ -755,9 +793,9 @@ static bool test_jitter_permanent_gap()
     return true;
 }
 
-/// A temporarily missing frame that arrives inside the three-frame gap window
-/// must still be delivered in order and must not increment the skip counter.
-static bool test_jitter_gap_filled_before_deadline()
+/// A frame that arrives after the playback cursor skipped its sequence must be
+/// counted as late and must not be delivered out of order.
+static bool test_jitter_late_gap_frame_is_not_waited()
 {
     constexpr uint32_t N = 10;
     std::vector<std::array<uint8_t, 4>> bufs(N);
@@ -786,24 +824,28 @@ static bool test_jitter_gap_filled_before_deadline()
     }
 
     q.enqueue(bufs[9].data(), 4, 9);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    q.enqueue(bufs[8].data(), 4, 8);
 
     {
         std::unique_lock<std::mutex> lk(mtx);
-        cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() >= N; });
+        cv.wait_for(lk, std::chrono::seconds(1), [&] { return received.size() >= N - 1; });
     }
+    const bool late_enqueue_ok = q.enqueue(bufs[8].data(), 4, 8);
     const auto stats = q.stats_snapshot();
     q.stop();
 
-    if (received.size() != N || stats.skip != 0)
+    if (late_enqueue_ok || received.size() != N - 1 || stats.skip != 1 || stats.late < 1)
     {
-        std::cout << "  [gap_before_deadline] bad result: received=" << received.size() << '\n';
+        std::cout << "  [late_gap_frame] bad result: received=" << received.size() << " skip=" << stats.skip
+                  << " late=" << stats.late << '\n';
         return false;
     }
-    for (uint32_t i = 0; i < N; ++i)
+    for (uint32_t i = 0; i < 8; ++i)
+    {
         if (received[i] != i)
             return false;
+    }
+    if (received[8] != 9)
+        return false;
     return true;
 }
 
@@ -881,11 +923,11 @@ static bool test_jitter_stale_prefix_preserves_fresh_tail()
 
 /// Verify output timing uniformity under realistic jitter input.
 ///
-/// Frames are injected in sliding-window shuffled order (WINDOW=4) with a
-/// controlled inter-send interval of SEND_INTERVAL_MS ms.  Each frame arrival
-/// is also perturbed by a random jitter of ±JITTER_MS ms to simulate a real
-/// network.  The test measures the wall-clock time between consecutive callback
-/// deliveries and computes the coefficient of variation (CV = stddev / mean).
+/// Frames are injected in order with a controlled inter-send interval of
+/// SEND_INTERVAL_MS ms. Each frame arrival is also perturbed by a random jitter
+/// of ±JITTER_MS ms to simulate a real network. The test measures the
+/// wall-clock time between consecutive callback deliveries and computes the
+/// coefficient of variation (CV = stddev / mean).
 ///
 /// Pass condition: CV stays bounded. The default frame-complete profile favors
 /// lower latency over strong slice-level smoothing, so this test avoids
@@ -897,7 +939,6 @@ static bool test_jitter_timing_uniformity()
     constexpr double SEND_INTERVAL_MS = 8.0; // nominal 125 fps (fast enough to finish quickly)
     constexpr double JITTER_MS = 4.0;        // moderate jitter for the low-latency frame profile
     constexpr double CV_LIMIT = 0.75;
-    constexpr uint32_t WINDOW = 2;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
     for (uint32_t i = 0; i < N; i++)
@@ -916,7 +957,7 @@ static bool test_jitter_timing_uniformity()
         cv.notify_one();
     }));
 
-    // Send frames window-shuffled, each delayed by nominal interval ± jitter.
+    // Send frames in order, each delayed by nominal interval ± jitter.
     std::mt19937 rng(0xABCD1234);
     std::uniform_real_distribution<double> jdist(-JITTER_MS, JITTER_MS);
 
@@ -930,24 +971,16 @@ static bool test_jitter_timing_uniformity()
         }
     }
 
-    for (uint32_t base = WARMUP; base < N; base += WINDOW)
+    for (uint32_t seq = WARMUP; seq < N; ++seq)
     {
-        uint32_t end = std::min(base + WINDOW, N);
-        std::vector<uint32_t> win;
-        for (uint32_t j = base; j < end; j++)
-            win.push_back(j);
-        std::shuffle(win.begin(), win.end(), rng);
-        for (uint32_t seq : win)
+        double delay_ms = SEND_INTERVAL_MS + jdist(rng);
+        if (delay_ms < 1.0)
+            delay_ms = 1.0;
+        std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
+        if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(1000)))
         {
-            double delay_ms = SEND_INTERVAL_MS + jdist(rng);
-            if (delay_ms < 1.0)
-                delay_ms = 1.0;
-            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
-            if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(1000)))
-            {
-                q.stop();
-                return false;
-            }
+            q.stop();
+            return false;
         }
     }
 
@@ -1617,10 +1650,12 @@ static bool test_jitter_burst_silence_uniformity()
     return true;
 }
 
-/// Prove absolute delivery ordering under a large random shuffle (WINDOW=10).
+/// Prove absolute delivery ordering when large random shuffle windows are fully
+/// buffered before their playback cursor advances through the window.
 ///
-/// Injects N frames with each window fully shuffled and a random inter-arrival
-/// jitter of [0, MAX_JITTER_MS].  Verifies:
+/// Injects N frames with each window's first sequence sent first, then the rest
+/// of the window fully shuffled and enqueued before the next delivery period.
+/// Verifies:
 ///   (a) Every sequence number 0..N-1 is delivered exactly once.
 ///   (b) The sequence of delivered seq numbers is strictly non-decreasing.
 ///   (c) Quantifies jitter absorption: prints P50/P90/P99 of input arrival
@@ -1630,8 +1665,7 @@ static bool test_jitter_large_window_order()
 {
     constexpr uint32_t N = 400;
     constexpr uint32_t WINDOW = 10;
-    constexpr double BASE_MS = 5.0;
-    constexpr double MAX_JITTER_MS = 20.0;
+    constexpr double WINDOW_INTERVAL_MS = 5.0;
 
     std::vector<std::array<uint8_t, 4>> bufs(N);
     for (uint32_t i = 0; i < N; i++)
@@ -1655,26 +1689,29 @@ static bool test_jitter_large_window_order()
     }));
 
     std::mt19937 rng(0x12345678);
-    std::uniform_real_distribution<double> jdist(0.0, MAX_JITTER_MS);
 
     for (uint32_t base = 0; base < N; base += WINDOW)
     {
         uint32_t end = std::min(base + WINDOW, N);
         std::vector<uint32_t> win;
-        for (uint32_t j = base; j < end; j++)
+        for (uint32_t j = base + 1; j < end; j++)
             win.push_back(j);
         std::shuffle(win.begin(), win.end(), rng);
 
+        if (!enqueue_with_retry(q, bufs[base].data(), 4, base, std::chrono::milliseconds(2000)))
+        {
+            q.stop();
+            return false;
+        }
         for (uint32_t seq : win)
         {
-            const double delay_ms = BASE_MS + jdist(rng);
-            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1000.0)));
             if (!enqueue_with_retry(q, bufs[seq].data(), 4, seq, std::chrono::milliseconds(2000)))
             {
                 q.stop();
                 return false;
             }
         }
+        std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(WINDOW_INTERVAL_MS * 1000.0)));
     }
 
     {
@@ -2144,6 +2181,8 @@ static int run_jitter_tests()
     const Test tests[] = {
         {"in-order delivery preserves order   ", test_jitter_inorder},
         {"default profile is frame-complete   ", test_jitter_default_uses_frame_profile},
+        {"forward gap is discounted depth     ", test_reorder_forward_gap_is_discounted_depth},
+        {"confirmed reorder sets depth        ", test_reorder_confirmed_late_arrival_sets_depth},
         {"reorder: all frames received        ", test_jitter_reorder_complete},
         {"duplicate seq silently dropped      ", test_jitter_no_duplicates},
         {"callback retains until release      ", test_jitter_callback_retains_until_release},
@@ -2156,7 +2195,7 @@ static int run_jitter_tests()
         {"window-shuffle: order under auto depth", test_jitter_window_shuffle},
         {"auto depth survives mixed phases    ", test_jitter_adapt_up_down},
         {"permanent gap skipped, rest deliver ", test_jitter_permanent_gap},
-        {"gap filled before deadline          ", test_jitter_gap_filled_before_deadline},
+        {"late gap frame is not waited       ", test_jitter_late_gap_frame_is_not_waited},
         {"stale prefix preserves fresh tail   ", test_jitter_stale_prefix_preserves_fresh_tail},
         {"output timing uniform under jitter  ", test_jitter_timing_uniformity},
         {"timing estimators stable by phase   ", test_jitter_adaptive_estimation},
