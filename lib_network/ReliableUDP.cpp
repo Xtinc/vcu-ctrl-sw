@@ -467,9 +467,9 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
     start_receive();
 }
 
-void ReliableUDP::create_dup_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data,
-                                       size_t current_group_size, uint16_t current_group_id, uint16_t uid,
-                                       uint16_t current_frame_id, uint16_t total_groups)
+void ReliableUDP::create_dup_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
+                                       uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id,
+                                       uint16_t total_groups)
 {
     if (current_group_size > MAX_TRX_DATA_SIZE)
     {
@@ -478,23 +478,29 @@ void ReliableUDP::create_dup_rtx_group(std::vector<TRXUnit> &all_units, const ui
     }
 
     all_units.reserve(all_units.size() + TRX_DUP_FEC_GROUP_UNIT_NUMS);
-    for (size_t i = 0; i < TRX_DUP_FEC_GROUP_UNIT_NUMS; ++i)
-    {
-        TRXUnit unit;
-        unit.head.group_seq = current_group_id;
-        unit.head.units_idx = static_cast<uint8_t>(i);
-        unit.head.units_num = static_cast<uint8_t>(TRX_DUP_FEC_GROUP_UNIT_NUMS);
-        unit.head.group_len = static_cast<uint16_t>(current_group_size);
-        unit.head.frame_seq = current_frame_id;
-        unit.head.group_num = static_cast<uint8_t>(total_groups);
-        unit.head.units_len = static_cast<uint16_t>(current_group_size);
-        unit.head.conn_uuid = uid;
-        unit.head.check_sum = TRXUnit::adler_8(&unit.head);
 
-        unit.data = static_cast<uint8_t *>(send_pool_.allocate(current_group_size));
-        memcpy(unit.data, data, current_group_size);
-        all_units.push_back(unit);
-    }
+    TRXUnit unit;
+    unit.head.group_seq = current_group_id;
+    unit.head.units_idx = 0;
+    unit.head.units_num = static_cast<uint8_t>(TRX_DUP_FEC_GROUP_UNIT_NUMS);
+    unit.head.group_len = static_cast<uint16_t>(current_group_size);
+    unit.head.frame_seq = current_frame_id;
+    unit.head.group_num = static_cast<uint8_t>(total_groups);
+    unit.head.units_len = static_cast<uint16_t>(current_group_size);
+    unit.head.conn_uuid = uid;
+    unit.head.check_sum = TRXUnit::adler_8(&unit.head);
+
+    unit.data = static_cast<uint8_t *>(send_pool_.allocate(current_group_size));
+    memcpy(unit.data, data, current_group_size);
+
+    auto redundant_unit = unit;
+    redundant_unit.head.units_idx = 1;
+    redundant_unit.head.check_sum = TRXUnit::adler_8(&redundant_unit.head);
+    redundant_unit.data = static_cast<uint8_t *>(send_pool_.allocate(current_group_size));
+    memcpy(redundant_unit.data, data, current_group_size);
+
+    all_units.push_back(unit);
+    all_units.push_back(redundant_unit);
 }
 
 void ReliableUDP::create_huge_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
@@ -649,7 +655,6 @@ void ReliableUDP::create_small_rtx_group(std::vector<TRXUnit> &all_units, const 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
 {
     const size_t total_groups = (size + MAX_TRX_GROUP_DATA_SIZE - 1) / MAX_TRX_GROUP_DATA_SIZE;
-    const bool use_rs = size > MAX_XOR_GROUP_DATA_SIZE;
 
     std::vector<TRXUnit> all_units;
     size_t offset = 0;
@@ -661,20 +666,20 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
         size_t remaining_size = size - offset;
         size_t current_group_size = std::min(remaining_size, MAX_TRX_GROUP_DATA_SIZE);
 
-        if (use_rs)
+        if (current_group_size > MAX_XOR_GROUP_DATA_SIZE)
         {
             create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                   static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
         }
-        else if (current_group_size <= MAX_TRX_DATA_SIZE)
-        {
-            create_dup_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
-                                 static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
-        }
-        else
+        else if (current_group_size > MAX_TRX_DATA_SIZE)
         {
             create_small_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                    static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+        }
+        else
+        {
+            create_dup_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
+                                 static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
         }
 
         offset += current_group_size;
@@ -884,26 +889,19 @@ void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_pa
 
 void ReliableUDP::try_recover_dup_group(std::vector<TRXUnit> &units)
 {
-    uint16_t group_len = units[0].head.group_len;
-    size_t packet_size = units[0].head.units_len;
-    if (packet_size != group_len || !units[0].data)
+    auto &unit = units[0];
+    uint16_t group_len = unit.head.group_len;
+    size_t packet_size = unit.head.units_len;
+    if (packet_size != group_len || !unit.data)
     {
-        for (auto &unit : units)
-        {
-            recv_pool_.deallocate(unit.data);
-        }
+        recv_pool_.deallocate(unit.data);
         return;
     }
 
-    auto *assembled = units[0].data;
-    units[0].data = nullptr;
-    for (auto &unit : units)
-    {
-        recv_pool_.deallocate(unit.data);
-    }
+    auto *assembled = unit.data;
+    unit.data = nullptr;
 
-    assemble_complete_message(units[0].head.frame_seq, units[0].head.group_num, units[0].head.group_seq, assembled,
-                              group_len);
+    assemble_complete_message(unit.head.frame_seq, unit.head.group_num, unit.head.group_seq, assembled, group_len);
 }
 
 void ReliableUDP::try_recover_xor_group(std::vector<TRXUnit> &units)

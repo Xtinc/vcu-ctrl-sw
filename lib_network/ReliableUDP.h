@@ -216,13 +216,11 @@ static_assert(MAX_GROUP_NUM_PER_FRAME <= 0xffu, "group_num exceeds 8 bits");
  *
  * ### Framing and FEC rules
  * Each send() call corresponds to one frame of up to `MAX_TRX_UDP_SIZE`
- * bytes. If the payload fits in one TRX data packet (`MAX_TRX_DATA_SIZE`
- * bytes), the frame uses DUP redundancy. Payloads up to two TRX data packets
- * use XOR redundancy. Larger payloads use Reed-Solomon for every group in the
- * frame and are split into one or more groups of at most
- * `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes.
+ * bytes. A frame is split into one or more groups of at most
+ * `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes. Each group selects
+ * its own FEC mode based on that group's payload size.
  *
- * | Frame payload size            | Mode | Data pkts | Redundancy pkts | Recoverable losses |
+ * | Group payload size            | Mode | Data pkts | Redundancy pkts | Recoverable losses |
  * |-------------------------------|------|-----------|-----------------|--------------------|
  * | <= MAX_TRX_DATA_SIZE          | DUP  | 1         | 1 copy          | 1                  |
  * | <= MAX_XOR_GROUP_DATA_SIZE    | XOR  | 2         | 1               | 1                  |
