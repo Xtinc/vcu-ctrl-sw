@@ -31,9 +31,12 @@ constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 8;
 constexpr size_t TRX_RS_FEC_REDUNDANCY = 2;
 constexpr size_t MAX_XOR_PACKET_NUM_PER_GROUP = 2;
 constexpr size_t TRX_XOR_FEC_REDUNDANCY = 1;
+constexpr size_t MAX_DUP_PACKET_NUM_PER_GROUP = 1;
+constexpr size_t TRX_DUP_FEC_REDUNDANCY = 1;
 constexpr size_t MAX_TRX_RECEIVE_FRAMES = 20;
 static_assert(MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
 static_assert(MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
+static_assert(MAX_DUP_PACKET_NUM_PER_GROUP + TRX_DUP_FEC_REDUNDANCY <= 16, "units_num exceeds 4 bits");
 static_assert(SEND_QUEUE_MAX_PACKET_SIZE == MAX_TRX_UDP_SIZE,
               "send queue packet size must match ReliableUDP frame cap");
 
@@ -111,7 +114,8 @@ struct TRXUnit
 
     static bool validate(Header *header)
     {
-        if (header->units_num != 1 && header->units_num != MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY &&
+        if (header->units_num != MAX_DUP_PACKET_NUM_PER_GROUP + TRX_DUP_FEC_REDUNDANCY &&
+            header->units_num != MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY &&
             header->units_num != MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY)
         {
             return false;
@@ -198,9 +202,11 @@ struct TRXFrame
 
 constexpr size_t TRX_HEADER_SIZE = sizeof(TRXUnit::Header);
 constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
+constexpr size_t MAX_XOR_GROUP_DATA_SIZE = MAX_XOR_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
 constexpr size_t MAX_TRX_GROUP_DATA_SIZE = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
 constexpr size_t MAX_GROUP_NUM_PER_FRAME = (MAX_TRX_UDP_SIZE + MAX_TRX_GROUP_DATA_SIZE - 1) / MAX_TRX_GROUP_DATA_SIZE;
 static_assert(MAX_TRX_DATA_SIZE <= 0x0fffu, "units_len exceeds 12 bits");
+static_assert(MAX_XOR_GROUP_DATA_SIZE <= 0xffffu, "group_len exceeds 16 bits");
 static_assert(MAX_TRX_GROUP_DATA_SIZE <= 0xffffu, "group_len exceeds 16 bits");
 static_assert(MAX_GROUP_NUM_PER_FRAME <= 0xffu, "group_num exceeds 8 bits");
 
@@ -211,16 +217,19 @@ static_assert(MAX_GROUP_NUM_PER_FRAME <= 0xffu, "group_num exceeds 8 bits");
  * ### Framing and FEC rules
  * Each send() call corresponds to one frame of up to `MAX_TRX_UDP_SIZE`
  * bytes. If the payload fits in one TRX data packet (`MAX_TRX_DATA_SIZE`
- * bytes), the frame uses XOR redundancy; otherwise it uses Reed-Solomon for
- * every group in the frame. Large payloads are split into one or more groups of
- * at most `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes.
+ * bytes), the frame uses DUP redundancy. Payloads up to two TRX data packets
+ * use XOR redundancy. Larger payloads use Reed-Solomon for every group in the
+ * frame and are split into one or more groups of at most
+ * `MAX_RS_PACKET_NUM_PER_GROUP × MAX_TRX_DATA_SIZE` bytes.
  *
  * | Frame payload size            | Mode | Data pkts | Redundancy pkts | Recoverable losses |
  * |-------------------------------|------|-----------|-----------------|--------------------|
- * | <= MAX_TRX_DATA_SIZE          | XOR  | 2         | 1               | 1                  |
- * | >  MAX_TRX_DATA_SIZE          | RS   | 8         | 2               | up to 2            |
+ * | <= MAX_TRX_DATA_SIZE          | DUP  | 1         | 1 copy          | 1                  |
+ * | <= MAX_XOR_GROUP_DATA_SIZE    | XOR  | 2         | 1               | 1                  |
+ * | >  MAX_XOR_GROUP_DATA_SIZE    | RS   | 8         | 2               | up to 2            |
  *
- * XOR mode splits a small payload into two padded halves and sends one parity
+ * DUP mode sends two identical packets and delivers the first received packet.
+ * XOR mode splits a medium payload into two padded halves and sends one parity
  * packet (`half0 ^ half1`), so any two of the three packets reconstruct the
  * original payload.
  *
@@ -266,6 +275,9 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void handle_receive(const asio::error_code &error, size_t bytes_transferred);
 
     std::vector<TRXUnit> create_trx_units(const uint8_t *data, size_t size);
+    void create_dup_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
+                              uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id,
+                              uint16_t total_groups);
     void create_huge_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
                                uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id,
                                uint16_t total_groups);
@@ -276,6 +288,7 @@ class ReliableUDP : public std::enable_shared_from_this<ReliableUDP>
     void process_received_unit(const TRXUnit &unit);
     void reset_receive_state_for_new_epoch(uint16_t uid);
     void try_recover_group(std::vector<TRXUnit> &units, uint8_t data_packets_count);
+    void try_recover_dup_group(std::vector<TRXUnit> &units);
     void try_recover_xor_group(std::vector<TRXUnit> &units);
     void try_recover_rs_group(std::vector<TRXUnit> &units, uint8_t data_packets_count);
     void assemble_complete_message(uint16_t frame_seq, uint16_t group_num, uint16_t group_seq, uint8_t *data,

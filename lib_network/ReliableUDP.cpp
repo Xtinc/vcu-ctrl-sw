@@ -5,11 +5,22 @@ using asio::ip::udp;
 
 constexpr static auto TRX_RS_FEC_GROUP_UNIT_NUMS = MAX_RS_PACKET_NUM_PER_GROUP + TRX_RS_FEC_REDUNDANCY;
 constexpr static auto TRX_XOR_FEC_GROUP_UNIT_NUMS = MAX_XOR_PACKET_NUM_PER_GROUP + TRX_XOR_FEC_REDUNDANCY;
+constexpr static auto TRX_DUP_FEC_GROUP_UNIT_NUMS = MAX_DUP_PACKET_NUM_PER_GROUP + TRX_DUP_FEC_REDUNDANCY;
 constexpr static auto RECEIVE_EPOCH_IDLE_TIMEOUT = std::chrono::milliseconds(1000);
 constexpr static auto STATS_SAMPLE_INTERVAL = std::chrono::seconds(1);
 constexpr static auto MAX_UDP_DATAGRAM_SIZE = 65535;
 constexpr static double STATS_EMA_OLD_WEIGHT = 0.2;
 constexpr static double STATS_EMA_NEW_WEIGHT = 0.8;
+
+static uint8_t expected_units_for_layout(uint8_t units_num)
+{
+    if (units_num == TRX_DUP_FEC_GROUP_UNIT_NUMS || units_num == TRX_XOR_FEC_GROUP_UNIT_NUMS ||
+        units_num == TRX_RS_FEC_GROUP_UNIT_NUMS)
+    {
+        return units_num;
+    }
+    return 0;
+}
 
 static inline uint32_t get_time_ms()
 {
@@ -456,6 +467,36 @@ void ReliableUDP::handle_receive(const asio::error_code &error, size_t bytes_tra
     start_receive();
 }
 
+void ReliableUDP::create_dup_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data,
+                                       size_t current_group_size, uint16_t current_group_id, uint16_t uid,
+                                       uint16_t current_frame_id, uint16_t total_groups)
+{
+    if (current_group_size > MAX_TRX_DATA_SIZE)
+    {
+        VIDEO_ERROR_PRINT("DUP packet size %zu exceeds MAX_DATA_SIZE %zu", current_group_size, MAX_TRX_DATA_SIZE);
+        return;
+    }
+
+    all_units.reserve(all_units.size() + TRX_DUP_FEC_GROUP_UNIT_NUMS);
+    for (size_t i = 0; i < TRX_DUP_FEC_GROUP_UNIT_NUMS; ++i)
+    {
+        TRXUnit unit;
+        unit.head.group_seq = current_group_id;
+        unit.head.units_idx = static_cast<uint8_t>(i);
+        unit.head.units_num = static_cast<uint8_t>(TRX_DUP_FEC_GROUP_UNIT_NUMS);
+        unit.head.group_len = static_cast<uint16_t>(current_group_size);
+        unit.head.frame_seq = current_frame_id;
+        unit.head.group_num = static_cast<uint8_t>(total_groups);
+        unit.head.units_len = static_cast<uint16_t>(current_group_size);
+        unit.head.conn_uuid = uid;
+        unit.head.check_sum = TRXUnit::adler_8(&unit.head);
+
+        unit.data = static_cast<uint8_t *>(send_pool_.allocate(current_group_size));
+        memcpy(unit.data, data, current_group_size);
+        all_units.push_back(unit);
+    }
+}
+
 void ReliableUDP::create_huge_rtx_group(std::vector<TRXUnit> &all_units, const uint8_t *data, size_t current_group_size,
                                         uint16_t current_group_id, uint16_t uid, uint16_t current_frame_id,
                                         uint16_t total_groups)
@@ -608,6 +649,7 @@ void ReliableUDP::create_small_rtx_group(std::vector<TRXUnit> &all_units, const 
 std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t size)
 {
     const size_t total_groups = (size + MAX_TRX_GROUP_DATA_SIZE - 1) / MAX_TRX_GROUP_DATA_SIZE;
+    const bool use_rs = size > MAX_XOR_GROUP_DATA_SIZE;
 
     std::vector<TRXUnit> all_units;
     size_t offset = 0;
@@ -619,10 +661,15 @@ std::vector<TRXUnit> ReliableUDP::create_trx_units(const uint8_t *data, size_t s
         size_t remaining_size = size - offset;
         size_t current_group_size = std::min(remaining_size, MAX_TRX_GROUP_DATA_SIZE);
 
-        if (current_group_size > MAX_TRX_DATA_SIZE)
+        if (use_rs)
         {
             create_huge_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
                                   static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
+        }
+        else if (current_group_size <= MAX_TRX_DATA_SIZE)
+        {
+            create_dup_rtx_group(all_units, data + offset, current_group_size, current_group_id, target_uid_,
+                                 static_cast<uint16_t>(current_frame_id), static_cast<uint16_t>(total_groups));
         }
         else
         {
@@ -697,7 +744,7 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         return;
     }
 
-    if (units_num != TRX_RS_FEC_GROUP_UNIT_NUMS && units_num != TRX_XOR_FEC_GROUP_UNIT_NUMS)
+    if (expected_units_for_layout(units_num) == 0)
     {
         VIDEO_ERROR_PRINT("Unsupported units_num %u for group (%u,%u)", units_num, it->trxunit_cycle,
                           it->trxunit_group);
@@ -720,9 +767,13 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
     {
         data_packets_count = MAX_RS_PACKET_NUM_PER_GROUP;
     }
-    else
+    else if (units_num == TRX_XOR_FEC_GROUP_UNIT_NUMS)
     {
         data_packets_count = MAX_XOR_PACKET_NUM_PER_GROUP;
+    }
+    else
+    {
+        data_packets_count = MAX_DUP_PACKET_NUM_PER_GROUP;
     }
 
     auto it_recv_count = it->received_cnt();
@@ -757,10 +808,12 @@ void ReliableUDP::process_received_unit(const TRXUnit &unit)
         auto oldest_units_num = oldest_group.units.empty()
                                     ? static_cast<uint8_t>(0)
                                     : static_cast<uint8_t>(oldest_group.units.front().head.units_num);
-        auto oldest_layout_num =
-            oldest_units_num == TRX_RS_FEC_GROUP_UNIT_NUMS ? TRX_RS_FEC_GROUP_UNIT_NUMS : TRX_XOR_FEC_GROUP_UNIT_NUMS;
+        auto oldest_layout_num = expected_units_for_layout(oldest_units_num);
 
-        lost_packets_.fetch_add(static_cast<uint64_t>(oldest_layout_num - recv_cnt), std::memory_order_relaxed);
+        if (oldest_layout_num > recv_cnt)
+        {
+            lost_packets_.fetch_add(static_cast<uint64_t>(oldest_layout_num - recv_cnt), std::memory_order_relaxed);
+        }
 
         for (auto &u : oldest_group.units)
         {
@@ -815,7 +868,11 @@ void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_pa
     std::sort(units.begin(), units.end(),
               [](const TRXUnit &a, const TRXUnit &b) { return a.head.units_idx < b.head.units_idx; });
 
-    if (static_cast<uint8_t>(units[0].head.units_num) == TRX_XOR_FEC_GROUP_UNIT_NUMS)
+    if (static_cast<uint8_t>(units[0].head.units_num) == TRX_DUP_FEC_GROUP_UNIT_NUMS)
+    {
+        try_recover_dup_group(units);
+    }
+    else if (static_cast<uint8_t>(units[0].head.units_num) == TRX_XOR_FEC_GROUP_UNIT_NUMS)
     {
         try_recover_xor_group(units);
     }
@@ -823,6 +880,30 @@ void ReliableUDP::try_recover_group(std::vector<TRXUnit> &units, uint8_t data_pa
     {
         try_recover_rs_group(units, data_packets_count);
     }
+}
+
+void ReliableUDP::try_recover_dup_group(std::vector<TRXUnit> &units)
+{
+    uint16_t group_len = units[0].head.group_len;
+    size_t packet_size = units[0].head.units_len;
+    if (packet_size != group_len || !units[0].data)
+    {
+        for (auto &unit : units)
+        {
+            recv_pool_.deallocate(unit.data);
+        }
+        return;
+    }
+
+    auto *assembled = units[0].data;
+    units[0].data = nullptr;
+    for (auto &unit : units)
+    {
+        recv_pool_.deallocate(unit.data);
+    }
+
+    assemble_complete_message(units[0].head.frame_seq, units[0].head.group_num, units[0].head.group_seq, assembled,
+                              group_len);
 }
 
 void ReliableUDP::try_recover_xor_group(std::vector<TRXUnit> &units)
