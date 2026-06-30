@@ -69,7 +69,7 @@ struct Config
     uint16_t local_port = 15301;
     uint16_t peer_port = 15302;
     uint32_t duration_sec = 30;
-    size_t payload_bytes = 1200;
+    size_t payload_bytes = 1300;
     double rate_mbps = 5.0;
 };
 

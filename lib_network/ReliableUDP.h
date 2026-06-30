@@ -25,9 +25,9 @@ class BackgroundService
 #define BG_SERVICE (BackgroundService::instance().context())
 
 constexpr uint8_t MAGIC_TRX_PROBE_NUMBER = 0xA5;
-constexpr size_t MAX_TRX_UNIT_SIZE = 1200;
+constexpr size_t MAX_TRX_UNIT_SIZE = 1300;
 constexpr size_t MAX_TRX_UDP_SIZE = 128 * 1024;
-constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 12;
+constexpr size_t MAX_RS_PACKET_NUM_PER_GROUP = 8;
 constexpr size_t TRX_RS_FEC_REDUNDANCY = 2;
 constexpr size_t MAX_XOR_PACKET_NUM_PER_GROUP = 2;
 constexpr size_t TRX_XOR_FEC_REDUNDANCY = 1;
@@ -200,6 +200,8 @@ constexpr size_t TRX_HEADER_SIZE = sizeof(TRXUnit::Header);
 constexpr size_t MAX_TRX_DATA_SIZE = MAX_TRX_UNIT_SIZE - TRX_HEADER_SIZE;
 constexpr size_t MAX_TRX_GROUP_DATA_SIZE = MAX_RS_PACKET_NUM_PER_GROUP * MAX_TRX_DATA_SIZE;
 constexpr size_t MAX_GROUP_NUM_PER_FRAME = (MAX_TRX_UDP_SIZE + MAX_TRX_GROUP_DATA_SIZE - 1) / MAX_TRX_GROUP_DATA_SIZE;
+static_assert(MAX_TRX_DATA_SIZE <= 0x0fffu, "units_len exceeds 12 bits");
+static_assert(MAX_TRX_GROUP_DATA_SIZE <= 0xffffu, "group_len exceeds 16 bits");
 static_assert(MAX_GROUP_NUM_PER_FRAME <= 0xffu, "group_num exceeds 8 bits");
 
 /**
@@ -216,13 +218,13 @@ static_assert(MAX_GROUP_NUM_PER_FRAME <= 0xffu, "group_num exceeds 8 bits");
  * | Frame payload size            | Mode | Data pkts | Redundancy pkts | Recoverable losses |
  * |-------------------------------|------|-----------|-----------------|--------------------|
  * | <= MAX_TRX_DATA_SIZE          | XOR  | 2         | 1               | 1                  |
- * | >  MAX_TRX_DATA_SIZE          | RS   | 12        | 3               | up to 3            |
+ * | >  MAX_TRX_DATA_SIZE          | RS   | 8         | 2               | up to 2            |
  *
  * XOR mode splits a small payload into two padded halves and sends one parity
  * packet (`half0 ^ half1`), so any two of the three packets reconstruct the
  * original payload.
  *
- * RS mode uses Reed-Solomon(12, 3): any 12 received packets (data or parity)
+ * RS mode uses Reed-Solomon(8, 2): any 8 received packets (data or parity)
  * are sufficient to reconstruct the full group.
  *
  * ### RTT and clock offset

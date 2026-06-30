@@ -51,7 +51,7 @@ struct Config
 {
     uint32_t duration_sec = 30;
     double rate_mbps = 5.0;
-    size_t payload_bytes = 1200;
+    size_t payload_bytes = 1300;
     uint16_t sender_port = 15301;
     uint16_t receiver_port = 15302;
     std::string out_dir = "reliable_udp_jitter_out";
@@ -118,7 +118,7 @@ static void usage(const char *prog)
     std::cout << "Usage: " << prog << " [options]\n"
               << "  --duration <n>         run duration in seconds (default: 30)\n"
               << "  --rate-mbps <f>        ReliableUDP send rate in Mbps, 0 = unlimited (default: 5.0)\n"
-              << "  --payload-bytes <n>    ReliableUDP message size including test header (default: 1200)\n"
+              << "  --payload-bytes <n>    ReliableUDP message size including test header (default: 1300)\n"
               << "  --sender-port <n>      local sender port (default: 15301)\n"
               << "  --receiver-port <n>    local receiver port (default: 15302)\n"
               << "  --out-dir <path>       output directory (default: reliable_udp_jitter_out)\n";

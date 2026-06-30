@@ -35,7 +35,7 @@ test_udp_network --role receiver --local-port 15302 --peer-address 192.0.2.10 --
 Sender, host A (`192.0.2.10`):
 
 ```text
-test_udp_network --role sender --local-port 15301 --peer-address 192.0.2.20 --peer-port 15302 --duration 30 --rate-mbps 5 --payload-bytes 1200 --out-dir sender_out
+test_udp_network --role sender --local-port 15301 --peer-address 192.0.2.20 --peer-port 15302 --duration 30 --rate-mbps 5 --payload-bytes 1300 --out-dir sender_out
 ```
 
 The receiver waits up to 60 seconds for the first valid frame and captures for

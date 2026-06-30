@@ -9,7 +9,7 @@ PRESET="reorder"
 OUT_DIR="${ROOT_DIR}/reliable_udp_jitter_out/tc_$(date +%Y%m%d_%H%M%S)"
 DURATION=30
 RATE_MBPS=5
-PAYLOAD_BYTES=1200
+PAYLOAD_BYTES=1300
 DO_BUILD=1
 DO_CLEANUP=1
 DO_PLOT=1
@@ -35,7 +35,7 @@ Options:
   --duration <sec>         total seconds for jitter/reorder/harsh (default: 30)
                              ignored for --preset staged, which derives duration from the stage file
   --rate-mbps <value>      ReliableUDP send rate (default: 5)
-  --payload-bytes <n>      message size including test header (default: 1200)
+  --payload-bytes <n>      message size including test header (default: 1300)
   --build | --no-build     build test target before run (default: --build)
   --plot | --no-plot       run Python plotter after capture (default: --plot)
   --cleanup | --no-cleanup remove tc qdisc on exit (default: --cleanup)
